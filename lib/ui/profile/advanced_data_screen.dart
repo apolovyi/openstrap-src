@@ -246,7 +246,11 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
                   const SizedBox(height: Sp.x3),
                   _kv(
                     'Cross-day baseline',
-                    _crossday?['present'] == true ? 'Present' : 'Missing',
+                    _crossday?['stale'] == true
+                        ? 'Stale'
+                        : _crossday?['present'] == true
+                            ? 'Present'
+                            : 'Missing',
                   ),
                   _kv(
                     'Cross-day updated',

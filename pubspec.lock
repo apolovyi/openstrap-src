@@ -964,9 +964,9 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: f0d115308aa5e9e3c82ee113c3d52e59756121d4
-      resolved-ref: f0d115308aa5e9e3c82ee113c3d52e59756121d4
-      url: "https://github.com/OpenStrap/analytics.git"
+      ref: c7d5f19035b1d8949e600e26d9d5a2e6cb5fd328
+      resolved-ref: c7d5f19035b1d8949e600e26d9d5a2e6cb5fd328
+      url: "https://github.com/apolovyi/analytics.git"
     source: git
     version: "1.0.0"
   openstrap_protocol:

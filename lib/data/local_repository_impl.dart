@@ -75,7 +75,9 @@ class LocalRepositoryImpl extends LocalRepository {
   /// The cross-day analytics rollup bundle (from the `crossday` baseline), or
   /// null when none has been computed yet.
   Future<Map<String, dynamic>?> _crossDay() async {
-    final r = await LocalDb.baseline('crossday');
+    final r = await LocalDb.currentCrossDayBaseline(
+      algoVersion: kAlgoVersion,
+    );
     return _decode(r?['payload_json']);
   }
 
@@ -194,7 +196,7 @@ class LocalRepositoryImpl extends LocalRepository {
   Future<Map<String, dynamic>> getToday() async {
     var todayFresh = await _freshness('today');
     if (todayFresh == null) {
-      await LocalDb.refreshComputeFreshness();
+      await LocalDb.refreshComputeFreshness(algoVersion: kAlgoVersion);
       todayFresh = await _freshness('today');
     }
     final todayDay = todayFresh?['today_day']?.toString() ?? _todayLocalLabel();

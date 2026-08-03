@@ -11,6 +11,8 @@
 //     hr_curve + hypnogram + HRV series for TEN YEARS) and jsonDecode every one
 //     on the main isolate for what is only a scalar-extremes screen.
 
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -43,6 +45,8 @@ void main() {
     await db.delete('day_result');
     await db.delete('metric_series');
     await db.delete('sessions');
+    await db.delete('baselines');
+    await db.delete('compute_freshness');
   });
 
   // ── fix 7 ────────────────────────────────────────────────────────────────
@@ -132,4 +136,76 @@ void main() {
       expect(records['workouts_tracked'], 0);
     },
   );
+
+  test('stale cross-day artifacts are withheld and reported honestly', () async {
+    await LocalDb.putBaseline(
+      'crossday_input',
+      jsonEncode({
+        'algo_version': 55,
+        'revision': 'current-input',
+        'days': [
+          {'date': '2026-08-03'},
+        ],
+      }),
+    );
+    await LocalDb.putBaseline(
+      'crossday',
+      jsonEncode({
+        'algo_version': 55,
+        'source_input_revision': 'old-input',
+        'source_last_day': '2025-06-22',
+        'n_days': 90,
+      }),
+    );
+    final stored = await LocalDb.baseline('crossday');
+
+    expect(await repo.getInsights(), isEmpty);
+    expect(
+      await LocalDb.crossDayStats(algoVersion: 55),
+      {'present': false, 'stale': true},
+    );
+
+    await LocalDb.refreshComputeFreshness(algoVersion: 55);
+    final row = await LocalDb.computeFreshness('crossday');
+    final freshness = jsonDecode(row!['payload_json'] as String) as Map;
+    expect(freshness['present'], isFalse);
+    expect(freshness['stale'], isTrue);
+    expect(freshness['updated_at'], stored!['updated_at']);
+  });
+
+  test('matching cross-day input revision is served', () async {
+    await LocalDb.putBaseline(
+      'crossday_input',
+      jsonEncode({
+        'algo_version': 55,
+        'revision': 'current-input',
+        'days': [
+          {'date': '2026-08-03'},
+        ],
+      }),
+    );
+    await LocalDb.putBaseline(
+      'crossday',
+      jsonEncode({
+        'algo_version': 55,
+        'source_input_revision': 'current-input',
+        'source_last_day': '2026-08-03',
+        'n_days': 1,
+      }),
+    );
+
+    expect((await repo.getInsights())['n_days'], 1);
+    expect(
+      await LocalDb.crossDayStats(algoVersion: 55),
+      {'present': true, 'stale': false, 'n_days': 1},
+    );
+    expect(
+      await LocalDb.currentCrossDayBaseline(algoVersion: 54),
+      isNull,
+    );
+
+    await LocalDb.deleteDays({'2026-08-03'});
+    expect(await LocalDb.baseline('crossday'), isNull);
+    expect(await LocalDb.baseline('crossday_input'), isNull);
+  });
 }

@@ -891,7 +891,7 @@ class AppState extends ChangeNotifier {
         },
       ));
       TelemetryService.instance.breadcrumb('derive: $mode done');
-      await LocalDb.refreshComputeFreshness();
+      await LocalDb.refreshComputeFreshness(algoVersion: kAlgoVersion);
       _bumpInsightsRevision();
       notifyListeners(); // screens re-fetch from the derived store
       // A heavy finalize is where a freshly-closed sleep window + recovery for a
@@ -1255,7 +1255,7 @@ class AppState extends ChangeNotifier {
           }
         },
       );
-      await LocalDb.refreshComputeFreshness();
+      await LocalDb.refreshComputeFreshness(algoVersion: kAlgoVersion);
       _bumpInsightsRevision();
       dbCounts = await LocalDb.counts();
       return n;
@@ -1324,7 +1324,7 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     try {
       await _derive.run(_profile, force: true);
-      await LocalDb.refreshComputeFreshness();
+      await LocalDb.refreshComputeFreshness(algoVersion: kAlgoVersion);
       dbCounts = await LocalDb.counts();
     } catch (e) {
       _log('[derive] sleep-override re-derive failed: $e');
@@ -1354,7 +1354,7 @@ class AppState extends ChangeNotifier {
           }
         },
       );
-      await LocalDb.refreshComputeFreshness();
+      await LocalDb.refreshComputeFreshness(algoVersion: kAlgoVersion);
       _bumpInsightsRevision();
       dbCounts = await LocalDb.counts();
       return n;
@@ -1378,7 +1378,7 @@ class AppState extends ChangeNotifier {
 
   Future<int> deleteDays(Set<String> dayIds) async {
     final deleted = await LocalDb.deleteDays(dayIds);
-    await LocalDb.refreshComputeFreshness();
+    await LocalDb.refreshComputeFreshness(algoVersion: kAlgoVersion);
     dbCounts = await LocalDb.counts();
     lastSynced = await LocalDb.latestSample();
     notifyListeners();
@@ -1436,7 +1436,7 @@ class AppState extends ChangeNotifier {
     _lastRecTs =
         await LocalDb.getCursorInt('rec_ts_hw') ?? lastSynced?.tsEpoch;
     dbCounts = await LocalDb.counts();
-    await LocalDb.refreshComputeFreshness();
+    await LocalDb.refreshComputeFreshness(algoVersion: kAlgoVersion);
     _savedAlarm = (await SharedPreferences.getInstance()).getInt('alarm_epoch');
     // Band-gesture mapping: load the saved action + query native capabilities so the
     // settings UI knows what this platform supports. Best-effort, non-blocking.
@@ -1569,7 +1569,9 @@ class AppState extends ChangeNotifier {
       // when we have one (from the crossday rollup), else the fixed default.
       double? bedtimeMin;
       try {
-        final cd = await LocalDb.baseline('crossday');
+        final cd = await LocalDb.currentCrossDayBaseline(
+          algoVersion: kAlgoVersion,
+        );
         final m = cd?['payload_json'];
         if (m is String) {
           final j = jsonDecode(m);

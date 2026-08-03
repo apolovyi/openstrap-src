@@ -3295,6 +3295,11 @@ class LocalDb {
       await deleteByIn(txn, 'cycle_symptom', 'date', sorted);
       await deleteByIn(txn, 'workout_suggestions', 'date', sorted);
       await deleteByIn(txn, 'sleep_override', 'day_id', sorted);
+      await txn.delete(
+        'baselines',
+        where: 'key IN (?, ?)',
+        whereArgs: ['crossday', 'crossday_input'],
+      );
     });
     return deleted;
   }
@@ -3797,16 +3802,21 @@ class LocalDb {
   }
 
   /// Cross-day rollup presence + day count, read from the `crossday` baseline.
-  static Future<Map<String, dynamic>?> crossDayStats() async {
-    final r = await baseline('crossday');
-    final json = r?['payload_json'];
-    if (json is! String) return {'present': false};
+  static Future<Map<String, dynamic>?> crossDayStats({
+    required int algoVersion,
+  }) async {
+    final stored = await baseline('crossday');
+    final current = await currentCrossDayBaseline(algoVersion: algoVersion);
+    final json = current?['payload_json'];
+    if (json is! String) {
+      return {'present': false, 'stale': stored != null};
+    }
     try {
       final p = jsonDecode(json);
       final nDays = p is Map ? p['n_days'] : null;
-      return {'present': true, 'n_days': nDays};
+      return {'present': true, 'stale': false, 'n_days': nDays};
     } catch (_) {
-      return {'present': false};
+      return {'present': false, 'stale': stored != null};
     }
   }
 
@@ -3913,6 +3923,41 @@ class LocalDb {
     }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
+  static Future<Map<String, dynamic>?> currentCrossDayBaseline({
+    required int algoVersion,
+  }) async {
+    final cross = await baseline('crossday');
+    final input = await baseline('crossday_input');
+    final crossRaw = cross?['payload_json'];
+    final inputRaw = input?['payload_json'];
+    if (crossRaw is! String || inputRaw is! String) return null;
+    try {
+      final crossPayload = jsonDecode(crossRaw);
+      final inputPayload = jsonDecode(inputRaw);
+      if (crossPayload is! Map || inputPayload is! Map) return null;
+      final crossAlgo = (crossPayload['algo_version'] as num?)?.toInt();
+      final inputAlgo = (inputPayload['algo_version'] as num?)?.toInt();
+      final crossRevision = crossPayload['source_input_revision'];
+      final inputRevision = inputPayload['revision'];
+      final sourceLastDay = crossPayload['source_last_day'];
+      final inputDays = inputPayload['days'];
+      if (crossAlgo != algoVersion ||
+          inputAlgo != algoVersion ||
+          crossRevision is! String ||
+          crossRevision != inputRevision ||
+          sourceLastDay is! String ||
+          inputDays is! List ||
+          inputDays.isEmpty) {
+        return null;
+      }
+      final lastInput = inputDays.last;
+      if (lastInput is! Map || lastInput['date'] != sourceLastDay) return null;
+      return cross;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Atomically read-modify-write one `baselines` row.
   ///
   /// [transform] receives the current `payload_json` (null when the row does
@@ -3983,11 +4028,13 @@ class LocalDb {
 
   static String localDayLabelNow() => todayLabel();
 
-  static Future<void> refreshComputeFreshness() async {
+  static Future<void> refreshComputeFreshness({
+    required int algoVersion,
+  }) async {
     final raw = await rawStats();
     final recent = await recentDayResults(30);
-    final rolling = await baseline('rolling');
-    final cross = await baseline('crossday');
+    final storedCross = await baseline('crossday');
+    final cross = await currentCrossDayBaseline(algoVersion: algoVersion);
     final today = localDayLabelNow();
     final latestRawTs = (raw['max_rec_ts'] as num?)?.toInt();
     final todayWake = await wakeDayFeatures(today);
@@ -4078,7 +4125,8 @@ class LocalDb {
       'crossday',
       jsonEncode({
         'present': cross != null,
-        'updated_at': rolling?['updated_at'],
+        'stale': storedCross != null && cross == null,
+        'updated_at': storedCross?['updated_at'],
       }),
     );
   }

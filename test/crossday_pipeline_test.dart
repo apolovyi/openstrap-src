@@ -7,6 +7,8 @@
 // injected RHR spike trips the illness flag, and that absent inputs degrade to
 // honest absent envelopes (never a thrown exception, never a fabricated number).
 
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:openstrap_edge/compute/crossday_pipeline.dart';
 
@@ -177,6 +179,22 @@ void main() {
       expect(out['n_days'], 3);
       expect((out['regularity'] as Map)['value'], '—');
       expect((out['social_jetlag'] as Map)['value'], '—');
+    });
+
+    test('partial signal history remains JSON-safe', () {
+      final days = _synthDays(8);
+      for (var i = 0; i < days.length - 2; i++) {
+        days[i]['skin_temp_z'] = null;
+      }
+
+      final out = buildCrossDayBundle(days, const {});
+      final glassBox = (out['readiness_glassbox'] as Map)['value'] as Map;
+      final breakdown = (glassBox['breakdown'] as List).cast<Map>();
+      final temp = breakdown.firstWhere((item) => item['label'] == 'temp');
+
+      expect(temp['used'], isFalse);
+      expect(temp['percentile_of_you'], isNull);
+      expect(() => jsonEncode(out), returnsNormally);
     });
 
     // ── the SRI grid must WRAP around midnight, not drop the segment ─────────

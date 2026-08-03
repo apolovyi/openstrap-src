@@ -404,7 +404,13 @@ import 'substrate.dart';
 // output moves. NOTE this bump does not retro-fix an existing import — imported
 // days are force-finalized snapshots with no stored raw to recompute from, so
 // an already-imported day needs a re-import to pick its steps up.
-const int kAlgoVersion = 54;
+// v55: analytics c7d5f19 serializes a baseline-gated readiness-breakdown
+// percentile as null instead of NaN. NaN made jsonEncode reject the entire
+// cross-day bundle whenever a newly present signal had fewer than seven prior
+// days, leaving old coaching and alert inputs live. Cross-day artifacts now
+// carry their exact input revision, stale artifacts are withheld, and
+// notifications run only after a successful replacement.
+const int kAlgoVersion = 55;
 
 // Fold idempotency, the minimum-nights warm-up, and legacy-payload handling
 // all live in SleepProfilePolicy (pure, unit-tested) — see
@@ -917,9 +923,11 @@ class DerivationEngine {
         _diag['stage'] = 'baselines';
         await _refreshBaselines();
         _diag['stage'] = 'cross_day';
-        await _runCrossDay(profile);
-        _diag['stage'] = 'notifications';
-        await _runNotifications();
+        final crossDayUpdated = await _runCrossDay(profile);
+        if (crossDayUpdated) {
+          _diag['stage'] = 'notifications';
+          await _runNotifications();
+        }
       }
       // 5. Prune raw — never for a day still inside its raw window / un-derived.
       if (scope.fullHistory) {
@@ -1066,8 +1074,9 @@ class DerivationEngine {
       }
       if (done > 0) {
         await _refreshBaselines();
-        await _runCrossDay(profile);
-        await _runNotifications();
+        if (await _runCrossDay(profile)) {
+          await _runNotifications();
+        }
       }
       return done;
     } catch (e, st) {
@@ -1793,8 +1802,9 @@ class DerivationEngine {
 
       await _refreshBaselines();
       // Cross-day rollup + notifications reflect the refreshed scalars.
-      await _runCrossDay(profile);
-      await _runNotifications();
+      if (await _runCrossDay(profile)) {
+        await _runNotifications();
+      }
       // Store the new signature so the next tick is a cheap no-op until it moves.
       await LocalDb.setCursor('baseline_sig', await _baselineSignature());
       return done;
@@ -1903,8 +1913,9 @@ class DerivationEngine {
   /// import completes (reflects the freshly imported day history).
   Future<void> finalizeImport(Profile profile) async {
     await _refreshBaselines();
-    await _runCrossDay(profile);
-    await _runNotifications();
+    if (await _runCrossDay(profile)) {
+      await _runNotifications();
+    }
   }
 
   // ── derive one day ──────────────────────────────────────────────────────────
@@ -2546,12 +2557,12 @@ class DerivationEngine {
   static const Duration _crossDayTimeout = Duration(seconds: 30);
   static const int _crossDayWindow = 90;
 
-  Future<void> _runCrossDay(Profile profile) async {
+  Future<bool> _runCrossDay(Profile profile) async {
     try {
-      final days = await _crossDayInputDays();
+      final (days, inputRevision) = await _crossDayInputDays();
       if (days.length < 3) {
         _log('crossday: only ${days.length} usable day(s) — skip');
-        return;
+        return false;
       }
       final profileMap = profile.toMap();
       // Encode INSIDE the isolate too — a real ~3.5-4.7s main-isolate hang was
@@ -2560,19 +2571,23 @@ class DerivationEngine {
       // main isolate after Isolate.run returned it. Returning the already-
       // encoded string avoids both the main-isolate encode cost AND transfers
       // a flat string across the isolate boundary instead of a large nested Map.
-      final bundleJson = await _runIsolateCancellable(
-        () => jsonEncode(buildCrossDayBundle(days, profileMap)),
-        _crossDayTimeout,
-        label: 'crossday',
-      );
+      final bundleJson = await _runIsolateCancellable(() {
+        final bundle = buildCrossDayBundle(days, profileMap);
+        bundle['algo_version'] = kAlgoVersion;
+        bundle['source_input_revision'] = inputRevision;
+        bundle['source_last_day'] = days.last['date'];
+        return jsonEncode(bundle);
+      }, _crossDayTimeout, label: 'crossday');
       await LocalDb.putBaseline('crossday', bundleJson);
       _log('crossday: stored over ${days.length} day(s)');
+      return true;
     } catch (e) {
       _log('crossday FAILED/skipped: $e');
+      return false;
     }
   }
 
-  Future<List<Map<String, dynamic>>> _crossDayInputDays() async {
+  Future<(List<Map<String, dynamic>>, String)> _crossDayInputDays() async {
     final artifact = await LocalDb.baseline('crossday_input');
     final raw = artifact?['payload_json'];
     if (raw is String && raw.isNotEmpty) {
@@ -2580,11 +2595,15 @@ class DerivationEngine {
         final decoded = jsonDecode(raw);
         if (decoded is Map) {
           final rows = decoded['days'];
-          if (rows is List) {
-            return [
-              for (final row in rows)
-                if (row is Map) row.cast<String, dynamic>(),
-            ];
+          final revision = decoded['revision'];
+          if (rows is List && revision is String) {
+            return (
+              [
+                for (final row in rows)
+                  if (row is Map) row.cast<String, dynamic>(),
+              ],
+              revision,
+            );
           }
         }
       } catch (_) {
@@ -2594,7 +2613,8 @@ class DerivationEngine {
     return _refreshCrossDayInputArtifact();
   }
 
-  Future<List<Map<String, dynamic>>> _refreshCrossDayInputArtifact() async {
+  Future<(List<Map<String, dynamic>>, String)>
+      _refreshCrossDayInputArtifact() async {
     // The DB read itself must stay on the main isolate (sqflite), but
     // decoding up to _crossDayWindow (90) full day payloads + re-encoding
     // them was previously ALL synchronous main-isolate work with zero
@@ -2604,6 +2624,8 @@ class DerivationEngine {
     // both static, so this whole transform+encode step is isolate-safe.
     final rows = await LocalDb.recentDayResults(_crossDayWindow);
     final today = LocalDb.localDayLabelNow();
+    final revision =
+        '${DateTime.now().microsecondsSinceEpoch}-${Isolate.current.hashCode}';
     final (days, json) = await _runIsolateCancellable(() {
       final days = <Map<String, dynamic>>[];
       for (final row in rows.reversed) {
@@ -2628,17 +2650,26 @@ class DerivationEngine {
         }
         days.add(rec);
       }
-      return (days, jsonEncode({'algo_version': kAlgoVersion, 'days': days}));
+      return (
+        days,
+        jsonEncode({
+          'algo_version': kAlgoVersion,
+          'revision': revision,
+          'days': days,
+        }),
+      );
     }, _crossDayTimeout, label: 'crossday-input');
     await LocalDb.putBaseline('crossday_input', json);
-    return days;
+    return (days, revision);
   }
 
   // ── notifications generator ─────────────────────────────────────────────────
 
   Future<void> _runNotifications() async {
     try {
-      final cdRow = await LocalDb.baseline('crossday');
+      final cdRow = await LocalDb.currentCrossDayBaseline(
+        algoVersion: kAlgoVersion,
+      );
       final cd = _decodeBundle(cdRow?['payload_json']);
       if (cd == null) return;
       String? date;
