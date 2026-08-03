@@ -52,9 +52,8 @@ dependencies:
   openstrap_analytics:
     git:
       url: https://github.com/apolovyi/analytics.git
-      # Fork commit for OpenStrap/analytics#36: baseline-gated readiness
-      # breakdowns serialize unavailable percentiles as null instead of NaN.
-      # Keep the fork URL until the upstream PR merges, then repin its merge SHA.
+      # Fork commit: baseline-gated readiness breakdowns serialize unavailable
+      # percentiles as null instead of NaN.
       # analytics main @ #34 merge. Two hops in one: #32 (the HR-onset bypass
       # for low-limb-swing cardio) had already merged and this pin was still
       # sitting on its PR-branch head, and #34 lands the sleep-stager rewrite.
