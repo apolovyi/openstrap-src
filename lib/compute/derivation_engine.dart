@@ -563,11 +563,9 @@ class _BaselineHistoryCache {
   /// de-duplicated store on every load makes the read path immune and self-heals
   /// any already-polluted install.
   ///
-  /// NOTE ON THE QUERY: `LocalDb.metricSeries(key)` with NO `limit` is the whole
-  /// series, `date ASC` — the dates are what make a per-day `date < target`
-  /// window possible at all. It must NOT be given a `limit` (that is `date ASC
-  /// LIMIT n`, i.e. the OLDEST n — the opposite of a trailing window); the
-  /// trailing window is taken here, in Dart, per target day.
+  /// NOTE ON THE QUERY: `LocalDb.baselineMetricSeries(key)` returns the whole
+  /// local measured series in `date ASC` order. Imported vendor snapshots stay
+  /// visible in trends but cannot normalize future locally measured days.
   static Future<_BaselineHistoryCache> load() async {
     Future<List<_DatedValue>> hist(String key) async {
       final rows = await LocalDb.baselineMetricSeries(key);
@@ -1901,12 +1899,12 @@ class DerivationEngine {
     return done;
   }
 
-  /// Refresh baselines and cross-day rollups after a historical import.
-  /// Notifications are intentionally excluded: old conclusions are not current
-  /// alerts and must never buzz merely because history was loaded.
+  /// Run the cross-day rollup + notifications + baseline refresh once after an
+  /// import completes (reflects the freshly imported day history).
   Future<void> finalizeImport(Profile profile) async {
     await _refreshBaselines();
     await _runCrossDay(profile);
+    await _runNotifications();
   }
 
   // ── derive one day ──────────────────────────────────────────────────────────

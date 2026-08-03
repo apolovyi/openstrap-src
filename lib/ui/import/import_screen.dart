@@ -126,37 +126,8 @@ class _ImportScreenState extends State<ImportScreen> {
     final app = context.read<AppState>();
     final paths = await _pick(multiple: true);
     if (paths.isEmpty) return;
-    _set(() {
-      _busy = true;
-      _progress = 'Validating…';
-      _result = null;
-      _error = null;
-    });
-    try {
-      final result = await app.importWhoopCsvs(paths,
-          onProgress: (day) =>
-              _set(() => _progress = 'Validating day $day…'));
-      final skipped = result.skippedExistingDays == 0
-          ? ''
-          : ' ${result.skippedExistingDays} overlapping band '
-              'day${result.skippedExistingDays == 1 ? '' : 's'} preserved.';
-      final deferred = result.finalizationDeferred
-          ? ' Profile-dependent rollups will refresh after profile setup.'
-          : '';
-      _set(() {
-        _busy = false;
-        _progress = null;
-        _result = 'WHOOP: imported ${result.days} '
-            'day${result.days == 1 ? '' : 's'} and ${result.workouts} '
-            'workout${result.workouts == 1 ? '' : 's'}.$skipped$deferred';
-      });
-    } catch (error) {
-      _set(() {
-        _busy = false;
-        _progress = null;
-        _error = 'WHOOP failed: $error';
-      });
-    }
+    await _run('WHOOP', () => app.importWhoopCsvs(paths,
+        onProgress: (d) => _set(() => _progress = 'Importing day $d…')));
   }
 
   /// Finish: if still in onboarding (no choice made yet) mark it done so the gate

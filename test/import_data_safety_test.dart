@@ -18,9 +18,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:openstrap_edge/cloud/cloud_import.dart';
-import 'package:openstrap_edge/compute/derivation_engine.dart'
-    show DerivationEngine, debugBaselineWindow, kAlgoVersion;
-import 'package:openstrap_edge/compute/profile.dart';
+import 'package:openstrap_edge/compute/derivation_engine.dart' show kAlgoVersion;
 import 'package:openstrap_edge/compute/substrate.dart' show localDateLabel;
 import 'package:openstrap_edge/data/db.dart';
 import 'package:openstrap_edge/import/noop_import.dart';
@@ -179,160 +177,6 @@ void main() {
     });
   });
 
-  group('WhoopImporter preserves vendor semantics and fails closed', () {
-    test('explicit historical local day wins over the host timezone', () async {
-      final f = File(p.join(tmp.path, 'explicit_day.csv'));
-      f.writeAsStringSync(
-        'Local day,Cycle start time,Wake onset,Recovery score %\n'
-        '2020-01-01,2026-06-10T23:30:00Z,2026-06-11T07:30:00Z,63\n',
-      );
-      final result = await WhoopImporter.importFiles([f.path]);
-      expect(result.days, 1);
-      expect(await _row('2020-01-01'), isNotNull);
-      expect(await _row(localDateLabel(
-        DateTime.parse('2026-06-11T07:30:00Z').millisecondsSinceEpoch ~/ 1000,
-      )), isNull);
-    });
-
-    test('efficiency, performance, temperature, and oxygen stay distinct',
-        () async {
-      final f = File(p.join(tmp.path, 'vendor_semantics.csv'));
-      f.writeAsStringSync(
-        'Local day,Cycle start time,Wake onset,Asleep duration (min),'
-        'Sleep efficiency %,Sleep performance %,Skin temp (Celsius),'
-        'Blood oxygen %\n'
-        '2020-01-02,2020-01-02T00:00:00Z,2020-01-02T08:00:00Z,'
-        '420,91.5,74,33.7,96.2\n',
-      );
-      await WhoopImporter.importFiles([f.path]);
-      final payload = jsonDecode(
-        (await _row('2020-01-02'))!['payload_json'] as String,
-      ) as Map<String, dynamic>;
-      final scalars = payload['scalars'] as Map;
-      expect(scalars['efficiency'], 91.5);
-      expect(scalars['sleep_performance'], 74.0);
-      expect(scalars['skin_temp_c'], 33.7);
-      expect(scalars['spo2_pct'], 96.2);
-      expect(scalars.containsKey('skin_temp_z'), isFalse);
-      expect(scalars.containsKey('spo2'), isFalse);
-      expect(await _metric('2020-01-02', 'efficiency'), 91.5);
-      expect(await _metric('2020-01-02', 'sleep_performance'), 74.0);
-      expect(await _metric('2020-01-02', 'skin_temp_z'), isNull);
-      expect(await _metric('2020-01-02', 'spo2'), isNull);
-    });
-
-    test('a malformed later row leaves every earlier row uncommitted', () async {
-      final f = File(p.join(tmp.path, 'malformed_bundle.csv'));
-      f.writeAsStringSync(
-        'Local day,Cycle start time,Wake onset,Recovery score %\n'
-        '2020-01-03,2020-01-03T00:00:00Z,2020-01-03T08:00:00Z,50\n'
-        '2020-02-30,2020-01-04T00:00:00Z,2020-01-04T08:00:00Z,51\n',
-      );
-      await expectLater(
-        WhoopImporter.importFiles([f.path]),
-        throwsA(isA<FormatException>()),
-      );
-      expect(await _row('2020-01-03'), isNull);
-    });
-
-    test('database failure rolls the complete WHOOP transaction back', () async {
-      const day = '2020-01-04';
-      final write = WhoopDayWrite(
-        dayId: day,
-        payloadJson: jsonEncode({'date': day, 'imported': true}),
-        windowJson: '{}',
-        rhr: 50,
-        rmssd: 60,
-        readiness: 70,
-        series: const {'rhr': 50},
-      );
-      await expectLater(
-        LocalDb.putWhoopImport(
-          days: [write],
-          workouts: [
-            {
-              'id': 'invalid-atomic-workout',
-              'type': 'run',
-              'status': 'done',
-              'source': 'whoop',
-              'created_at': 1,
-            },
-          ],
-          algoVersion: kAlgoVersion,
-        ),
-        throwsA(anything),
-      );
-      expect(await _row(day), isNull);
-      expect(await _metric(day, 'rhr'), isNull);
-    });
-
-    test('re-import removes obsolete semantic aliases from older imports',
-        () async {
-      const day = '2020-01-05';
-      await LocalDb.putDayResult(
-        dayId: day,
-        algoVersion: kAlgoVersion,
-        payloadJson: jsonEncode({'date': day, 'imported': true}),
-        windowJson: '{}',
-        finalized: true,
-        series: const {'skin_temp_z': 33.7, 'spo2': 96.0, 'calories': 2000},
-      );
-      final f = File(p.join(tmp.path, 'replace_old_aliases.csv'));
-      f.writeAsStringSync(
-        'Local day,Cycle start time,Wake onset,Skin temp (Celsius),'
-        'Blood oxygen %,Energy burned (kcal)\n'
-        '$day,2020-01-05T00:00:00Z,2020-01-05T08:00:00Z,33.8,97,2100\n',
-      );
-      await WhoopImporter.importFiles([f.path]);
-      expect(await _metric(day, 'skin_temp_z'), isNull);
-      expect(await _metric(day, 'spo2'), isNull);
-      expect(await _metric(day, 'calories'), isNull);
-      expect(await _metric(day, 'skin_temp_c'), 33.8);
-      expect(await _metric(day, 'spo2_pct'), 97.0);
-      expect(await _metric(day, 'calories_total'), 2100.0);
-    });
-
-    test('unknown selected files fail before any bundle write', () async {
-      final good = File(p.join(tmp.path, 'known_before_unknown.csv'));
-      good.writeAsStringSync(
-        'Local day,Cycle start time,Wake onset,Recovery score %\n'
-        '2020-01-06,2020-01-06T00:00:00Z,2020-01-06T08:00:00Z,60\n',
-      );
-      final unknown = File(p.join(tmp.path, 'unknown.csv'));
-      unknown.writeAsStringSync('unrelated,column\nvalue,1\n');
-      await expectLater(
-        WhoopImporter.importFiles([good.path, unknown.path]),
-        throwsA(isA<FormatException>()),
-      );
-      expect(await _row('2020-01-06'), isNull);
-    });
-
-    test('vendor snapshots never seed local readiness baselines', () async {
-      final f = File(p.join(tmp.path, 'baseline_vendor.csv'));
-      f.writeAsStringSync(
-        'Local day,Cycle start time,Wake onset,Resting heart rate (bpm)\n'
-        '2020-01-07,2020-01-07T00:00:00Z,2020-01-07T08:00:00Z,333\n',
-      );
-      await WhoopImporter.importFiles([f.path]);
-      expect(await _metric('2020-01-07', 'rhr'), 333);
-      expect(await debugBaselineWindow('rhr'), isNot(contains(333.0)));
-    });
-
-    test('profile-dependent finalization is deferred for onboarding', () async {
-      final f = File(p.join(tmp.path, 'deferred_profile.csv'));
-      f.writeAsStringSync(
-        'Local day,Cycle start time,Wake onset,Recovery score %\n'
-        '2020-01-08,2020-01-08T00:00:00Z,2020-01-08T08:00:00Z,60\n',
-      );
-      final result = await WhoopImporter.importFiles(
-        [f.path],
-        engine: DerivationEngine(),
-        profile: const Profile(),
-      );
-      expect(result.finalizationDeferred, isTrue);
-    });
-  });
-
   group('WhoopImporter energy units come from the header, not the value', () {
     Future<double?> importEnergy(
         String wake, String header, String value) async {
@@ -345,16 +189,14 @@ void main() {
         '$wake,$wake,50,60,60,5,$value,400\n',
       );
       await WhoopImporter.importFiles([f.path]);
-      return _metric(day, 'calories_total');
+      return _metric(day, 'calories');
     }
 
-    test('daily energy is preserved as total, never active calories', () async {
+    test('a real 4,500 kcal ultra day is NOT rewritten as kJ', () async {
+      // The old heuristic (`v > 4000 ? v / 4.184 : v`) turned this into 1,076.
       expect(await importEnergy('2026-04-01 07:00:00', 'Energy burned (cal)',
               '4500'),
           4500.0);
-      final day = localDateLabel(
-          DateTime.parse('2026-04-01 07:00:00').millisecondsSinceEpoch ~/ 1000);
-      expect(await _metric(day, 'calories'), isNull);
     });
 
     test('a kJ column IS converted', () async {

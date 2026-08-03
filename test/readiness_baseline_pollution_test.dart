@@ -63,6 +63,27 @@ void main() {
     );
   }
 
+  test('imported vendor snapshots never enter live readiness baselines', () async {
+    final db = await LocalDb.instance;
+    await db.delete('metric_series');
+    await db.delete('day_result');
+    await LocalDb.putDayResult(
+      dayId: '2024-01-01',
+      algoVersion: kAlgoVersion,
+      payloadJson: jsonEncode({
+        'imported': true,
+        'scalars': {'readiness': 99.0},
+      }),
+      windowJson: '{}',
+      finalized: true,
+      readiness: 99,
+      series: const {'readiness': 99.0},
+    );
+    await seedDay('2024-01-02', 61);
+
+    expect(await debugBaselineWindow('readiness'), [61.0]);
+  });
+
   // ── The mechanism: duplicate-day pollution collapses MAD → absent ──────────
 
   test('a baseline dominated by one repeated value makes robustZ degenerate',
