@@ -108,6 +108,39 @@ Device Management, then launch again.
 A successful launch does not prove BLE sync, HealthKit, widget/App Group flow, background
 execution, or Watch launch. Record those separately.
 
+## Diagnose process identity and BLE restoration
+
+Never identify an iOS app by the executable suffix `Runner.app/Runner` or by the
+`Application/<UUID>` path segment. Multiple Flutter apps use that executable name, and the
+application-container UUID is not the bundle identity. Resolve each full process path against
+the installed-app registry before attributing it or terminating it:
+
+```bash
+xcrun devicectl device info processes --device <COREDEVICE-ID>
+mkdir -p .tmp
+xcrun devicectl device info apps \
+  --device <COREDEVICE-ID> \
+  --include-all-apps \
+  --json-output .tmp/device-apps.json
+```
+
+Match the process path to `result.apps[].url`, then use `bundleIdentifier` as the identity.
+RunningBoard records that pair the bundle identifier with the PID provide an independent
+confirmation. A generic Runner path alone is not evidence of a duplicate OpenStrap install or
+BLE ownership.
+
+CoreBluetooth state restoration can legitimately relaunch OpenStrap in the background. The
+current app has two central restoration identifiers in the same bundle:
+
+- `flutterBluePlusRestoreIdentifier` belongs to the `flutter_blue_plus` central that owns the
+  live GATT session.
+- `openstrap.ble.restore` belongs to the native recovery-only `BleRestoreManager`; it does
+  not drain GATT data and hands the wake to Flutter.
+
+These are central sessions, not separate app processes. Confirm an actual restoration launch
+from `bluetoothd` bundle-ID events and confirm the live GATT owner from its session routing;
+do not infer either from the number of restoration identifiers or Runner executables.
+
 ## Finish
 
 ```bash
