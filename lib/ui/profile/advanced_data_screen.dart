@@ -24,6 +24,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
   Map<String, dynamic>? _capture;
   Map<String, dynamic>? _today;
   Map<String, dynamic>? _crossday;
+  Map<String, dynamic>? _firmware;
   final Set<String> _selected = <String>{};
 
   @override
@@ -40,6 +41,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
     final captureRow = await LocalDb.computeFreshness('capture');
     final todayRow = await LocalDb.computeFreshness('today');
     final crossdayRow = await LocalDb.computeFreshness('crossday');
+    final firmwareRow = await LocalDb.computeFreshness('firmware');
     Map<String, dynamic>? decode(Map<String, dynamic>? row) {
       final raw = row?['payload_json'];
       if (raw is! String || raw.isEmpty) return null;
@@ -58,6 +60,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
       _capture = decode(captureRow);
       _today = decode(todayRow);
       _crossday = decode(crossdayRow);
+      _firmware = decode(firmwareRow);
       _selected.removeWhere((d) => !_days.any((row) => row['day_id'] == d));
       _loading = false;
     });
@@ -134,8 +137,13 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
     // Was context.watch<AppState>() — the same reanalyzing/reanalyzeProgress
     // pair as today_screen.dart's dev-tools card; this screen IS the "analyze
     // your data" dev tool, so this select matters exactly during a backfill.
-    context.select<AppState, (bool, String)>(
-      (a) => (a.reanalyzing, a.reanalyzeProgress),
+    context.select<AppState, (bool, String, String?, String?)>(
+      (a) => (
+        a.reanalyzing,
+        a.reanalyzeProgress,
+        a.device.firmwareVersion,
+        a.device.bluetoothFirmwareVersion,
+      ),
     );
     final app = context.read<AppState>();
     return Scaffold(
@@ -255,6 +263,23 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
                   _kv(
                     'Cross-day updated',
                     _fmtMs((_crossday?['updated_at'] as num?)?.toInt()),
+                  ),
+                  const SizedBox(height: Sp.x3),
+                  _kv(
+                    'WHOOP firmware',
+                    app.device.firmwareVersion ??
+                        _firmware?['core_version']?.toString() ??
+                        '—',
+                  ),
+                  _kv(
+                    'Bluetooth firmware',
+                    app.device.bluetoothFirmwareVersion ??
+                        _firmware?['bluetooth_version']?.toString() ??
+                        '—',
+                  ),
+                  _kv(
+                    'Firmware read',
+                    _fmtMs((_firmware?['captured_at'] as num?)?.toInt()),
                   ),
                 ],
               ),

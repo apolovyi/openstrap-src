@@ -9,6 +9,80 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:openstrap_edge/ble/ble_state.dart';
 
 void main() {
+  group('BandFirmwareInfo', () {
+    String payload(List<int> components, {int length = 35}) {
+      final bytes = <int>[0xa0, 0x00, 0x00];
+      for (final value in components) {
+        bytes.addAll([
+          value & 0xff,
+          (value >> 8) & 0xff,
+          (value >> 16) & 0xff,
+          (value >> 24) & 0xff,
+        ]);
+      }
+      return bytes
+          .take(length)
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+    }
+
+    test('decodes WHOOP core and Bluetooth firmware components', () {
+      final raw = payload([41, 17, 4, 0, 17, 2, 2, 0]);
+      final info = BandFirmwareInfo.tryParse(raw);
+
+      expect(info, isNotNull);
+      expect(info!.coreVersion, '41.17.4.0');
+      expect(info.bluetoothVersion, '17.2.2.0');
+      expect(info.rawHex, raw);
+      expect(info.toJson()['payload_len'], 35);
+    });
+
+    test('decodes the 73-byte response captured from real hardware', () {
+      const raw =
+          'a2010129000000110000000200000000000000110000000200000002000000'
+          '0000000003000000040000000000000000000000030000000600000000000000'
+          '00000000080501000000';
+      final info = BandFirmwareInfo.tryParse(raw);
+
+      expect(info, isNotNull);
+      expect(info!.coreVersion, '41.17.2.0');
+      expect(info.bluetoothVersion, '17.2.2.0');
+      expect(info.toJson()['payload_len'], 73);
+    });
+
+    test('pads the observed 31-byte response variant honestly', () {
+      final raw = payload([41, 17, 2, 0, 17, 2, 2, 99], length: 31);
+      final info = BandFirmwareInfo.tryParse(raw);
+
+      expect(info, isNotNull);
+      expect(info!.coreVersion, '41.17.2.0');
+      expect(info.bluetoothVersion, '17.2.2.0');
+      expect(info.toJson()['payload_len'], 31);
+    });
+
+    test('rejects malformed, short, and versionless payloads', () {
+      expect(BandFirmwareInfo.tryParse('abc'), isNull);
+      expect(BandFirmwareInfo.tryParse(List.filled(35, 'zz').join()), isNull);
+      expect(BandFirmwareInfo.tryParse(List.filled(30, '00').join()), isNull);
+      expect(BandFirmwareInfo.tryParse(List.filled(35, '00').join()), isNull);
+    });
+  });
+
+  group('WHOOP 4 clock response', () {
+    test('decodes the status-prefixed timestamp captured from hardware', () {
+      final payload = <int>[
+        0xa1, 0x01, 0xa3, 0xff, 0x70, 0x6a, 0x58, 0x11, 0, 0, 0, 0, 0, 0,
+      ];
+
+      expect(decodeWhoop4ClockResponse(payload), 1785790371);
+    });
+
+    test('rejects a failed or truncated response', () {
+      expect(decodeWhoop4ClockResponse([0xa1, 0x00, 1, 2, 3, 4]), isNull);
+      expect(decodeWhoop4ClockResponse([0xa1, 0x01, 1, 2, 3]), isNull);
+    });
+  });
+
   group('ReconnectPolicy backoff schedule', () {
     final p = ReconnectPolicy(
       base: const Duration(seconds: 2),

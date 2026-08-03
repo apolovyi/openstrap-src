@@ -12,6 +12,69 @@ import 'dart:math';
 
 import '../sync/sync_policy.dart' show isPlausibleUnix;
 
+class BandFirmwareInfo {
+  final String coreVersion;
+  final String bluetoothVersion;
+  final String rawHex;
+
+  const BandFirmwareInfo({
+    required this.coreVersion,
+    required this.bluetoothVersion,
+    required this.rawHex,
+  });
+
+  static BandFirmwareInfo? tryParse(String rawHex) {
+    if (rawHex.length.isOdd || rawHex.length < 62) return null;
+    final bytes = <int>[];
+    for (var i = 0; i < rawHex.length; i += 2) {
+      final byte = int.tryParse(rawHex.substring(i, i + 2), radix: 16);
+      if (byte == null) return null;
+      bytes.add(byte);
+    }
+    if (bytes.length < 31) return null;
+    while (bytes.length < 35) {
+      bytes.add(0);
+    }
+
+    // The response starts with three status bytes, then the first eight
+    // little-endian u32 values are the four Harvard and four Bluetooth version
+    // components. Newer replies append more fields, which remain in rawHex.
+    int le32(int offset) =>
+        bytes[offset] |
+        (bytes[offset + 1] << 8) |
+        (bytes[offset + 2] << 16) |
+        (bytes[offset + 3] << 24);
+
+    String versionAt(int offset) =>
+        '${le32(offset)}.${le32(offset + 4)}.${le32(offset + 8)}.${le32(offset + 12)}';
+
+    final core = versionAt(3);
+    if (core == '0.0.0.0') return null;
+    return BandFirmwareInfo(
+      coreVersion: core,
+      bluetoothVersion: versionAt(19),
+      rawHex: rawHex.toLowerCase(),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'core_version': coreVersion,
+    'bluetooth_version': bluetoothVersion,
+    'raw_hex': rawHex,
+    'payload_len': rawHex.length ~/ 2,
+  };
+}
+
+int? decodeWhoop4ClockResponse(List<int> payload) {
+  // WHOOP 4 replies [origin_seq, success, epoch_u32_le, ...]. Sliding-window
+  // timestamp scans can mistake the overlapping status bytes for a future date.
+  if (payload.length < 6 || payload[1] != 1) return null;
+  return payload[2] |
+      (payload[3] << 8) |
+      (payload[4] << 16) |
+      (payload[5] << 24);
+}
+
 /// The explicit connection state machine. The flutter_blue_plus connection-state
 /// stream is the SOURCE OF TRUTH for connected/disconnected; this enum layers the
 /// app's intent + sub-phases (scan/discover/subscribe) on top of it.

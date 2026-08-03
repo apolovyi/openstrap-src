@@ -1219,6 +1219,7 @@ class BleEngine {
       );
       _setPhase(BleConnState.listening);
       _log('Connected + subscribed — listening (history + live).');
+      await _queryFirmwareInfo();
       _setOffloadActive(true);
       _lastBackfillAt = _wallSecs();
       await sendInit(); // triggers the historical offload flood
@@ -1742,7 +1743,10 @@ class BleEngine {
     } else if (pt == PacketType.consoleLogs && _offloadActive) {
       _drain?.onBurstConsole();
     }
-    final decoded = _maybeAugmentDataRange(frame, decodeFrame(frame));
+    final decoded = _maybeAugmentClock(
+      frame,
+      _maybeAugmentDataRange(frame, decodeFrame(frame)),
+    );
     _absorbState(decoded);
   }
 
@@ -1957,6 +1961,35 @@ class BleEngine {
       if (nm != null) {
         state.strapName = nm;
         onState(state);
+      }
+    }
+    final versionInfo = f['version_info'];
+    if (versionInfo is Map) {
+      final raw = versionInfo['raw_hex'];
+      if (raw is String && raw.isNotEmpty) {
+        final info = BandFirmwareInfo.tryParse(raw);
+        state.firmwareRawHex = raw;
+        state.firmwareVersion = info?.coreVersion;
+        state.bluetoothFirmwareVersion = info?.bluetoothVersion;
+        onState(state);
+        final capturedAt = DateTime.now().millisecondsSinceEpoch;
+        final persisted = <String, dynamic>{
+          if (info != null) ...info.toJson() else ...{
+            'raw_hex': raw,
+            'payload_len': raw.length ~/ 2,
+          },
+          'decoded': info != null,
+          'captured_at': capturedAt,
+        };
+        unawaited(
+          LocalDb.putComputeFreshness('firmware', jsonEncode(persisted)),
+        );
+        _log(
+          info == null
+              ? '[FIRMWARE] unrecognized payload (${raw.length ~/ 2} B): $raw'
+              : '[FIRMWARE] core=${info.coreVersion} '
+                  'bluetooth=${info.bluetoothVersion} raw=$raw',
+        );
       }
     }
     if (f.containsKey('battery_pct')) {
@@ -2606,6 +2639,16 @@ class BleEngine {
       inner.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
   // ── high-level flows ─────────────────────────────────────────────────────────────
+  Future<void> _queryFirmwareInfo() async {
+    _log('[FIRMWARE] requesting REPORT_VERSION_INFO (0x07).');
+    final sent = await _write(cmdReportVersionInfo(_seq.nextLive()));
+    if (!sent) {
+      _log('[FIRMWARE] query write failed.');
+      return;
+    }
+    await Future.delayed(const Duration(milliseconds: 120));
+  }
+
   Future<void> sendInit() async {
     _log('Sending 5-packet INIT…');
     for (final pkt in initPackets) {
@@ -3087,6 +3130,21 @@ class BleEngine {
       missing: missing,
       backward: backward,
     );
+  }
+
+  Decoded _maybeAugmentClock(Frame frame, Decoded decoded) {
+    if (decoded.kind != 'cmd_response' ||
+        decoded.fields['opcode'] != Cmd.getClock) {
+      return decoded;
+    }
+    final payload = frame.inner.length > 3
+        ? Uint8List.sublistView(frame.inner, 3)
+        : Uint8List(0);
+    final fields = <String, dynamic>{...decoded.fields};
+    fields.remove('clock_epoch');
+    final epoch = decodeWhoop4ClockResponse(payload);
+    if (epoch != null) fields['clock_epoch'] = epoch;
+    return Decoded(decoded.kind, fields);
   }
 
   Decoded _maybeAugmentDataRange(Frame frame, Decoded decoded) {

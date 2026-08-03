@@ -145,6 +145,9 @@ class DeviceState {
   alarmEpoch; // current strap alarm (unix sec) from GET_ALARM_TIME, if read
   String?
   strapName; // strap advertising name (editable via SET_ADVERTISING_NAME)
+  String? firmwareVersion;
+  String? bluetoothFirmwareVersion;
+  String? firmwareRawHex;
   String connection; // 'disconnected' | 'scanning' | 'connecting' | 'connected'
 
   // ── resumable-sync / reconnect-health flags ──────────────────────────────────
