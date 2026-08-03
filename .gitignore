@@ -51,6 +51,9 @@ app.*.map.json
 .env.local
 ios/Config/Signing.xcconfig
 
+# machine-specific maintainer deployment state
+/docs/local/
+
 # stray dumps / archives never belong in assets
 *.gz
 *.sql
