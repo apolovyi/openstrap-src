@@ -9,16 +9,18 @@ import io
 import json
 import math
 import os
+import re
 import tempfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 COLLECTIONS = ("cycles", "recoveries", "sleeps", "workouts")
 DAY_HEADERS = (
+    "Local day",
     "Cycle start time",
     "Sleep onset",
     "Wake onset",
@@ -341,11 +343,44 @@ def build_day_row(
     }
 
 
-def local_day(row: JsonObject, target_timezone: tzinfo) -> str:
+def parse_timezone_offset(value: Any, field: str) -> tzinfo:
+    if value == "Z":
+        return timezone.utc
+    if not isinstance(value, str):
+        raise ConversionError(f"{field} must be Z or an offset in +hh:mm form")
+    match = re.fullmatch(r"([+-])(\d{2}):(\d{2})", value)
+    if match is None:
+        raise ConversionError(f"{field} must be Z or an offset in +hh:mm form")
+    hours, minutes = int(match[2]), int(match[3])
+    if hours > 23 or minutes > 59:
+        raise ConversionError(f"{field} is outside the valid UTC offset range")
+    total_minutes = hours * 60 + minutes
+    if match[1] == "-":
+        total_minutes = -total_minutes
+    return timezone(timedelta(minutes=total_minutes))
+
+
+def local_day(
+    cycle: JsonObject,
+    sleep: JsonObject | None,
+    row: JsonObject,
+    fallback_timezone: tzinfo,
+) -> str:
     anchor = row.get("Wake onset") or row.get("Sleep onset") or row.get(
         "Cycle start time"
     )
-    return parse_timestamp(anchor, "day anchor").astimezone(target_timezone).date().isoformat()
+    offset = (sleep or {}).get("timezone_offset") or cycle.get("timezone_offset")
+    source_timezone = (
+        parse_timezone_offset(offset, "WHOOP timezone_offset")
+        if offset not in (None, "")
+        else fallback_timezone
+    )
+    return (
+        parse_timestamp(anchor, "day anchor")
+        .astimezone(source_timezone)
+        .date()
+        .isoformat()
+    )
 
 
 def day_rank(row: JsonObject, cycle_id: Any) -> tuple[Any, ...]:
@@ -368,7 +403,8 @@ def build_day_rows(data: JsonObject, target_timezone: tzinfo) -> DayRows:
         recovery = index.recoveries_by_cycle.get(str(cycle["id"]))
         sleep = select_primary_sleep(cycle, recovery, index)
         row = build_day_row(cycle, recovery, sleep)
-        day = local_day(row, target_timezone)
+        day = local_day(cycle, sleep, row, target_timezone)
+        row["Local day"] = day
         ranked = (day_rank(row, cycle["id"]), row)
         previous = selected.get(day)
         if previous is not None:
@@ -465,7 +501,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timezone",
         required=True,
-        help="IANA timezone used by the device when importing, e.g. Europe/Zurich",
+        help="IANA fallback timezone for records missing WHOOP timezone_offset",
     )
     return parser
 

@@ -310,18 +310,18 @@ class AppState extends ChangeNotifier {
   }
 
   /// WHOOP export CSV(s) → derived-snapshot days (+ workouts). BETA.
-  Future<int> importWhoopCsvs(
+  Future<WhoopImportResult> importWhoopCsvs(
     List<String> paths, {
     void Function(int days)? onProgress,
   }) async {
-    final res = await WhoopImporter.importFiles(
+    final result = await WhoopImporter.importFiles(
       paths,
       engine: _derive,
       profile: _profile,
       onProgress: onProgress,
     );
     notifyListeners();
-    return res.days;
+    return result;
   }
 
   /// Another device's exported OpenStrap DB (.db) → merge into the local store.
@@ -522,9 +522,13 @@ class AppState extends ChangeNotifier {
   Future<Map<String, dynamic>> updateProfile(
     Map<String, dynamic> fields,
   ) async {
+    final wasComplete = _profile.isComplete;
     user = {...?user, ...fields};
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kProfile, jsonEncode(user));
+    if (!wasComplete && _profile.isComplete) {
+      await _derive.finalizeImport(_profile);
+    }
     notifyListeners();
     return user!;
   }

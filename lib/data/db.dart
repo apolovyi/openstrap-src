@@ -21,6 +21,38 @@ import 'day_label.dart';
 import 'live_coverage_policy.dart';
 import 'models.dart';
 
+class WhoopDayWrite {
+  final String dayId;
+  final String payloadJson;
+  final String windowJson;
+  final double? rhr;
+  final double? rmssd;
+  final double? readiness;
+  final Map<String, double?> series;
+
+  const WhoopDayWrite({
+    required this.dayId,
+    required this.payloadJson,
+    required this.windowJson,
+    required this.rhr,
+    required this.rmssd,
+    required this.readiness,
+    required this.series,
+  });
+}
+
+class WhoopImportCommit {
+  final int days;
+  final int workouts;
+  final int skippedExistingDays;
+
+  const WhoopImportCommit({
+    required this.days,
+    required this.workouts,
+    required this.skippedExistingDays,
+  });
+}
+
 class LocalDb {
   static Database? _db;
   static String dbName = 'openstrap.db';
@@ -2746,6 +2778,116 @@ class LocalDb {
     });
   }
 
+  /// Atomically commit a validated WHOOP snapshot bundle. Existing measured
+  /// days are protected inside the same transaction that writes the import.
+  static Future<WhoopImportCommit> putWhoopImport({
+    required List<WhoopDayWrite> days,
+    required List<Map<String, Object?>> workouts,
+    required int algoVersion,
+  }) async {
+    final db = await instance;
+    return db.transaction((txn) async {
+      final protected = <String>{};
+      final dayIds = [for (final day in days) day.dayId];
+      for (final chunk in _sqlVarChunks(dayIds)) {
+        final marks = List.filled(chunk.length, '?').join(',');
+        final rows = await txn.rawQuery(
+          'SELECT r.day_id, r.payload_json, r.skipped FROM day_result r '
+          'JOIN (SELECT day_id, MAX(algo_version) AS v FROM day_result '
+          'GROUP BY day_id) m '
+          'ON r.day_id = m.day_id AND r.algo_version = m.v '
+          'WHERE r.day_id IN ($marks)',
+          chunk,
+        );
+        for (final row in rows) {
+          if (((row['skipped'] as num?) ?? 0).toInt() == 1) continue;
+          try {
+            final payload = jsonDecode((row['payload_json'] as String?) ?? '{}');
+            if (payload is Map &&
+                (payload['skipped'] == true || payload['imported'] == true)) {
+              continue;
+            }
+          } catch (_) {
+            protected.add(row['day_id'] as String);
+            continue;
+          }
+          protected.add(row['day_id'] as String);
+        }
+      }
+
+      final rawRows = await txn.rawQuery(
+        "SELECT strftime('%Y-%m-%d', rec_ts, 'unixepoch', 'localtime') AS d "
+        'FROM decoded_onehz GROUP BY d',
+      );
+      final rawDays = {
+        for (final row in rawRows)
+          if (row['d'] is String) row['d'] as String,
+      };
+      final now = DateTime.now().millisecondsSinceEpoch;
+      var batch = txn.batch();
+      var ops = 0;
+      Future<void> flush() async {
+        if (ops == 0) return;
+        await batch.commit(noResult: true);
+        batch = txn.batch();
+        ops = 0;
+      }
+
+      var writtenDays = 0;
+      for (final day in days) {
+        if (protected.contains(day.dayId)) continue;
+        batch.insert(
+          'day_result',
+          {
+            'day_id': day.dayId,
+            'algo_version': algoVersion,
+            'payload_json': day.payloadJson,
+            'window_json': day.windowJson,
+            'computed_at': now,
+            'finalized': rawDays.contains(day.dayId) ? 0 : 1,
+            'skipped': 0,
+            'partial': 0,
+            'rhr': day.rhr,
+            'rmssd': day.rmssd,
+            'readiness': day.readiness,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        batch.delete(
+          'metric_series',
+          where: 'date = ?',
+          whereArgs: [day.dayId],
+        );
+        ops += 2;
+        for (final entry in day.series.entries) {
+          batch.insert(
+            'metric_series',
+            {'date': day.dayId, 'key': entry.key, 'value': entry.value},
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+          ops++;
+        }
+        writtenDays++;
+        if (ops >= 3000) await flush();
+      }
+      for (final workout in workouts) {
+        batch.insert(
+          'sessions',
+          workout,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        ops++;
+        if (ops >= 3000) await flush();
+      }
+      await flush();
+      return WhoopImportCommit(
+        days: writtenDays,
+        workouts: workouts.length,
+        skippedExistingDays: protected.length,
+      );
+    });
+  }
+
   /// The latest-version result row for one day_id (highest algo_version), with a
   /// normalized `date` alias for callers. Null if absent.
   static Future<Map<String, dynamic>?> dayResult(String dayId) async {
@@ -3852,6 +3994,28 @@ class LocalDb {
       whereArgs: [key],
       orderBy: 'date ASC',
       limit: limit,
+    );
+  }
+
+  /// Baseline input excludes imported vendor snapshots. They remain available
+  /// through [metricSeries] for historical trends, but never normalize a newly
+  /// measured local day against another vendor's algorithm or stale history.
+  static Future<List<Map<String, dynamic>>> baselineMetricSeries(
+    String key,
+  ) async {
+    final db = await instance;
+    return db.rawQuery(
+      'SELECT m.date, m.key, m.value FROM metric_series m '
+      'WHERE m.key = ? AND m.value IS NOT NULL AND NOT EXISTS ('
+      'SELECT 1 FROM day_result r '
+      'WHERE r.day_id = m.date '
+      'AND r.algo_version = ('
+      'SELECT MAX(r2.algo_version) FROM day_result r2 '
+      'WHERE r2.day_id = r.day_id) '
+      'AND json_valid(r.payload_json) '
+      "AND json_extract(r.payload_json, '\$.imported') = 1"
+      ') ORDER BY m.date ASC',
+      [key],
     );
   }
 

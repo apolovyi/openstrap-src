@@ -570,7 +570,7 @@ class _BaselineHistoryCache {
   /// trailing window is taken here, in Dart, per target day.
   static Future<_BaselineHistoryCache> load() async {
     Future<List<_DatedValue>> hist(String key) async {
-      final rows = await LocalDb.metricSeries(key);
+      final rows = await LocalDb.baselineMetricSeries(key);
       final out = <_DatedValue>[];
       for (final row in rows) {
         final date = row['date'];
@@ -1901,12 +1901,12 @@ class DerivationEngine {
     return done;
   }
 
-  /// Run the cross-day rollup + notifications + baseline refresh once after an
-  /// import completes (reflects the freshly imported day history).
+  /// Refresh baselines and cross-day rollups after a historical import.
+  /// Notifications are intentionally excluded: old conclusions are not current
+  /// alerts and must never buzz merely because history was loaded.
   Future<void> finalizeImport(Profile profile) async {
     await _refreshBaselines();
     await _runCrossDay(profile);
-    await _runNotifications();
   }
 
   // ── derive one day ──────────────────────────────────────────────────────────

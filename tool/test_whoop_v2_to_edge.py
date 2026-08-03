@@ -28,6 +28,7 @@ def fixture():
             {
                 "id": 1,
                 "start": "2024-01-02T00:00:00Z",
+                "timezone_offset": "+01:00",
                 "score": {"strain": 8.5, "kilojoule": 4184},
             }
         ],
@@ -50,6 +51,7 @@ def fixture():
                 "cycle_id": 1,
                 "start": "2024-01-02T01:00:00Z",
                 "end": "2024-01-02T08:00:00Z",
+                "timezone_offset": "+01:00",
                 "nap": False,
                 "score": {
                     "respiratory_rate": 14.2,
@@ -70,6 +72,7 @@ def fixture():
                 "id": 20,
                 "start": "2024-01-02T12:00:00Z",
                 "end": "2024-01-02T13:00:00Z",
+                "timezone_offset": "+01:00",
                 "sport_name": "Run, fast",
                 "score": {"strain": 10.5, "kilojoule": 900, "max_heart_rate": 180},
             }
@@ -232,7 +235,28 @@ class DayResolutionTests(unittest.TestCase):
         self.assertEqual(result.collisions, 1)
         self.assertEqual(result.rows[0]["Recovery score %"], 72)
 
-    def test_timezone_is_explicit_and_changes_day_resolution(self):
+    def test_recorded_offset_wins_over_fallback_timezone(self):
+        data = fixture()
+        data["sleeps"][0]["end"] = "2024-01-02T00:30:00Z"
+        data["sleeps"][0]["timezone_offset"] = "-01:00"
+        result = build_day_rows(data, ZoneInfo("Europe/Zurich"))
+        self.assertEqual(result.rows[0]["Local day"], "2024-01-01")
+
+    def test_sleep_offset_wins_over_cycle_offset(self):
+        data = fixture()
+        data["cycles"][0]["timezone_offset"] = "+12:00"
+        data["sleeps"][0]["timezone_offset"] = "-05:00"
+        data["sleeps"][0]["end"] = "2024-01-02T02:00:00Z"
+        result = build_day_rows(data, ZoneInfo("Europe/Zurich"))
+        self.assertEqual(result.rows[0]["Local day"], "2024-01-01")
+
+    def test_invalid_recorded_offset_is_rejected(self):
+        data = fixture()
+        data["sleeps"][0]["timezone_offset"] = "Europe/Zurich"
+        with self.assertRaisesRegex(ConversionError, "timezone_offset"):
+            build_day_rows(data, ZoneInfo("Europe/Zurich"))
+
+    def test_fallback_timezone_changes_resolution_when_offset_is_missing(self):
         data = {
             "cycles": [
                 {"id": 1, "start": "2024-01-02T00:30:00Z", "score": None},
@@ -268,6 +292,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(len(days), 1)
             self.assertEqual(len(workouts), 1)
             self.assertEqual(tuple(days[0]), DAY_HEADERS)
+            self.assertEqual(days[0]["Local day"], "2024-01-02")
             self.assertEqual(tuple(workouts[0]), WORKOUT_HEADERS)
             self.assertEqual(output.stat().st_mode & 0o777, 0o700)
             self.assertEqual(
