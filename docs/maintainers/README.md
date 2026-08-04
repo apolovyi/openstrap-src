@@ -5,6 +5,8 @@ These documents cover repeatable repository maintenance. User-facing setup remai
 
 - [`IOS_LOCAL_DEPLOYMENT.md`](IOS_LOCAL_DEPLOYMENT.md) — build, provision, sign,
   install, launch, verify, and clean up a local iOS deployment.
+- [`WHOOP4_FIRMWARE_COMPATIBILITY.md`](WHOOP4_FIRMWARE_COMPATIBILITY.md) — evaluate
+  firmware evidence and run a non-destructive pre/post-update verification.
 
 Machine-specific state belongs in `docs/local/`, which is gitignored. For iOS,
 maintain `docs/local/ios-deployment.md` with the current Mac, Apple team, bundle
