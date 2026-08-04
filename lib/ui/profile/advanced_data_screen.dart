@@ -300,6 +300,22 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
                     ),
                   ),
                   _kv(
+                    'Build commit',
+                    (_bleRuntime?['build_commit'] ?? '—').toString(),
+                  ),
+                  _kv(
+                    'Runtime mode',
+                    _bleRuntime?['product_mode'] == true
+                        ? 'Release (product)'
+                        : _bleRuntime?['product_mode'] == false
+                            ? 'Debug/profile'
+                            : '—',
+                  ),
+                  _kv(
+                    'Flutter',
+                    (_bleRuntime?['flutter_version'] ?? '—').toString(),
+                  ),
+                  _kv(
                     'Connection',
                     '${_bleRuntime?['connection_phase'] ?? '—'} '
                         '(${_bleRuntime?['engine_role'] ?? '—'})',

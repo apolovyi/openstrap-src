@@ -217,7 +217,7 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: flutter build apk --release --dart-define-from-file=.env
+        run: flutter build apk --release --dart-define-from-file=.env --dart-define=BUILD_COMMIT="$GITHUB_SHA"
 
       - name: Name the APK after the version
         id: rename
@@ -312,7 +312,7 @@ jobs:
           echo "$FIREBASE_OPTIONS_DART_B64" | base64 -d > lib/firebase_options.dart
 
       - name: Build unsigned iOS app
-        run: flutter build ios --release --no-codesign --dart-define-from-file=.env
+        run: flutter build ios --release --no-codesign --dart-define-from-file=.env --dart-define=BUILD_COMMIT="$GITHUB_SHA"
 
       # See the job-level comment above: the Watch companion cannot survive a
       # per-user free-account resign under any sideloading tool (Sideloadly,

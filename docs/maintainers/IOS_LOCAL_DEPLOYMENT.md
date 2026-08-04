@@ -25,7 +25,8 @@ FLUTTER=/absolute/path/to/the/ci-pinned/flutter
 (cd ios && pod install)
 "$FLUTTER" analyze
 "$FLUTTER" test --concurrency=1
-"$FLUTTER" build ios --release --no-codesign --dart-define-from-file=.env
+"$FLUTTER" build ios --release --no-codesign --dart-define-from-file=.env \
+  --dart-define=BUILD_COMMIT="$(git rev-parse HEAD)"
 ```
 
 Inspect `ios/Podfile.lock`. Restore changes that only update the CocoaPods generator

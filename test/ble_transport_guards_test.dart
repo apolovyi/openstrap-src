@@ -52,6 +52,9 @@ void main() {
       expect(snapshots.last['connection_phase'], 'disconnected');
       expect(snapshots.last['connected'], isFalse);
       expect(snapshots.last['session_connected'], isFalse);
+      expect(snapshots.last, contains('build_commit'));
+      expect(snapshots.last, contains('flutter_version'));
+      expect(snapshots.last, contains('product_mode'));
       expect(snapshots.last, contains('last_rx_ms'));
       expect(snapshots.last, contains('clock_drift_sec'));
       expect(snapshots.last, contains('crc_failures_this_session'));

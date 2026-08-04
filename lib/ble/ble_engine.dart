@@ -749,6 +749,15 @@ class BleEngine {
         offload['session_packet_counts_by_revision'] as Map<int, int>;
     return {
       'observed_at_ms': DateTime.now().millisecondsSinceEpoch,
+      'build_commit': const String.fromEnvironment(
+        'BUILD_COMMIT',
+        defaultValue: 'unknown',
+      ),
+      'flutter_version': const String.fromEnvironment(
+        'FLUTTER_VERSION',
+        defaultValue: 'unknown',
+      ),
+      'product_mode': const bool.fromEnvironment('dart.vm.product'),
       'engine_role': isBackgroundDrainer ? 'headless' : 'foreground',
       'connection_phase': state.connection,
       'connected': isConnected,
