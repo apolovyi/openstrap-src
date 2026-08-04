@@ -25,6 +25,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
   Map<String, dynamic>? _today;
   Map<String, dynamic>? _crossday;
   Map<String, dynamic>? _firmware;
+  Map<String, dynamic>? _bleRuntime;
   final Set<String> _selected = <String>{};
 
   @override
@@ -42,6 +43,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
     final todayRow = await LocalDb.computeFreshness('today');
     final crossdayRow = await LocalDb.computeFreshness('crossday');
     final firmwareRow = await LocalDb.computeFreshness('firmware');
+    final bleRuntimeRow = await LocalDb.computeFreshness('ble_runtime');
     Map<String, dynamic>? decode(Map<String, dynamic>? row) {
       final raw = row?['payload_json'];
       if (raw is! String || raw.isEmpty) return null;
@@ -61,6 +63,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
       _today = decode(todayRow);
       _crossday = decode(crossdayRow);
       _firmware = decode(firmwareRow);
+      _bleRuntime = decode(bleRuntimeRow);
       _selected.removeWhere((d) => !_days.any((row) => row['day_id'] == d));
       _loading = false;
     });
@@ -85,6 +88,14 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
     final n = (rows as num?)?.toInt();
     if (n == null) return '—';
     return n.toString();
+  }
+
+  String _clockStatus() {
+    final accepted = _bleRuntime?['last_clock_read_accepted'];
+    if (accepted == null) return '—';
+    if (accepted != true) return 'Rejected';
+    final drift = (_bleRuntime?['clock_drift_sec'] as num?)?.toInt();
+    return drift == null ? 'Accepted' : 'Accepted (${drift}s drift)';
   }
 
   Future<void> _reanalyzeSelected() async {
@@ -280,6 +291,59 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
                   _kv(
                     'Firmware read',
                     _fmtMs((_firmware?['captured_at'] as num?)?.toInt()),
+                  ),
+                  const SizedBox(height: Sp.x3),
+                  _kv(
+                    'BLE runtime observed',
+                    _fmtMs(
+                      (_bleRuntime?['observed_at_ms'] as num?)?.toInt(),
+                    ),
+                  ),
+                  _kv(
+                    'Connection',
+                    '${_bleRuntime?['connection_phase'] ?? '—'} '
+                        '(${_bleRuntime?['engine_role'] ?? '—'})',
+                  ),
+                  _kv(
+                    'Last BLE frame',
+                    _fmtMs((_bleRuntime?['last_rx_ms'] as num?)?.toInt()),
+                  ),
+                  _kv('Clock read', _clockStatus()),
+                  _kv(
+                    'CRC failures',
+                    '${_bleRuntime?['crc_failures_this_session'] ?? '—'} session / '
+                        '${_bleRuntime?['crc_failures_total'] ?? '—'} total',
+                  ),
+                  _kv(
+                    'Burst mismatches',
+                    '${_bleRuntime?['burst_mismatch_streak'] ?? '—'} streak / '
+                        '${_bleRuntime?['burst_mismatch_total'] ?? '—'} total',
+                  ),
+                  _kv(
+                    'Gate drops',
+                    (_bleRuntime?['gate_dropped_total'] ?? '—').toString(),
+                  ),
+                  _kv(
+                    'Poisoned bursts',
+                    (_bleRuntime?['poisoned_bursts_total'] ?? '—').toString(),
+                  ),
+                  _kv(
+                    'Corrupt reads',
+                    '${_bleRuntime?['corrupt_clock_reads_total'] ?? '—'} clock / '
+                        '${_bleRuntime?['corrupt_data_ranges_total'] ?? '—'} range',
+                  ),
+                  _kv(
+                    'Last sync report',
+                    _bleRuntime?['last_report_complete'] == true
+                        ? 'Complete'
+                        : _bleRuntime?['last_report_complete'] == false
+                            ? 'Incomplete'
+                            : '—',
+                  ),
+                  _kv(
+                    'Packet revisions',
+                    (_bleRuntime?['session_packet_counts_by_revision'] ?? '—')
+                        .toString(),
                   ),
                 ],
               ),

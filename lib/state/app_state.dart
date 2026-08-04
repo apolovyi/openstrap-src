@@ -689,6 +689,10 @@ class AppState extends ChangeNotifier {
       // LIVE high-rate frames (0x28/0x2B/0x33) are ephemeral — routed here for the
       // live UI / spot-check, never persisted.
       onLiveFrame: _onLiveFrame,
+      onDiagnostics: (snapshot) => LocalDb.putComputeFreshness(
+        'ble_runtime',
+        jsonEncode(snapshot),
+      ),
       deriveDataStaleness: () {
         final ts = _lastRecTs;
         if (ts == null || ts <= 0) return const Duration(days: 3650);

@@ -2,6 +2,8 @@
 // the process-wide single-owner band claim, link-down teardown, and inbound
 // frame routing.
 
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:openstrap_edge/ble/ble_engine.dart';
 import 'package:openstrap_edge/ble/ble_state.dart';
@@ -33,6 +35,29 @@ void main() {
       // the rest of the process lifetime.
       expect(BleEngine.bandClaimed, isFalse);
       expect(engine.holdsBandLink, isFalse);
+    });
+
+    test('runtime diagnostics survive a failed connection attempt', () async {
+      final snapshots = <Map<String, dynamic>>[];
+      final engine = BleEngine(
+        onRecord: (sample, raw) async {},
+        onState: (_) {},
+        onDiagnostics: (snapshot) async => snapshots.add(snapshot),
+      );
+
+      await engine.connectToRemoteId('AA:BB:CC:DD:EE:FF');
+      await engine.flushDiagnostics();
+
+      expect(snapshots, isNotEmpty);
+      expect(snapshots.last['connection_phase'], 'disconnected');
+      expect(snapshots.last['connected'], isFalse);
+      expect(snapshots.last['session_connected'], isFalse);
+      expect(snapshots.last, contains('last_rx_ms'));
+      expect(snapshots.last, contains('clock_drift_sec'));
+      expect(snapshots.last, contains('crc_failures_this_session'));
+      expect(snapshots.last, contains('burst_mismatch_total'));
+      expect(snapshots.last, contains('gate_dropped_total'));
+      expect(() => jsonEncode(snapshots.last), returnsNormally);
     });
 
     test(

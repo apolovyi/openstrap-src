@@ -83,6 +83,7 @@ typedef ArchiveSink = Future<void> Function(ArchiveRecord archive);
 /// DerivationEngine pass. Replaces the old "runSync() → SyncReport → derive"
 /// trigger now that listening is continuous and there's no discrete sync end.
 typedef DataStoredSink = void Function();
+typedef DiagnosticsSink = Future<void> Function(Map<String, dynamic> snapshot);
 
 @visibleForTesting
 int countHistoricalBurstPackets({
@@ -334,6 +335,7 @@ class BleEngine {
   /// feature-extraction. NEVER hits raw_records.
   final LiveFrameSink? onLiveFrame;
   final OffloadStateSink? onOffloadState;
+  final DiagnosticsSink? onDiagnostics;
 
   /// If provided, sync chunks are persisted via this ATOMIC commit (raw + samples
   /// + continuation cursor in one transaction) before the HISTORY_END ACK. This is
@@ -363,6 +365,7 @@ class BleEngine {
     this.onDataStored,
     this.onLiveFrame,
     this.onOffloadState,
+    this.onDiagnostics,
     this.onCommitBatch,
     this.onArchiveRecord,
     this.cursorReader,
@@ -657,6 +660,9 @@ class BleEngine {
   // Proactive RTC recheck timestamp for long-lived connections — see
   // kRtcReverifyIntervalSeconds. Every other clock recheck is symptom-driven.
   DateTime? _lastClockVerifyAt;
+  int? _lastClockReadDevice;
+  int? _lastClockReadWall;
+  bool? _lastClockReadAccepted;
   int? _sessionOldestUnix; // strap's banked-data window (GET_DATA_RANGE)
   int? _sessionNewestUnix;
   // Lifetime count of GET_DATA_RANGE reads rejected by isCorruptFutureRtc —
@@ -732,6 +738,67 @@ class BleEngine {
   /// UI's "last data: Xs ago". `null` until the first frame this connection.
   DateTime? get lastRxAt =>
       _lastRx.millisecondsSinceEpoch == 0 ? null : _lastRx;
+
+  DateTime _lastDiagnosticsPublish = DateTime.fromMillisecondsSinceEpoch(0);
+  Future<void> _diagnosticsWrite = Future<void>.value();
+
+  Map<String, dynamic> get runtimeSnapshot {
+    final clock = _clockRef;
+    final offload = offloadSnapshot;
+    final revisionCounts =
+        offload['session_packet_counts_by_revision'] as Map<int, int>;
+    return {
+      'observed_at_ms': DateTime.now().millisecondsSinceEpoch,
+      'engine_role': isBackgroundDrainer ? 'headless' : 'foreground',
+      'connection_phase': state.connection,
+      'connected': isConnected,
+      'session_connected': _session?.connected == true,
+      'last_rx_ms': lastRxAt?.millisecondsSinceEpoch,
+      'firmware_version': state.firmwareVersion,
+      'bluetooth_firmware_version': state.bluetoothFirmwareVersion,
+      'battery_pct': state.batteryPct,
+      'charging': state.charging,
+      'wrist_on': state.wristOn,
+      'clock_device_epoch': clock?.device,
+      'clock_wall_epoch': clock?.wall,
+      'clock_drift_sec': clock?.driftSec,
+      'last_clock_read_device_epoch': _lastClockReadDevice,
+      'last_clock_read_wall_epoch': _lastClockReadWall,
+      'last_clock_read_accepted': _lastClockReadAccepted,
+      'last_clock_verify_ms': _lastClockVerifyAt?.millisecondsSinceEpoch,
+      'clock_set_attempts': _clockCorrectTries,
+      'standard_hr_fallback': state.standardHrFallback,
+      'needs_repair_guide': state.needsRepairGuide,
+      'auto_reconnect_paused': state.autoReconnectPaused,
+      'sync_clock_lost': state.syncClockLost,
+      'strap_needs_reboot': state.strapNeedsReboot,
+      ...offload,
+      'session_packet_counts_by_revision': {
+        for (final entry in revisionCounts.entries)
+          entry.key.toString(): entry.value,
+      },
+    };
+  }
+
+  void _publishDiagnostics({bool force = false}) {
+    final sink = onDiagnostics;
+    if (sink == null) return;
+    final now = DateTime.now();
+    if (!force &&
+        now.difference(_lastDiagnosticsPublish) < const Duration(seconds: 30)) {
+      return;
+    }
+    _lastDiagnosticsPublish = now;
+    final snapshot = runtimeSnapshot;
+    _diagnosticsWrite = _diagnosticsWrite.then((_) => sink(snapshot)).catchError(
+      (Object error, StackTrace stackTrace) {
+        _log('[diagnostics] runtime snapshot write failed: $error');
+      },
+    );
+  }
+
+  @visibleForTesting
+  Future<void> flushDiagnostics() => _diagnosticsWrite;
 
   // ── debounced "new data stored → derive" trigger ─────────────────────────────
   // Continuous listening has no discrete "sync done", so we coalesce stored-record
@@ -818,6 +885,7 @@ class BleEngine {
     _phase = p;
     state.connection = connStringFor(p);
     onState(state);
+    _publishDiagnostics(force: true);
   }
 
   bool get isConnected =>
@@ -1377,6 +1445,7 @@ class BleEngine {
         // Ignore notifications from a session we've already torn down.
         if (_session != session || !session.connected) return;
         _lastRx = DateTime.now();
+        var corruptionTripped = false;
         for (final frame in session.asm[role]!.feed(chunk)) {
           if (frame.valid) {
             _onFrame(role, frame, session);
@@ -1390,6 +1459,7 @@ class BleEngine {
             _crcFailuresThisSession++;
           }
           if (_frameCorruption.feed(frame.valid)) {
+            corruptionTripped = true;
             state.standardHrFallback = true;
             onState(state);
             _log(
@@ -1399,6 +1469,7 @@ class BleEngine {
             );
           }
         }
+        _publishDiagnostics(force: corruptionTripped);
       }),
     );
   }
@@ -1990,6 +2061,7 @@ class BleEngine {
               : '[FIRMWARE] core=${info.coreVersion} '
                   'bluetooth=${info.bluetoothVersion} raw=$raw',
         );
+        _publishDiagnostics(force: true);
       }
     }
     if (f.containsKey('battery_pct')) {
@@ -2013,6 +2085,10 @@ class BleEngine {
     if (f.containsKey('clock_epoch')) {
       final dev = f['clock_epoch'] as int;
       final wall = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final accepted = ClockPolicy.acceptsClockRead(dev, wall);
+      _lastClockReadDevice = dev;
+      _lastClockReadWall = wall;
+      _lastClockReadAccepted = accepted;
       // SANITY GATE, mirroring the one `range_newest` gets below. An
       // implausibly far-future `clock_epoch` yields a large NEGATIVE driftSec,
       // and setAlarm arms at `when - driftSec` — years out, where the alarm
@@ -2021,7 +2097,7 @@ class BleEngine {
       // correlation the alarm falls back to the raw wall epoch. connect()
       // already issues an unconditional SET_CLOCK, and the periodic re-verify
       // re-reads, so a genuinely-wrong RTC still gets corrected.
-      if (!ClockPolicy.acceptsClockRead(dev, wall)) {
+      if (!accepted) {
         _corruptClockReadCount++;
         _log(
           '[SYNC] GET_CLOCK clock_epoch=$dev is implausibly far in the future '
@@ -2056,6 +2132,7 @@ class BleEngine {
           _clockCorrectTries = 0; // latched — reset for the next drift episode
         }
       }
+      _publishDiagnostics(force: true);
     }
     if (f.containsKey('range_oldest') && f.containsKey('range_newest')) {
       final oldest = f['range_oldest'] as int;
@@ -2081,6 +2158,7 @@ class BleEngine {
         state.dataRangeNewest = newest;
         onState(state);
       }
+      _publishDiagnostics(force: true);
     }
     if (d.kind == 'cmd_response' && f['hello'] is HelloInfo) {
       final h = f['hello'] as HelloInfo;
@@ -3054,6 +3132,7 @@ class BleEngine {
     if (_offloadActive == active) return;
     _offloadActive = active;
     onOffloadState?.call(active);
+    _publishDiagnostics(force: true);
   }
 
   void _setHpsTerminal(
