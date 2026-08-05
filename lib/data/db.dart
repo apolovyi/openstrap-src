@@ -2566,6 +2566,95 @@ class LocalDb {
     return out;
   }
 
+  static Future<Map<String, dynamic>> auditDecodedOneHzContinuity({
+    required int? frontierBefore,
+    required int? frontierAfter,
+  }) async {
+    final observedAt = DateTime.now().millisecondsSinceEpoch;
+    final base = <String, dynamic>{
+      'observed_at_ms': observedAt,
+      'frontier_before_ts': frontierBefore,
+      'frontier_after_ts': frontierAfter,
+    };
+    if (frontierBefore == null ||
+        frontierAfter == null ||
+        frontierAfter <= frontierBefore) {
+      return {
+        ...base,
+        'status': 'no_new_data',
+        'gap_count': 0,
+        'missing_seconds': 0,
+      };
+    }
+
+    final db = await instance;
+    const gaps = '''
+      SELECT d.rec_ts AS after_ts,
+             (SELECT MAX(p.rec_ts)
+                FROM decoded_onehz p
+               WHERE p.rec_ts < d.rec_ts) AS before_ts
+        FROM decoded_onehz d
+        LEFT JOIN decoded_onehz immediate
+          ON immediate.rec_ts = d.rec_ts - 1
+       WHERE d.rec_ts > ? AND d.rec_ts <= ?
+         AND immediate.rec_ts IS NULL
+    ''';
+    final aggregate = (await db.rawQuery(
+      'SELECT COUNT(*) AS gap_count, '
+      'COALESCE(SUM(after_ts - before_ts - 1), 0) AS missing_seconds '
+      'FROM ($gaps) '
+      'WHERE before_ts IS NOT NULL AND after_ts - before_ts > 1',
+      [frontierBefore, frontierAfter],
+    )).first;
+    final gapCount = (aggregate['gap_count'] as num?)?.toInt() ?? 0;
+    final missingSeconds =
+        (aggregate['missing_seconds'] as num?)?.toInt() ?? 0;
+    if (gapCount == 0) {
+      return {
+        ...base,
+        'status': 'continuous',
+        'gap_count': 0,
+        'missing_seconds': 0,
+      };
+    }
+
+    final largest = (await db.rawQuery(
+      'SELECT before_ts, after_ts, after_ts - before_ts - 1 AS missing_seconds '
+      'FROM ($gaps) '
+      'WHERE before_ts IS NOT NULL AND after_ts - before_ts > 1 '
+      'ORDER BY missing_seconds DESC LIMIT 1',
+      [frontierBefore, frontierAfter],
+    )).first;
+    return {
+      ...base,
+      'status': 'gaps_detected',
+      'gap_count': gapCount,
+      'missing_seconds': missingSeconds,
+      'largest_gap_missing_seconds':
+          (largest['missing_seconds'] as num).toInt(),
+      'largest_gap_before_ts': (largest['before_ts'] as num).toInt(),
+      'largest_gap_after_ts': (largest['after_ts'] as num).toInt(),
+    };
+  }
+
+  static Future<Map<String, dynamic>> auditAndPersistDecodedOneHzContinuity({
+    required int? frontierBefore,
+    required int? frontierAfter,
+  }) async {
+    final audit = await auditDecodedOneHzContinuity(
+      frontierBefore: frontierBefore,
+      frontierAfter: frontierAfter,
+    );
+    await Future.wait([
+      putComputeFreshness('capture_gap_audit', jsonEncode(audit)),
+      upsertSyncLedgerEntry(
+        status: 'complete',
+        metaPatch: {'capture_gap_audit': audit},
+      ),
+    ]);
+    return audit;
+  }
+
   /// Decoded 1 Hz frames in record-time order. This is the preferred derive
   /// read path: smaller than raw hex, directly queryable, and already split into
   /// canonical columns.

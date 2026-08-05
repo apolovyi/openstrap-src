@@ -973,9 +973,9 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: "7edcb3e377329968118c62cb03a81d95e2f6db8e"
-      resolved-ref: "7edcb3e377329968118c62cb03a81d95e2f6db8e"
-      url: "https://github.com/OpenStrap/protocol.git"
+      ref: "811cb0e738daf9707bdd794b5c2f15d8177f5c32"
+      resolved-ref: "811cb0e738daf9707bdd794b5c2f15d8177f5c32"
+      url: "https://github.com/apolovyi/protocol.git"
     source: git
     version: "1.0.0"
   ota_update:

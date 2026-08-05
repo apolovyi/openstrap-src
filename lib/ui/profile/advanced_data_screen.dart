@@ -26,6 +26,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
   Map<String, dynamic>? _crossday;
   Map<String, dynamic>? _firmware;
   Map<String, dynamic>? _bleRuntime;
+  Map<String, dynamic>? _gapAudit;
   final Set<String> _selected = <String>{};
 
   @override
@@ -44,6 +45,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
     final crossdayRow = await LocalDb.computeFreshness('crossday');
     final firmwareRow = await LocalDb.computeFreshness('firmware');
     final bleRuntimeRow = await LocalDb.computeFreshness('ble_runtime');
+    final gapAuditRow = await LocalDb.computeFreshness('capture_gap_audit');
     Map<String, dynamic>? decode(Map<String, dynamic>? row) {
       final raw = row?['payload_json'];
       if (raw is! String || raw.isEmpty) return null;
@@ -64,6 +66,7 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
       _crossday = decode(crossdayRow);
       _firmware = decode(firmwareRow);
       _bleRuntime = decode(bleRuntimeRow);
+      _gapAudit = decode(gapAuditRow);
       _selected.removeWhere((d) => !_days.any((row) => row['day_id'] == d));
       _loading = false;
     });
@@ -96,6 +99,20 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
     if (accepted != true) return 'Rejected';
     final drift = (_bleRuntime?['clock_drift_sec'] as num?)?.toInt();
     return drift == null ? 'Accepted' : 'Accepted (${drift}s drift)';
+  }
+
+  String _gapAuditStatus() {
+    switch (_gapAudit?['status']) {
+      case 'continuous':
+        return 'Continuous';
+      case 'gaps_detected':
+        return '${_gapAudit?['gap_count']} gaps / '
+            '${_gapAudit?['missing_seconds']}s missing';
+      case 'no_new_data':
+        return 'No new data';
+      default:
+        return '—';
+    }
   }
 
   Future<void> _reanalyzeSelected() async {
@@ -355,6 +372,11 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
                         : _bleRuntime?['last_report_complete'] == false
                             ? 'Incomplete'
                             : '—',
+                  ),
+                  _kv('Post-sync continuity', _gapAuditStatus()),
+                  _kv(
+                    'Continuity checked',
+                    _fmtMs((_gapAudit?['observed_at_ms'] as num?)?.toInt()),
                   ),
                   _kv(
                     'Packet revisions',

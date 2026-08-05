@@ -51,6 +51,26 @@ double scrubTimeAt(
   return t0 + (x / usable) * (t1 - t0);
 }
 
+typedef TimelineBucket = ({double t, double v, double lo, double hi});
+
+const double timelineMaxSegmentGapSec = 1800;
+
+bool timelineBucketsAreContinuous(TimelineBucket a, TimelineBucket b) =>
+    b.t - a.t <= timelineMaxSegmentGapSec;
+
+List<List<TimelineBucket>> plottedLineSegments(List<TimelineBucket> avg) {
+  final segments = <List<TimelineBucket>>[];
+  for (final point in avg) {
+    if (segments.isEmpty ||
+        !timelineBucketsAreContinuous(segments.last.last, point)) {
+      segments.add([point]);
+    } else {
+      segments.last.add(point);
+    }
+  }
+  return segments;
+}
+
 /// Value of the plotted line at time [t] — a linear interpolation between the
 /// two adjacent bucket centres, i.e. the exact y the painter's `lineTo`
 /// segments pass through (see [_ChartPainter._drawLine], which strokes this
@@ -58,24 +78,19 @@ double scrubTimeAt(
 /// nearest sample, so the marker lands on the drawn line at the touched x and
 /// at the line's own (bucketed) granularity — not on an unaligned raw point.
 ///
-/// Returns null when [t] falls STRICTLY outside the drawn range — before the
-/// first or after the last bucket centre — because the line isn't drawn there
-/// (the scrub band spans the whole day, but a vital's line only covers its own
-/// buckets). Callers omit the vital there (no dot, "—" readout) rather than
-/// extrapolating a value onto empty space. The boundary centres themselves
-/// still return their value. Pure + unit-tested.
-double? plottedLineValueAt(
-  List<({double t, double v, double lo, double hi})> avg,
-  double t,
-) {
-  if (avg.isEmpty) return null;
-  if (t < avg.first.t || t > avg.last.t) return null;
+/// Returns null outside a drawn segment. Callers omit the vital there (no dot,
+/// "—" readout) rather than extrapolating a value onto empty space. Bucket
+/// centres themselves still return their value. Pure + unit-tested.
+double? plottedLineValueAt(List<TimelineBucket> avg, double t) {
+  if (avg.isEmpty || t < avg.first.t || t > avg.last.t) return null;
+  if (t == avg.first.t) return avg.first.v;
   for (var i = 1; i < avg.length; i++) {
     final b = avg[i];
-    if (t <= b.t) {
+    if (t == b.t) return b.v;
+    if (t < b.t) {
       final a = avg[i - 1];
       final span = b.t - a.t;
-      if (span <= 0) return b.v;
+      if (span <= 0 || !timelineBucketsAreContinuous(a, b)) return null;
       return a.v + (b.v - a.v) * ((t - a.t) / span);
     }
   }
@@ -88,7 +103,7 @@ class _Vital {
   final Color color;
   final List<({double t, double v})> pts; // raw (peaks + envelope extremes)
   // Per-bucket mean (v) + min/max (lo/hi) → the line + its range envelope.
-  final List<({double t, double v, double lo, double hi})> avg;
+  final List<TimelineBucket> avg;
   final int decimals;
   const _Vital(
     this.label,
@@ -181,7 +196,7 @@ class _TimelineContentState extends State<TimelineContent>
   /// Bucket a series into fixed windows (default 15 min): mean (the line) plus
   /// min/max (the range envelope) per bucket — so the smoothed line stays clean
   /// while the band still reaches the true peak/low. Raw series kept separately.
-  List<({double t, double v, double lo, double hi})> _bucketAvg(
+  List<TimelineBucket> _bucketAvg(
     List<({double t, double v})> pts, [
     double bucketSec = 900,
   ]) {
@@ -190,7 +205,7 @@ class _TimelineContentState extends State<TimelineContent>
       (byBucket[(p.t / bucketSec).floor()] ??= []).add(p.v);
     }
     final keys = byBucket.keys.toList()..sort();
-    final out = <({double t, double v, double lo, double hi})>[];
+    final out = <TimelineBucket>[];
     for (final k in keys) {
       final vs = byBucket[k]!;
       var s = 0.0, lo = vs.first, hi = vs.first;
@@ -711,48 +726,49 @@ class _ChartPainter extends CustomPainter {
   /// on a visible edge instead of floating above the averaged mean line.
   void _drawEnvelope(Canvas canvas, _Vital v, double Function(double) x,
       double Function(double, double, double) yNorm, double chartW) {
-    final a = v.avg;
-    if (a.length < 2) return;
+    if (v.avg.length < 2) return;
     final (lo, hi) = _range(v);
     final cutoff = leftPad + chartW * progress;
-    final top = <Offset>[], bot = <Offset>[];
-    for (final b in a) {
-      final px = x(b.t);
-      if (px > cutoff) break;
-      top.add(Offset(px, yNorm(b.hi, lo, hi)));
-      bot.add(Offset(px, yNorm(b.lo, lo, hi)));
+    for (final segment in plottedLineSegments(v.avg)) {
+      final top = <Offset>[], bot = <Offset>[];
+      for (final b in segment) {
+        final px = x(b.t);
+        if (px > cutoff) break;
+        top.add(Offset(px, yNorm(b.hi, lo, hi)));
+        bot.add(Offset(px, yNorm(b.lo, lo, hi)));
+      }
+      if (top.length < 2) continue;
+      final path = Path()..moveTo(top.first.dx, top.first.dy);
+      for (final o in top.skip(1)) {
+        path.lineTo(o.dx, o.dy);
+      }
+      for (final o in bot.reversed) {
+        path.lineTo(o.dx, o.dy);
+      }
+      path.close();
+      canvas.drawPath(path, Paint()..color = v.color.withValues(alpha: 0.14));
     }
-    if (top.length < 2) return;
-    final path = Path()..moveTo(top.first.dx, top.first.dy);
-    for (final o in top.skip(1)) {
-      path.lineTo(o.dx, o.dy);
-    }
-    for (final o in bot.reversed) {
-      path.lineTo(o.dx, o.dy);
-    }
-    path.close();
-    canvas.drawPath(path, Paint()..color = v.color.withValues(alpha: 0.14));
   }
 
   void _drawLine(Canvas canvas, _Vital v, double Function(double) x,
       double Function(double, double, double) yNorm, double chartW,
       double width, double alpha) {
-    final pts = v.avg; // pre-averaged → already smooth
-    final n = pts.length;
-    if (n < 2) return;
-    final (lo, hi) = _range(v); // range over RAW so the axis matches the data
+    if (v.avg.length < 2) return;
+    final (lo, hi) = _range(v);
     final cutoff = leftPad + chartW * progress;
     final path = Path();
-    var started = false;
-    for (var i = 0; i < n; i++) {
-      final px = x(pts[i].t);
-      if (px > cutoff) break;
-      final yy = yNorm(pts[i].v, lo, hi);
-      if (!started) {
-        path.moveTo(px, yy);
-        started = true;
-      } else {
-        path.lineTo(px, yy);
+    for (final segment in plottedLineSegments(v.avg)) {
+      var started = false;
+      for (final point in segment) {
+        final px = x(point.t);
+        if (px > cutoff) break;
+        final yy = yNorm(point.v, lo, hi);
+        if (started) {
+          path.lineTo(px, yy);
+        } else {
+          path.moveTo(px, yy);
+          started = true;
+        }
       }
     }
     canvas.drawPath(

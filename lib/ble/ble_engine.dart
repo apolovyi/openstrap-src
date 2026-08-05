@@ -665,6 +665,7 @@ class BleEngine {
   bool? _lastClockReadAccepted;
   int? _sessionOldestUnix; // strap's banked-data window (GET_DATA_RANGE)
   int? _sessionNewestUnix;
+  int? _offloadFrontierBefore;
   // Lifetime count of GET_DATA_RANGE reads rejected by isCorruptFutureRtc —
   // see the range_oldest/range_newest handler below.
   int _corruptDataRangeCount = 0;
@@ -1249,8 +1250,9 @@ class BleEngine {
       _bondTime = DateTime.now();
       // Fresh record gate, seeded from the durable high-water so the stuck/
       // continuation detectors are correct on the first offload after a restart.
-      _recordGate =
-          RecordGate(frontierTs: (await cursorReader?.call('rec_ts_hw')) ?? 0);
+      final durableFrontier = await cursorReader?.call('rec_ts_hw');
+      _recordGate = RecordGate(frontierTs: durableFrontier ?? 0);
+      _offloadFrontierBefore = durableFrontier;
       // Re-seed the counter-regression watch from the durable counter_hw
       // cursor so a reboot is caught even across the reconnect it usually
       // causes, instead of only within a single unbroken connection.
@@ -1417,6 +1419,8 @@ class BleEngine {
       );
       return;
     }
+    _offloadFrontierBefore =
+        await cursorReader?.call('rec_ts_hw') ?? _recordGate.frontierTs;
     d.rearm();
     _setOffloadActive(true);
     if (refreshRange) {
@@ -1823,10 +1827,7 @@ class BleEngine {
     } else if (pt == PacketType.consoleLogs && _offloadActive) {
       _drain?.onBurstConsole();
     }
-    final decoded = _maybeAugmentClock(
-      frame,
-      _maybeAugmentDataRange(frame, decodeFrame(frame)),
-    );
+    final decoded = _maybeAugmentClock(frame, decodeFrame(frame));
     _absorbState(decoded);
   }
 
@@ -2009,21 +2010,6 @@ class BleEngine {
 
   void _absorbState(Decoded d) {
     final f = d.fields;
-    if (d.kind == 'cmd_response' && f['opcode'] == Cmd.getDataRange) {
-      final oldest = (f['history_oldest'] as num?)?.toInt();
-      final newest = (f['history_newest'] as num?)?.toInt();
-      if (oldest != null) _strapHistoryOldestTs = oldest;
-      if (newest != null) _strapHistoryNewestTs = newest;
-      unawaited(
-        LocalDb.upsertSyncLedgerEntry(
-          status: 'range_seen',
-          metaPatch: {
-            'strap_history_oldest_ts': _strapHistoryOldestTs,
-            'strap_history_newest_ts': _strapHistoryNewestTs,
-          },
-        ),
-      );
-    }
     // GET_ALARM_TIME readback is PARKED: the response byte layout isn't confirmed
     // (the decode assumed a leading revision byte before the epoch that the band
     // doesn't send → it returned a plausible-but-wrong epoch, e.g. showing 21:49
@@ -2163,9 +2149,20 @@ class BleEngine {
       } else {
         _sessionOldestUnix = oldest;
         _sessionNewestUnix = newest;
+        _strapHistoryOldestTs = oldest;
+        _strapHistoryNewestTs = newest;
         state.dataRangeOldest = oldest;
         state.dataRangeNewest = newest;
         onState(state);
+        unawaited(
+          LocalDb.upsertSyncLedgerEntry(
+            status: 'range_seen',
+            metaPatch: {
+              'strap_history_oldest_ts': oldest,
+              'strap_history_newest_ts': newest,
+            },
+          ),
+        );
       }
       _publishDiagnostics(force: true);
     }
@@ -2648,8 +2645,24 @@ class BleEngine {
         '${_recordGate.dropped} dropped). Still listening for live records.',
       );
       _setHpsTerminal(_HpsTerminalKind.success, drain: d);
+      if (tailDurable) await _auditCompletedOffload();
       _noteStored();
       await _onOffloadFinished(complete: true);
+    }
+  }
+
+  Future<void> _auditCompletedOffload() async {
+    try {
+      final audit = await LocalDb.auditAndPersistDecodedOneHzContinuity(
+        frontierBefore: _offloadFrontierBefore,
+        frontierAfter: await cursorReader?.call('rec_ts_hw'),
+      );
+      _log(
+        '[SYNC] post-offload continuity=${audit['status']} '
+        'gaps=${audit['gap_count']} missing=${audit['missing_seconds']}s.',
+      );
+    } catch (e) {
+      _log('[SYNC] post-offload continuity audit failed: $e');
     }
   }
 
@@ -3235,35 +3248,6 @@ class BleEngine {
     return Decoded(decoded.kind, fields);
   }
 
-  Decoded _maybeAugmentDataRange(Frame frame, Decoded decoded) {
-    if (decoded.kind != 'cmd_response') return decoded;
-    final opcode = decoded.fields['opcode'];
-    if (opcode != Cmd.getDataRange) return decoded;
-    final payload = frame.inner.length > 3
-        ? Uint8List.sublistView(frame.inner, 3)
-        : Uint8List(0);
-    // We scan every byte offset for a plausible unix u32 (the field layout isn't
-    // fully pinned), so the UPPER bound must be tight: a data-range timestamp can
-    // never be in the FUTURE. The old ceiling (2100000000 ≈ year 2036) let a
-    // spurious cross-field read land as "newest" — observed 2020230636 (year
-    // 2034) — which made `history_newest` garbage, so backlogRemains was
-    // PERMANENTLY true and the offload never recognized completion (it chased a
-    // 2034 target forever). Cap at wall-clock + 1 day (clock skew slack).
-    final maxPlausible =
-        (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 86400;
-    final ts = <int>[];
-    for (var off = 0; off + 4 <= payload.length; off++) {
-      final v = u32(payload, off);
-      if (v >= 1600000000 && v <= maxPlausible) {
-        ts.add(v);
-      }
-    }
-    if (ts.isEmpty) return decoded;
-    final fields = <String, dynamic>{...decoded.fields};
-    fields['history_oldest'] = ts.reduce((a, b) => a < b ? a : b);
-    fields['history_newest'] = ts.reduce((a, b) => a > b ? a : b);
-    return Decoded(decoded.kind, fields);
-  }
 }
 
 /// Per-connection historical-offload helper. Buffers records per ACK boundary and

@@ -110,6 +110,29 @@ void main() {
       final v = plottedLineValueAt(dup, 100)!;
       expect(v.isFinite, isTrue);
     });
+
+    test('the observed multi-hour sensor gap returns null inside it', () {
+      final gap = [_b(100, 87), _b(42400, 78)];
+
+      expect(plottedLineValueAt(gap, 20000), isNull);
+      expect(plottedLineValueAt(gap, 100), 87);
+      expect(plottedLineValueAt(gap, 42400), 78);
+    });
+
+    test('one absent 15-minute bucket remains a continuous segment', () {
+      final sparse = [_b(100, 50), _b(1900, 70)];
+
+      expect(timelineMaxSegmentGapSec, 1800);
+      expect(plottedLineValueAt(sparse, 1000), 60);
+      expect(plottedLineSegments(sparse), hasLength(1));
+    });
+
+    test('two absent 15-minute buckets split line and envelope segments', () {
+      final sparse = [_b(100, 50), _b(2800, 70)];
+
+      expect(plottedLineValueAt(sparse, 1000), isNull);
+      expect(plottedLineSegments(sparse), hasLength(2));
+    });
   });
 
   group('composed scrub → value stays on the line at matching granularity', () {

@@ -34,7 +34,8 @@ dependencies:
   # change, and a branch deletion could orphan them.
   openstrap_protocol:
     git:
-      url: https://github.com/OpenStrap/protocol.git
+      url: https://github.com/apolovyi/protocol.git
+      # Fork commit adds capture-backed WHOOP 4 GET_DATA_RANGE decoding.
       # Tip of protocol main — OpenStrap/protocol#20 merged: the reassembler now
       # checks the length-field crc8 before trusting it (a corrupted length byte
       # used to consume up to 4092 bytes of good stream before this), and
@@ -48,7 +49,7 @@ dependencies:
       # activity/steps_inc null-instead-of-0 fix. Edge does not read the latter
       # two fields, so only the RR bound is behaviour-visible here.
       # Verified present: `git show <sha>:lib/src/live.dart | grep -c kMinRrMs`.
-      ref: 7edcb3e377329968118c62cb03a81d95e2f6db8e
+      ref: 811cb0e738daf9707bdd794b5c2f15d8177f5c32
   openstrap_analytics:
     git:
       url: https://github.com/apolovyi/analytics.git
