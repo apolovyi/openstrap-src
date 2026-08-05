@@ -1,8 +1,8 @@
-# AGENTS.md — OpenStrap `edge`
+# AGENTS.md: OpenStrap `edge`
 
 Reviewer context, verified against code at `kAlgoVersion 47`, schema `v25`,
 `0.9.19+50`. Where a source comment disagrees with an implementation, **the
-implementation wins** — header comments here go stale (e.g.
+implementation wins**. Header comments here go stale (e.g.
 `lib/compute/substrate.dart:10-12` still describes a wake-to-wake day model that
 `calendarDays()` at `:429` no longer implements; it walks local midnight to
 local midnight).
@@ -14,7 +14,7 @@ local-first**: BLE offload → SQLite → on-device analytics → UI. No backend
 user data. Network use is limited to OTA update pointers, opt-in
 telemetry/Crashlytics, and BYOK LLM calls.
 
-Three sibling repos, strict separation — push work to the right one:
+Three sibling repos, strict separation; push work to the right one:
 - `OpenStrap/protocol` — bytes: GATT, framing, CRC, opcodes, record decode.
 - `OpenStrap/analytics` — metrics: HRV, sleep staging, readiness, strain.
 - `OpenStrap/edge` (**this repo**) — flows, BLE link management, storage, UI.
@@ -64,10 +64,10 @@ output: versioned **immutable** `day_result` (PK `day_id, algo_version`) and
 `state/app_state.dart` 30 · `data/db.dart` 25 · `compute/derivation_engine.dart`
 24 · `data/local_repository_impl.dart` 17 · `ble/ble_engine.dart` 12 ·
 `main.dart`+`app.dart` 19. Treat diffs in these with extra scrutiny.
-`pubspec.yaml` has high raw churn but most of it is release version bumps — not
+`pubspec.yaml` has high raw churn but most of it is release version bumps, not
 a hotspot.
 
-## 3. Hard invariants — violating these is a P0 regression
+## 3. Hard invariants (violating these is a P0 regression)
 
 1. **Commit before ACK.** In the history-sync drain (`ble/ble_engine.dart:~2116`)
    decoded rows + cursor commit in one transaction *before*
@@ -92,22 +92,22 @@ a hotspot.
    analytics shipped main-thread ANRs into 0.9.13/0.9.14.
 7. **Day labels are LOCAL.** Always `todayLabel()` / `dayLabelOf()` from
    `data/day_label.dart`; never `DateTime.now().toUtc()...substring(0,10)`. Epoch
-   timestamps (rec_ts, session bounds, prune cutoffs) are absolute — do not
+   timestamps (rec_ts, session bounds, prune cutoffs) are absolute; do not
    "fix" those to local. Day-length arithmetic must not assume 86400 s (DST).
 8. **One source per concern.** One raw decode point (`substrate.dart`), one sleep
    segmentation, one readiness, one frame-ingest path (`RecordGate`), one
    notification emitter (`NotificationCenter.emit`). A second path is the bug.
 9. **Never prune raw/decoded for a day that is not fully derived.** `day_result`
    has a `partial` column because days with good headline scalars but a failed
-   second-half compute were finalized and pruned — unrecoverable. `raw_archive`
-   is never pruned.
+   second-half compute were finalized and pruned, making them unrecoverable.
+   `raw_archive` is never pruned.
 10. **Heavy compute never on the UI isolate.** Staging/derivation goes through
     `Isolate.run`; analytics ambient globals do not cross the boundary and must
     be re-armed inside the closure.
 11. **Migrations additive and idempotent.** `onUpgrade` is a sequential
     `if (oldV < N)` ladder; `onOpen`'s `_repairOpenSchema` re-runs creators so
     same-version merged builds self-heal. Migrations run inside `openDatabase`
-    under iOS's CPU watchdog — keep them cheap. `PRAGMA journal_mode=WAL` must go
+    under iOS's CPU watchdog, so keep them cheap. `PRAGMA journal_mode=WAL` must go
     through `rawQuery` (it returns a row; `execute` bricks iOS Darwin sqflite).
 12. **Headless/background sync serializes through `HeadlessSyncGate.tryRun`** —
     skip, don't queue.
@@ -117,7 +117,7 @@ a hotspot.
 15. **Dangerous opcodes are never auto-sent** (`dangerousCmds`, gated at
     `ble/ble_engine.dart:1471`): force-trim, reboot, power-cycle, firmware load.
 
-## 4. Recurring bug patterns — what actually ships broken here
+## 4. Recurring bug patterns (what actually ships broken here)
 
 ### 4.1 Fabricated / non-abstaining metrics ("honesty" violations)
 The project has an explicit never-impute rule and keeps breaking it. Instances:
@@ -131,7 +131,7 @@ data.
 **Ask on any metric diff:** what does this return when the input is missing or
 thin? Anything other than null/"—"/an honest low-confidence envelope is a bug.
 
-### 4.2 Readiness / recompute-idempotence — the largest single cluster
+### 4.2 Readiness / recompute-idempotence (the largest single cluster)
 Eight distinct fixes and four sequential attempts at one user-visible symptom.
 Readiness recomputes on *every* BLE drain against a moving 28-day baseline, so
 any non-idempotent step corrupts it: duplicate-day appends into the baseline
@@ -179,8 +179,8 @@ prefs gate and the new dedupe guard. Then a TOCTOU race let two overlapping
 ### 4.7 Capability wired into one call path but not all N
 The most damaging instance: `FirmwareAwareR24Decoder` existed but was not wired
 into all three decode paths (`ble_engine.dart`, `db.dart`, `substrate.dart`), so
-a real user's 88-byte v12 records were 100% silently archived — total sync
-outage. Also: HealthKit export gated on `day_result` and never session-triggered
+a real user's 88-byte v12 records were 100% silently archived, causing a total
+sync outage. Also: HealthKit export gated on `day_result` and never session-triggered
 (a workout finished offline never exported); auto-detected workouts never
 reaching the `sessions` table, invisible to both AI Coach and Health export.
 **Ask:** how many call sites exist for this concern, and does the diff cover all
@@ -201,8 +201,9 @@ rode analytics v42 into 0.9.13; a PR bumped `kAlgoVersion` while the lock still
 pinned the pre-fix analytics commit, requiring a manual merge-order gate; and
 `0.9.17+1` shipped versionCode 1 → `INSTALL_FAILED_VERSION_DOWNGRADE`, making
 the release uninstallable.
-`pubspec_overrides.yaml` redirects siblings to `../analytics` / `../protocol` and
-is gitignored — committing a path override fails CI `flutter pub get` (exit 66).
+`pubspec_overrides.yaml` redirects to the sibling analytics and protocol
+repositories and is gitignored, so committing a path override fails CI
+`flutter pub get` (exit 66).
 Note the tracked `pubspec.lock` currently records `source: path` for both
 siblings, so it provides **no** pin guarantee; `pubspec.yaml` is the source of
 truth. `version:` must always keep its `+BUILD` suffix, and the iOS widget/watch
@@ -219,7 +220,7 @@ labeled "baseline" on one screen.
 three rewrites before being restored. Also recap scrub-marker misalignment,
 `GanttPainter` needing restoration, and `RangeError` from unpadded substrate
 fields. Rendering regressions here surface as test failures rather than obvious
-visual bugs — check whether removed wrapper widgets were load-bearing.
+visual bugs; check whether removed wrapper widgets were load-bearing.
 
 ## 5. How to review this repo
 
@@ -242,3 +243,43 @@ every metric path, idempotence under repeated derivation, flag reset on failure
 paths, transaction ordering and durability around BLE sync, isolate boundaries,
 migration safety, and anything that could display a number the data does not
 support.
+
+### Recommendation gate
+
+Do not recommend a change from an isolated inconsistency, an unfamiliar label,
+a missing test, or a locally plausible improvement. A recommendation is ready
+only after the following analysis is backed by code or runtime evidence:
+
+1. **Define the decision and outcome.** State the concrete user or operational
+   deficiency being considered. Separate correctness/data safety from diagnostic
+   convenience, regression hardening, accessibility, and product-policy choices.
+2. **Trace the complete ownership path.** Follow the producer through lifecycle
+   transitions, persistence, every consumer, and the user-visible owner. Read all
+   callers and callees. Establish what each field or status semantically means;
+   do not infer meaning from its name or from two values that merely look
+   contradictory.
+3. **Inventory what already exists.** Search durable tables, retained raw data,
+   append-only logs, fallbacks, repair/replay paths, diagnostics, and tests.
+   Determine whether the proposal adds unavailable evidence or duplicates an
+   existing source in a second form.
+4. **Prove the remaining deficiency.** Reproduce it on the real ownership path
+   where possible. A helper-level anomaly, stale-looking debug value, or absent
+   end-to-end test is not by itself a user-visible defect. If there is no current
+   failure, label the idea optional rather than a fix.
+5. **Evaluate the counterfactual.** Explain precisely what changes if the work is
+   done, what it cannot prevent/recover/attribute, what happens if nothing is
+   done, and whether the added state can itself become stale or ambiguous. Count
+   maintenance, storage, UI complexity, false alarms, and competing sources of
+   truth as costs.
+6. **Reject unsupported policy.** Do not reuse a threshold or rule from another
+   layer merely because it is available (for example, a chart-presentation gap
+   threshold as a sync-alert threshold). Product policy needs its own evidence
+   or an explicit user decision.
+7. **Recommend the smallest net-positive action.** "Do nothing" is a valid and
+   preferred conclusion when the system already meets the outcome. Add tests
+   only for behavior that changed or for a demonstrated high-risk ownership path,
+   not to compensate for uncertainty in the analysis.
+
+The recommendation must summarize the evidence for necessity, the marginal
+benefit over existing mechanisms, tradeoffs, and remaining unknowns. If any of
+those are UNKNOWN, say so before proposing implementation.
