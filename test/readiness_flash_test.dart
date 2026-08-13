@@ -71,7 +71,7 @@ void main() {
       expect(_today(overnightState: 'ready').settledReadinessScore, isNull);
       expect(
         _today(
-          readiness: {'note': 'need_baseline:have=2,need=5'},
+          readiness: {'note': 'need_baseline:have=2,need=3'},
           overnightState: 'ready',
         ).settledReadinessScore,
         isNull,

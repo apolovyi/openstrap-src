@@ -623,7 +623,11 @@ import 'substrate.dart';
 //   was the explicit product decision, not an accident of where the code sat.
 //   Days carrying an edit are force-derived alongside sleep-override days, so
 //   an edit to an already-finalized day actually takes effect.
-const int kAlgoVersion = 61;
+// v62 - imported WHOOP/cloud snapshots now seed the canonical `ln_rmssd`
+//   baseline, and a finalized snapshot yields when measured 1 Hz data later
+//   arrives for the same date. Until the measured result is complete and
+//   settled, the snapshot stays intact instead of being replaced by thin data.
+const int kAlgoVersion = 62;
 
 // Fold idempotency, the minimum-nights warm-up, and legacy-payload handling
 // all live in SleepProfilePolicy (pure, unit-tested) — see
@@ -632,8 +636,8 @@ const int kAlgoVersion = 61;
 /// Raw is kept this many days past derivation, then pruned (derived stays).
 const int rawRetentionDays = 3;
 
-/// A day stays recomputable for this long after its wake, then FINALIZES (locks)
-/// — more flash may still drain within this buffer (ARCHITECTURE_V2: ~48 h).
+/// A measured day stays recomputable for this long after its wake, then
+/// FINALIZES (locks) — more flash may still drain within this buffer.
 const int _finalizationSec = 48 * 3600;
 
 /// How many trailing derived days feed readiness/composite baselines.
@@ -720,11 +724,13 @@ class _DeriveScope {
   final bool fullHistory;
   final List<String> targetDays;
   final String reason;
+  final Set<String> reopenedSnapshotDays;
 
   const _DeriveScope({
     required this.fullHistory,
     required this.targetDays,
     required this.reason,
+    this.reopenedSnapshotDays = const {},
   });
 }
 
@@ -1068,7 +1074,9 @@ class DerivationEngine {
       };
       final todoDays = [
         for (final day in scope.targetDays)
-          if (!finalized.contains(day) || overrideDays.contains(day)) day,
+          if (!finalized.contains(day) ||
+              overrideDays.contains(day) ||
+              scope.reopenedSnapshotDays.contains(day)) day,
       ];
       if (todoDays.isEmpty) {
         _log('derive: all days finalized — nothing to do');
@@ -1831,18 +1839,25 @@ class DerivationEngine {
       );
     }
     final rawDays = rawByDay.keys.toList()..sort();
+    final importedSnapshots =
+        await LocalDb.finalizedImportedSnapshotDayIds(kAlgoVersion);
     if (force) {
       // A full restage resolves any held-back timezone-adjacent days on its
       // own, so it clears the guard — but only once it has actually RUN. See
       // the reset at the end of run(): clearing it here, at scope-selection
       // time, meant an interrupted restage still dropped the hold.
-      return _scopeForDays(rawDays, reason: 'full-history', fullHistory: true);
+      return _scopeForDays(
+        rawDays,
+        reason: 'full-history',
+        fullHistory: true,
+        reopenedSnapshotDays: importedSnapshots,
+      );
     }
 
     final finalized = await LocalDb.finalizedDayIds(kAlgoVersion);
     var pending = [
       for (final day in rawDays)
-        if (!finalized.contains(day)) day,
+        if (!finalized.contains(day) || importedSnapshots.contains(day)) day,
     ];
 
     // decodedRecTsMaxByDay() buckets by the CURRENT device timezone, but
@@ -1881,7 +1896,11 @@ class DerivationEngine {
     }
 
     if (heavy) {
-      return _scopeForDays(pending, reason: 'pending-span');
+      return _scopeForDays(
+        pending,
+        reason: 'pending-span',
+        reopenedSnapshotDays: importedSnapshots,
+      );
     }
 
     final light = selectLightDeriveDays(
@@ -1889,7 +1908,11 @@ class DerivationEngine {
       pendingDays: pending,
       today: LocalDb.localDayLabelNow(),
     );
-    return _scopeForDays(light.days, reason: light.reason);
+    return _scopeForDays(
+      light.days,
+      reason: light.reason,
+      reopenedSnapshotDays: importedSnapshots,
+    );
   }
 
   /// The day before and after [dayId] ('YYYY-MM-DD'), DST-safe (goes through
@@ -1950,6 +1973,7 @@ class DerivationEngine {
     List<String> days, {
     required String reason,
     bool fullHistory = false,
+    Set<String> reopenedSnapshotDays = const {},
   }) {
     final sorted = days.toSet().toList()..sort();
     if (sorted.isEmpty || fullHistory) {
@@ -1957,9 +1981,15 @@ class DerivationEngine {
         fullHistory: true,
         targetDays: sorted,
         reason: reason,
+        reopenedSnapshotDays: reopenedSnapshotDays,
       );
     }
-    return _DeriveScope(fullHistory: false, targetDays: sorted, reason: reason);
+    return _DeriveScope(
+      fullHistory: false,
+      targetDays: sorted,
+      reason: reason,
+      reopenedSnapshotDays: reopenedSnapshotDays,
+    );
   }
 
   // ── baseline-dirty recent rescan ─────────────────────────────────────────────
@@ -2560,8 +2590,16 @@ class DerivationEngine {
     // _markDaySkipped: never let a thinner result overwrite a richer one.
     var effectiveFinalized = finalized;
     var effectivePartial = !secondHalfOk;
+    Map<String, dynamic>? existing;
+    if (!secondHalfOk || !finalized) {
+      existing = await LocalDb.dayResult(day.date);
+      if (_isImportedSnapshot(existing)) {
+        _log('derive ${day.date}: measured pass not settled — kept the '
+            'imported snapshot');
+        return;
+      }
+    }
     if (!secondHalfOk) {
-      final existing = await LocalDb.dayResult(day.date);
       if (_isRealDayResult(existing)) {
         final prev = _decodeBundle(existing!['payload_json']);
         if (prev != null) {
@@ -2795,6 +2833,11 @@ class DerivationEngine {
     final scalars = payload['scalars'];
     if (scalars is Map && scalars.values.any((v) => v != null)) return true;
     return row['rhr'] != null || row['rmssd'] != null || row['readiness'] != null;
+  }
+
+  static bool _isImportedSnapshot(Map<String, dynamic>? row) {
+    if (row == null) return false;
+    return _decodeBundle(row['payload_json'])?['imported'] == true;
   }
 
   /// Fill [next]'s missing detail from [prev] when the second-half compute

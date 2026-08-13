@@ -1325,7 +1325,8 @@ class LocalDb {
   // IMMUTABLE per version: an algo_version bump writes a NEW row (never mutates).
   // The serve seam reads the LATEST algo_version per day_id. A day stays
   // recomputable for ~48 h after its wake (finalized=0); then it LOCKS
-  // (finalized=1) and is no longer recomputed even on a version bump.
+  // (finalized=1). Imported derived snapshots are the exception: later settled
+  // measured data for the same date replaces them.
   static Future<void> _createDayResult(Database db) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS day_result (
@@ -3256,8 +3257,8 @@ class LocalDb {
     return {for (final r in rows) r['day_id'] as String};
   }
 
-  /// The set of day_id labels that are FINALIZED at [algoVersion] (locked). A
-  /// finalized day is never recomputed even on a version bump.
+  /// The set of day_id labels that are FINALIZED at [algoVersion] (locked).
+  /// Imported snapshots are separately reopened when measured data overlaps.
   static Future<Set<String>> finalizedDayIds(int algoVersion) async {
     final db = await instance;
     final rows = await db.query(
@@ -3267,6 +3268,21 @@ class LocalDb {
       whereArgs: [algoVersion],
     );
     return {for (final r in rows) r['day_id'] as String};
+  }
+
+  /// Finalized derived snapshots that must yield when measured 1 Hz data later
+  /// arrives for the same date.
+  static Future<Set<String>> finalizedImportedSnapshotDayIds(
+      int algoVersion) async {
+    final db = await instance;
+    final rows = await db.query(
+      'day_result',
+      columns: ['day_id'],
+      where: 'algo_version = ? AND finalized = 1 '
+          'AND payload_json LIKE ?',
+      whereArgs: [algoVersion, '{"date":%,"imported":true,%'],
+    );
+    return {for (final row in rows) row['day_id'] as String};
   }
 
   /// Normalize a day_result row to also carry a `date` key (== day_id) so legacy

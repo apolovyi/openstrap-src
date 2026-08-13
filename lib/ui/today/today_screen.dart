@@ -432,9 +432,10 @@ class _TodayScreenState extends State<TodayScreen>
             context,
             title: 'Readiness',
             body:
-                'One 0–100 score blending overnight HRV, resting heart rate, '
-                'sleep and recent strain against your own baselines.',
-            methodNote: 'Composite z-score vs your rolling baselines',
+                'One 0–100 score blending overnight HRV, sleeping resting heart '
+                'rate, respiratory rate and skin temperature against your own '
+                'baselines.',
+            methodNote: 'Weighted z-score vs your rolling baselines',
           );
         }
       case 'sleep':

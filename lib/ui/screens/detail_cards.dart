@@ -309,7 +309,7 @@ class HeartDayContent extends StatelessWidget {
                       ? infoFor('recovery')!
                       : infoFor('resting_hr')!,
                   methodNote: rec != null
-                      ? 'Plews lnRMSSD readiness vs your own baseline'
+                      ? 'Weighted overnight signals vs your own baselines'
                       : null,
                 ),
               ),

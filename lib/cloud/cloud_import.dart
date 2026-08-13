@@ -11,11 +11,11 @@
 // SEEDS the rolling baselines the recovery/illness stack reads — that's the
 // "snapshots + baselines" the onboarding promised.
 //
-// Overlap with future 1 Hz days is safe: putDayResult is INSERT-OR-REPLACE on
-// (day_id, algo_version), so once the band syncs and a real 1 Hz day is derived
-// it OVERWRITES any imported snapshot for the same date (real data wins).
+// Overlap with future 1 Hz days is safe: once the measured day is complete and
+// settled, it replaces the imported snapshot for that date (real data wins).
 
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
@@ -101,11 +101,19 @@ class CloudImporter {
     };
   }
 
+  @visibleForTesting
+  static Future<void> debugWriteDay(
+          String date, Map<String, dynamic> daily, Map<String, dynamic>? sleep) =>
+      _writeDay(date, daily, sleep);
+
   static Future<void> _writeDay(
       String date, Map<String, dynamic> d, Map<String, dynamic>? sl) async {
     num? n(Object? v) => v is num ? v : null;
     final rhr = n(d['resting_hr']);
     final rmssd = n(d['hrv_rmssd']);
+    final lnRmssd = rmssd != null && rmssd > 0
+        ? math.log(rmssd.toDouble())
+        : null;
     final sdnn = n(d['hrv_sdnn']);
     final readiness = n(d['readiness']) ?? n(d['recovery']);
     final strain = n(d['strain']);
@@ -201,6 +209,7 @@ class CloudImporter {
       'scalars': {
         'rhr': rhr,
         'rmssd': rmssd,
+        'ln_rmssd': lnRmssd,
         'sdnn': sdnn,
         'readiness': readiness,
         'strain': strain,
@@ -234,6 +243,7 @@ class CloudImporter {
       series: {
         'rhr': f(rhr),
         'rmssd': f(rmssd),
+        'ln_rmssd': lnRmssd,
         'readiness': f(readiness),
         'strain': f(strain),
         'resp_rate': f(resp),

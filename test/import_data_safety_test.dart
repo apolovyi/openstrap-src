@@ -13,12 +13,14 @@
 //    out-of-order row can't discard a whole buffered day.
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:openstrap_edge/cloud/cloud_import.dart';
-import 'package:openstrap_edge/compute/derivation_engine.dart' show kAlgoVersion;
+import 'package:openstrap_edge/compute/derivation_engine.dart';
+import 'package:openstrap_edge/compute/profile.dart';
 import 'package:openstrap_edge/compute/substrate.dart' show localDateLabel;
 import 'package:openstrap_edge/data/db.dart';
 import 'package:openstrap_edge/import/noop_import.dart';
@@ -119,10 +121,70 @@ void main() {
           jsonDecode((await _row(otherDay))!['payload_json'] as String) as Map;
       expect(payload['source'], 'whoop_export');
       expect(await _metric(otherDay, 'rhr'), 60.0);
+      expect(await _metric(otherDay, 'ln_rmssd'), closeTo(math.log(70), 1e-12));
       // No raw for this date, so nothing could ever re-derive it — finalizing
       // is correct here.
       expect(((await _row(otherDay))!['finalized'] as num).toInt(), 1);
     });
+
+    test('later measured data replaces a finalized WHOOP snapshot', () async {
+      const wake = '2026-04-12 08:00:00';
+      final startSec = DateTime.parse(wake).millisecondsSinceEpoch ~/ 1000;
+      final day = localDateLabel(startSec);
+      final f = File(p.join(tmp.path, 'day_import_then_sync.csv'));
+      f.writeAsStringSync(
+        'Cycle start time,Wake onset,Recovery score %,Resting heart rate (bpm),'
+        'Heart rate variability (ms),Day Strain,Energy burned (cal),'
+        'Asleep duration (min)\n'
+        '$wake,$wake,84,44,95,12,2600,460\n',
+      );
+      expect((await WhoopImporter.importFiles([f.path])).days, 1);
+      expect(((await _row(day))!['finalized'] as num).toInt(), 1);
+
+      final db = await LocalDb.instance;
+      final batch = db.batch();
+      for (var i = 0; i < 600; i++) {
+        batch.insert('decoded_onehz', {
+          'counter': 700000 + i,
+          'rec_ts': startSec + i,
+          'hr': 62,
+          'ax': 0.0,
+          'ay': 0.0,
+          'az': 1.0,
+          'spo2_red_raw': 0,
+          'spo2_ir_raw': 0,
+          'skin_temp_raw': 3000,
+        });
+      }
+      await batch.commit(noResult: true);
+
+      expect(await DerivationEngine().run(const Profile(), heavy: true), 1);
+      var row = (await _row(day))!;
+      var payload = jsonDecode(row['payload_json'] as String) as Map;
+      expect(payload['source'], 'whoop_export',
+          reason: 'thin, still-settling raw must not erase a complete import');
+
+      final settledEdge = startSec + 3 * 86400;
+      await db.insert('decoded_onehz', {
+        'counter': 800000,
+        'rec_ts': settledEdge,
+        'hr': 60,
+        'ax': 0.0,
+        'ay': 0.0,
+        'az': 1.0,
+        'spo2_red_raw': 0,
+        'spo2_ir_raw': 0,
+        'skin_temp_raw': 3000,
+      });
+      expect(await DerivationEngine().run(const Profile(), heavy: true),
+          greaterThanOrEqualTo(1));
+      row = (await _row(day))!;
+      payload = jsonDecode(row['payload_json'] as String) as Map;
+      expect(payload['imported'], isNot(true));
+      expect(payload['source'], isNot('whoop_export'));
+      expect((row['partial'] as num).toInt(), 0);
+      expect((row['finalized'] as num).toInt(), 1);
+    }, timeout: const Timeout(Duration(minutes: 2)));
 
     test('does not finalize a day that still has raw to re-derive from',
         () async {
@@ -209,6 +271,18 @@ void main() {
       expect(
           await importEnergy('2026-04-03 07:00:00', 'Energy burned', '5000'),
           isNull);
+    });
+  });
+
+  group('CloudImporter snapshots', () {
+    test('seeds the canonical logarithmic HRV baseline', () async {
+      const day = '2026-06-01';
+      await CloudImporter.debugWriteDay(
+        day,
+        const {'hrv_rmssd': 50.0, 'resting_hr': 55.0},
+        null,
+      );
+      expect(await _metric(day, 'ln_rmssd'), closeTo(math.log(50), 1e-12));
     });
   });
 

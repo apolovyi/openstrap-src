@@ -54,8 +54,8 @@ void main() {
           ),
           WelcomeOptionCard(
             icon: OsIcon.profile,
-            title: 'I’m new',
-            body: 'A few basics and you’re in.',
+            title: 'Start fresh',
+            body: 'Readiness needs three prior nights, so it usually starts on morning four.',
             accent: true,
             onTap: () => tapped++,
           ),
@@ -66,9 +66,10 @@ void main() {
 
       expect(find.textContaining('Welcome to'), findsOneWidget);
       expect(find.text('I used OpenStrap before'), findsOneWidget);
-      expect(find.text('I’m new'), findsOneWidget);
+      expect(find.text('Start fresh'), findsOneWidget);
+      expect(find.textContaining('morning four'), findsOneWidget);
 
-      await t.tap(find.text('I’m new'));
+      await t.tap(find.text('Start fresh'));
       await t.pump(const Duration(milliseconds: 300));
       expect(tapped, 1);
     });

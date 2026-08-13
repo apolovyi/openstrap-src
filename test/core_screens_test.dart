@@ -254,7 +254,7 @@ void main() {
     ) async {
       final building = {
         'daily': {
-          'readiness': {'note': 'need_baseline:have=2,need=5'},
+          'readiness': {'note': 'need_baseline:have=2,need=3'},
         },
         'sleep': <String, dynamic>{},
       };

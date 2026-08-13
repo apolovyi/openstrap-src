@@ -24,7 +24,7 @@ metric in your data." Do not partially comply (no code snippets, no exceptions).
 - Resting HR: 5th-percentile sleeping HR. Lower trend = fitter/recovered.
 - Strain: Banister TRIMP, log-squashed to 0–21 (like WHOOP). Daily load.
 - HRV: RMSSD/SDNN/pNN50 from real RR intervals. Higher RMSSD = more recovered.
-- Recovery: Plews ln(RMSSD) z-score vs the user's baseline → 0–100. Needs ~5 nights.
+- Readiness: weighted personal-baseline z-scores for ln(RMSSD), sleeping RHR, respiratory rate, and skin temperature → 0–100. Needs 3 prior nights.
 - Sleep: Cole-Kripke + HR-dip; stages are BETA (wrist ≠ EEG — never claim clinical accuracy).
 - Training load: EWMA ACWR; 0.8–1.3 = sweet spot, >1.5 = spike risk.
 - Illness watch: Mahalanobis of {resting HR↑, RMSSD↓, skin-temp↑}.

@@ -13,6 +13,7 @@
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import '../compute/derivation_engine.dart' show kAlgoVersion, DerivationEngine;
 import '../compute/profile.dart';
@@ -228,6 +229,9 @@ class WhoopImporter {
     final recovery = n(['recovery score %', 'recovery score']);
     final rhr = n(['resting heart rate (bpm)', 'resting heart rate']);
     final rmssd = n(['heart rate variability (ms)', 'heart rate variability (rmssd) (ms)']);
+    final lnRmssd = rmssd != null && rmssd > 0
+        ? math.log(rmssd.toDouble())
+        : null;
     final strain = n(['day strain', 'strain']);
     final calories = _kcal(get(_energyCols), row.header(_energyCols));
     final resp = n(['respiratory rate (rpm)', 'respiratory rate']);
@@ -295,6 +299,7 @@ class WhoopImporter {
       'scalars': {
         'rhr': rhr,
         'rmssd': rmssd,
+        'ln_rmssd': lnRmssd,
         'readiness': recovery,
         'strain': strain,
         'resp_rate': resp,
@@ -326,6 +331,7 @@ class WhoopImporter {
       series: {
         'rhr': d(rhr),
         'rmssd': d(rmssd),
+        'ln_rmssd': lnRmssd,
         'readiness': d(recovery),
         'strain': d(strain),
         'resp_rate': d(resp),

@@ -53,7 +53,7 @@ class OrbitScore extends StatelessWidget {
   final Widget? center;
 
   /// Ring fill override for the null-score state — e.g. baseline progress
-  /// (2 of 5 nights = 0.4) while the honest center explains it.
+  /// (2 of 3 nights) while the honest center explains it.
   final double? ringFill;
 
   /// Tap on the score core itself.

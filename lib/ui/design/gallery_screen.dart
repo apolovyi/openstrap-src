@@ -520,13 +520,14 @@ class _DesignGalleryScreenState extends State<DesignGalleryScreen> {
                 info: const MetricInfo(
                   title: 'Readiness',
                   body:
-                      'One 0–100 score fusing overnight HRV, resting heart rate, '
-                      'sleep debt and recent strain against your own baselines.',
+                      'One 0–100 score fusing overnight HRV, sleeping resting '
+                      'heart rate, respiratory rate and skin temperature against '
+                      'your own baselines.',
                   bullets: [
                     'Above your baseline → primed for load',
                     'Persistently low → prioritise recovery',
                   ],
-                  methodNote: 'Composite z-score vs your 30-day baselines',
+                  methodNote: 'Weighted z-score vs your rolling baselines',
                 ),
                 onTap: () {},
               ),

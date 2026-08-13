@@ -171,16 +171,16 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
         const SizedBox(height: Sp.x3),
         WelcomeOptionCard(
           icon: OsIcon.history,
-          title: 'Import from a file',
-          body: 'A backup from this app, or an export from another one.',
+          title: 'Import existing history',
+          body: 'Use an OpenStrap backup or WHOOP export to seed your baselines.',
           onTap: () => Navigator.of(context).push(
               themedRoute((_) => const ImportScreen(), name: 'ImportScreen')),
         ),
         const SizedBox(height: Sp.x3),
         WelcomeOptionCard(
           icon: OsIcon.profile,
-          title: 'I’m new',
-          body: 'A few basics and you’re in.',
+          title: 'Start fresh',
+          body: 'Readiness needs three prior nights, so it usually starts on morning four.',
           accent: true,
           onTap: () => context.read<AppState>().chooseNewUser(),
         ),
