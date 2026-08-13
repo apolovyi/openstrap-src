@@ -265,8 +265,8 @@ void main() {
       );
       await t.pump(const Duration(milliseconds: 1200));
       expect(find.text('Learning you'), findsOneWidget);
-      expect(find.text('3'), findsOneWidget); // 5 − 2 nights remaining
-      expect(find.text('NIGHTS'), findsOneWidget);
+      expect(find.text('1'), findsOneWidget); // 3 − 2 nights remaining
+      expect(find.text('NIGHT'), findsOneWidget);
       expect(find.text('—'), findsWidgets); // absent metrics stay honest
       expect(t.takeException(), isNull);
     });
