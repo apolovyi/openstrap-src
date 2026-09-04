@@ -1,6 +1,6 @@
 # Openstrap Edge
 
-An app that makes a WHOOP 4.0 useful without a WHOOP subscription. Connects to the band over Bluetooth, computes everything on your phone locally iOS and Android.
+An app that makes your wearable useful without its subscription. Pairs over Bluetooth, computes everything on your phone, iOS and Android. WHOOP 4/5/MG get full support today; see [Supports](#supports) for what else it talks to.
 
 [![test](https://github.com/OpenStrap/edge/actions/workflows/test.yml/badge.svg)](https://github.com/OpenStrap/edge/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -8,6 +8,7 @@ An app that makes a WHOOP 4.0 useful without a WHOOP subscription. Connects to t
 [![APK](https://img.shields.io/github/v/release/OpenStrap/edge?label=Android%20APK&logo=android&logoColor=white)](https://github.com/OpenStrap/edge/releases/latest)
 [![downloads](https://img.shields.io/github/downloads/OpenStrap/edge/total?label=downloads&color=6aa9e0)](https://github.com/OpenStrap/edge/releases)
 [![stars](https://img.shields.io/github/stars/OpenStrap/edge?style=flat&color=e2825f)](https://github.com/OpenStrap/edge/stargazers)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/dUXds5MWkd)
 [![Donate](https://img.shields.io/badge/donate-BTC%20%2F%20ETH-f7931a)](DONATE.md)
 
 > Not affiliated with WHOOP. Not a clone of their app or their scores — see below.
@@ -39,13 +40,13 @@ Quit the official WHOOP app before you pair. Bluetooth only lets one app own the
 band at a time.
 
 Prefer to sideload the unsigned IPA instead of using TestFlight? That still
-works — see [`guides/IOS_SIDELOAD.md`](guides/IOS_SIDELOAD.md).
+works, see [`guides/IOS_SIDELOAD.md`](guides/IOS_SIDELOAD.md).
 
 ---
 
 <div align="center">
 
-### ☕ Like it? Help keep it going.
+### Like it? Help keep it going.
 
 **No subscription, no paywall, no company behind this.**<br>
 If OpenStrap gave your band a second life, a small tip genuinely helps.
@@ -61,14 +62,14 @@ If OpenStrap gave your band a second life, a small tip genuinely helps.
 [**What donations actually pay for →**](DONATE.md)
 
 *Nothing is gated behind paying, and nothing ever will be.<br>
-Bug reports from real bands are worth more than money — there's only one
+Bug reports from real bands are worth more than money, there's only one
 person's physiology in the test data otherwise.*
 
 </div>
 
 ---
 
-## What made me build this app 
+## What made me build this app
 
 My subscription lapsed and a perfectly good sensor turned into a bracelet. The hardware
 never stopped working, only the app that made it useful did. So I reverse-engineered
@@ -79,9 +80,11 @@ drawer-bracelet problem can use it, or go dig through the code themselves.
 
 ## Checklist
 
-- **WHOOP 4.0 only.** Haven't touched a WHOOP 5, don't know if it even shares a protocol.
+- Pairs, syncs, and decodes WHOOP 4.0, WHOOP 5, and MG. WHOOP 4.0 gets the most daily
+  wear-testing since that's what's on my wrist, open an issue if 5 or MG does something
+  wrong.
 - Not affiliated with WHOOP, doesn't talk to their servers.
-- Not a clone of their algorithms — different math, published methods, cited in the
+- Not a clone of their algorithms, different math, published methods, cited in the
   analytics repo. Don't expect identical numbers to what their app shows.
 - There are bugs. Some I know about, more I probably don't. Open an issue if something
   looks wrong.
@@ -105,7 +108,14 @@ couple of Siri shortcuts.
 |:--:|:--:|:--:|
 | <img src="screenshots/widget.jpg" width="300"><br>**Widget** | <img src="screenshots/battery-widget.jpg" width="200"><br>**Battery widget** | <img src="screenshots/live-activity.jpg" width="300"><br>**Live Activity** |
 
-Every screenshot above is real output from a WHOOP 4.0. 
+Every screenshot above is real output from a WHOOP 4.0.
+
+## Supports
+
+- **WHOOP 4, WHOOP 5, MG** — full support. Everything below is computed from these.
+- **Any standard Bluetooth heart-rate strap** — pairs for workout tracking today (heart
+  rate + beat timing, stored and shown). Feeding it into recovery/strain is on the roadmap.
+- **Oura Ring** — protocol groundwork exists in the codebase; not pairable in the app yet.
 
 ## What works
 
@@ -117,10 +127,10 @@ zones.
 
 **Your data, elsewhere** — writes to **Apple Health** (HealthKit) and **Google Health
 Connect**: sleep stages, resting HR, HRV, respiratory rate, active energy and workouts.
-Only things the band actually measures — never the derived scores, which have no native
+Only things the band actually measures, never the derived scores, which have no native
 type and would be fabricated. Exports are idempotent, so a day re-deriving never
 duplicates samples. You can also export the entire local SQLite database to a file
-whenever you like — it's your data, in a format anything can open.
+whenever you like, it's your data, in a format anything can open.
 
 **Background sync** — the band drains without you opening the app. Android runs a
 foreground service with a 15-minute watchdog worker and re-attaches via
@@ -139,13 +149,13 @@ shortcuts, a smart alarm that buzzes the band.
   give third-party apps a real background-service option, so the OS decides when those
   tasks actually run. Syncing while you haven't opened the app in a while is "usually,"
   not "always." Android has no such limit.
-- Metrics are approximations off published research — not medical-grade, not validated
+- Metrics are approximations off published research, not medical-grade, not validated
   against a lab, don't treat any of it as a diagnosis.
 - Not on the App Store or Play Store yet. iOS is a public TestFlight beta, which is a
   normal install but still a beta; Android is an APK straight off Releases.
-- WHOOP 5.0 / MG support is in progress and **experimental** — the band is detected and
-  spoken to, but it hasn't been validated against real 5.0 hardware. WHOOP 4.0 is the
-  only one that's actually tested.
+- WHOOP 5 and MG support is newer than 4.0's and hasn't had as many bands, firmwares,
+  and daily hours put on it. Expect the occasional rough edge, and open an issue when
+  you hit one.
 
 ## Run it
 
@@ -157,26 +167,26 @@ flutter pub get
 flutter run --dart-define-from-file=.env
 ```
 
-Quit the official WHOOP app before you pair — Bluetooth only lets one app own the band at
+Quit the official WHOOP app before you pair, Bluetooth only lets one app own the band at
 a time. iOS signing and the App Group setup for the widget/Live Activity is its own
-longer story — see `guides/IOS_INSTALLATION.md`.
+longer story, see `guides/IOS_INSTALLATION.md`.
 
 ## How it works
 
 ```
-WHOOP band → Bluetooth → protocol decoder → local storage → analytics → the UI
+wearable → Bluetooth → protocol decoder → local storage → analytics → the UI
 ```
 
 - `openstrap_protocol` turns bytes off the band into records.
 - `openstrap_analytics` turns those records into metrics, each with its own confidence
-  score attached — nothing gets faked when the data isn't there.
+  score attached, nothing gets faked when the data isn't there.
 - this repo is the glue: Bluetooth reliability, local storage (versioned, so an algorithm
   update never silently overwrites old results), background sync, the UI.
 - everything that matters stays on the phone.
 
 ## Complex Bluetooth protocol
 
-The band doesn't have a normal documented API — it's a proprietary protocol, and getting
+The band uses a proprietary protocol without a normal documented API, and getting
 it to behave reliably took a while. Short version: the clock ships unset (skip setting it
 and every timestamp comes out garbage), history comes off in batches that need an exact
 8-byte token echoed back or the band just re-sends the same data forever, and the local
@@ -197,9 +207,9 @@ Being precise about the network, since "no cloud" gets said too loosely. Nothing
 is required for the app to work, and none of it carries health data except the two you
 turn on yourself:
 
-- **Anonymous diagnostics** (Firebase crash/performance). **On by default in GitHub
-  release builds** — switch it off in your profile and collection stops immediately.
-  **Not present at all** in App Store / Play Store builds. Never includes health data.
+- **Anonymous diagnostics** (Firebase crash/performance). **Off by default in every
+  build** — nothing is collected until you turn it on in your profile, and switching
+  it back off stops collection immediately. Never includes health data.
 - **OTA/announcement pointer** — checks whether there's a newer build.
 - **Legacy account import** — one-time, only if you had an old OpenStrap cloud account.
 - **BYOK AI assistant** — only if you configure a provider. Your key, your account. Be
@@ -215,35 +225,70 @@ Full detail in [PRIVACY.md](PRIVACY.md).
 ## Repo layout
 
 ```
-lib/ble/       Bluetooth + sync
-lib/data/      local storage + the repository seam the UI reads from
+lib/ai/        BYOK AI assistant — briefings, journal AI, nightly sweep
+lib/ble/       Bluetooth link + history-sync state machine
+lib/cloud/     optional companion/backend + cloud import clients
+lib/coach/     read-only SQL coach over allow-listed views
 lib/compute/   runs the analytics pipeline, writes results
+lib/data/      local storage + the repository seam the UI reads from
+lib/debug/     debug-mode flags
+lib/gestures/  device action / gesture dispatch
+lib/gps/       GPS route tracking for outdoor activities
+lib/health/    HealthKit / Health Connect import + export
+lib/import/    backup + third-party data import
+lib/l10n/      translations (.arb)
+lib/live/      Live Activity / breathing session
+lib/models/    shared data models (Metric, payloads, app status)
+lib/notify/    the single notification emitter + alert policies
+lib/platform/  platform-channel glue (app icon, Tasker, device actions)
 lib/state/     AppState, the one source of truth
-lib/ui/        every screen
+lib/stress/    guided-breathing session logic
+lib/sync/      background/headless sync policies
+lib/telemetry/ opt-in error + usage telemetry
+lib/theme/     design tokens, theming, transitions
+lib/ui2/       every screen
+lib/widget/    App-Group snapshot for the home-screen/watch widget
 ```
+
+See `AGENTS.md` §2 for the full architecture map, invariants, and the biggest
+files by ownership.
 
 Protocol decoding and analytics live in their own repos —
 [protocol](https://github.com/OpenStrap/protocol),
 [analytics](https://github.com/OpenStrap/analytics).
+
+## Guides
+
+- [`guides/IOS_INSTALLATION.md`](guides/IOS_INSTALLATION.md) — building and installing on an iPhone.
+- [`guides/IOS_SIDELOAD.md`](guides/IOS_SIDELOAD.md) — sideloading without a paid developer account.
+- [`guides/WATCH_SETUP.md`](guides/WATCH_SETUP.md) — the Apple Watch companion app.
+- [`guides/AI_COACH.md`](guides/AI_COACH.md) — bring-your-own-key AI coach, briefings, and journal.
+- [`guides/TASKER_INTEGRATION.md`](guides/TASKER_INTEGRATION.md) — buzzing the strap from Tasker/automation.
+- [`guides/BUZZ_MEANINGS.md`](guides/BUZZ_MEANINGS.md) — what each buzz pattern means.
+
+## Community
+
+[Discord](https://discord.gg/dUXds5MWkd) — for questions, band-specific quirks, and
+bug reports that don't need a full issue yet.
 
 ## Contributing
 
 Found something broken? Open an issue. Found something broken and fixed it? Even better,
 send the PR. Protocol-level stuff (new record types, opcodes) belongs in the protocol
 repo, metric/formula changes belong in analytics, anything about the app itself —
-Bluetooth, storage, UI — belongs here.
+Bluetooth, storage, UI, belongs here.
 
 [**CONTRIBUTING.md**](CONTRIBUTING.md) has the details: which repo a change belongs in,
 how to run the three packages together locally, and the two rules that matter most —
 never fabricate a number when the data isn't there, and cite the published method you're
 implementing.
 
-Security problems shouldn't go in a public issue — see [SECURITY.md](SECURITY.md) for
+Security problems shouldn't go in a public issue, see [SECURITY.md](SECURITY.md) for
 private reporting.
 
 ## Contributors
 
-Every one of these people made the app better — mostly by using it on a real
+Every one of these people made the app better, mostly by using it on a real
 wrist and reporting what came out wrong.
 
 <a href="https://github.com/OpenStrap/edge/graphs/contributors">
@@ -252,7 +297,7 @@ wrist and reporting what came out wrong.
 
 The most useful contribution isn't necessarily code. There's one person's
 physiology in the test data, so a bug report from a different body on a
-different band is worth a great deal — see
+different band is worth a great deal, see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Star history
@@ -262,11 +307,3 @@ different band is worth a great deal — see
 That cliff in mid-July is [Hackaday](https://hackaday.com/2026/07/15/making-a-locked-down-wearable-work-without-a-subscription/)
 and [Adafruit](https://blog.adafruit.com/2026/07/15/openstrap-edge-makes-a-whoop-4-0-band-useful-without-a-subscription)
 covering it on the same day.
-
-
-
-## Support the work
-
-Free, MIT, no company behind it. If it gave your band a second life,
-[**DONATE.md**](DONATE.md) has the BTC and EVM addresses and explains what they
-actually pay for. Bug reports from real bands are worth more than money, though.

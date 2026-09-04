@@ -42,10 +42,17 @@ class Profile {
         if (restingHrManual != null) 'resting_hr': restingHrManual,
       };
 
-  /// Tanaka (2001): HRmax = 208 − 0.7·age. Null when age is unknown — the caller
-  /// must NOT substitute 220−age or any default (that would fabricate a ceiling).
-  double? get hrMaxTanaka =>
-      ageYears == null ? null : 208 - 0.7 * (ageYears!.toDouble());
+  // NO `hrMaxTanaka` HERE. It was `208 − 0.7·age` inlined on the profile, which
+  // made the HR ceiling a property of the ATHLETE alone — and the app then
+  // carried four of them (this one, `220−age` twice, and `(220−age)+25`), so
+  // one user's zone timeline and that same day's session zone bands were banded
+  // off different ceilings with nothing on screen saying so.
+  //
+  // The one definition is `compute/hr_max.dart`'s `estimatedMaxHr(age, family)`
+  // and it takes the STRAP as well: what a band can read at intensity is a
+  // property of its sensor, so an uncalibrated or unstamped strap gets no
+  // ceiling rather than gen4's. Callers resolve it at the layer that knows
+  // which device measured the window and pass it down. (TS-03a)
 
   bool get isComplete =>
       ageYears != null && weightKg != null && heightCm != null && sex != null;
@@ -62,4 +69,31 @@ class Profile {
   /// kcal number that was simply somebody else's.
   bool get hasCalorieAnchors =>
       ageYears != null && weightKg != null && sex != null;
+}
+
+/// Normalise every sex spelling the app can persist onto the three names the
+/// analytics coefficient tables key on: 'male' | 'female' | 'nonbinary'.
+///
+/// Two writers disagree. Onboarding (`profile_setup_screen`) stores 'm'/'f';
+/// the profile screen offers 'male'/'female'/'other'. Every scored path — day
+/// calories, TRIMP, the live tick, a manually logged session — has to land on
+/// the same coefficient block for the same stored value, or one field of one
+/// profile scores as two different people. It happened: TRIMP tested `== 'f'`
+/// while the calorie path accepted 'female' too, so a profile written by the
+/// profile screen got female calories and male TRIMP.
+///
+/// 'other' and anything unrecognised map to `nonbinary`, which the analytics
+/// tables define as the mean of the two published sex constants rather than a
+/// guess at one of them.
+String workoutSex(String? sex) {
+  switch ((sex ?? '').toLowerCase()) {
+    case 'm':
+    case 'male':
+      return 'male';
+    case 'f':
+    case 'female':
+      return 'female';
+    default:
+      return 'nonbinary';
+  }
 }

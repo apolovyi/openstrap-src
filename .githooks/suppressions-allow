@@ -1,0 +1,2 @@
+# Android permission lint is guarded by an explicit runtime permission check.
+@SuppressLint("MissingPermission")

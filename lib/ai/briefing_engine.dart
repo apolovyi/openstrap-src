@@ -11,12 +11,20 @@
 // absent from the store is absent from the prompt — the system prompt forbids
 // the model from mentioning anything it wasn't given, and the breakdown screen
 // shows exactly the inputs snapshot so the user can see what the model saw.
+//
+// Omission alone is NOT that contract, though, which is what [kWithheldKey]
+// exists for. See its doc: silence about a refused metric leaves the model free
+// to narrate the thing it measures out of whatever else it was handed, and this
+// file already documents that happening (see [readinessBand]).
 
 import '../coach/coach_config.dart';
 import '../coach/coach_engine.dart';
 import '../data/day_label.dart';
 import '../data/local_repository.dart';
+import '../models/metric.dart' show whyFromNote;
+import '../ui2/screens/home_screen.dart' as ring show readinessBand;
 import 'briefing.dart';
+import 'nightly_sweep.dart';
 
 /// Injectable one-shot completion (tests pass a fake; production defaults to
 /// [CoachEngine.completeText] — the shared BYOK plumbing).
@@ -49,6 +57,30 @@ void _put(Map<String, dynamic> out, String key, num? v, {int? round}) {
       : num.parse(v.toStringAsFixed(round)); // keep ints as ints
 }
 
+/// Reserved key in the inputs snapshot: the metrics this briefing ASKED FOR and
+/// did not get, each with the reason the store gave, where it gave one.
+///
+/// WHY THIS IS NOT JUST OMISSION. Every refused metric is already dropped from
+/// the payload — `Metric.value` arrives as null (or the store's `'—'`
+/// placeholder), `_metricNum` returns null and `_put` skips the key. That much
+/// was always right and is unchanged. What omission cannot do is stop the model
+/// narrating the refused thing anyway out of what it WAS given: [readinessBand]
+/// below exists because a model handed HRV and RHR free-associates a recovery
+/// verdict from them, and when readiness is refused there is no score left to
+/// contradict it. A silence is the one input shape the model will fill in.
+///
+/// So the refusal is stated, not hidden. The notes are machine-readable
+/// precisely so this is possible — [whyFromNote] is the same parser the metric
+/// cards use, and it returns null rather than inventing a cause for a token
+/// nobody has written a sentence for, which is why an entry here may be a bare
+/// key name.
+///
+/// MORNING ONLY. The evening pass is the nightly sweep, which ships findings and
+/// nothing else; a list of what was refused is the day read back, which is the
+/// exact failure `sweepInputs` exists to prevent, and a non-empty map there
+/// would call a model on nights that should call none.
+const String kWithheldKey = 'withheld';
+
 /// Read-only snapshot of what the store knows for [period]. Only fields that
 /// exist end up in the map — the prompt builder and the "based on" UI both walk
 /// this map, so what the model saw and what the user sees are the same thing.
@@ -60,76 +92,178 @@ Future<Map<String, dynamic>> collectBriefingInputs(
   final t = await repo.getToday();
   final daily = _map(t['daily']) ?? const {};
   final out = <String, dynamic>{};
+  final withheld = <String>[];
+
+  /// Take the metric's value, or record the refusal. [env] is either a metric
+  /// envelope (`{value, note, …}`) or a bare number; only an envelope can say
+  /// why, and a bare absence is named without one rather than given a guess.
+  void take(String key, dynamic env, {int? round}) {
+    final v = _metricNum(env);
+    if (v != null && v.isFinite) {
+      _put(out, key, v, round: round);
+      return;
+    }
+    final why = whyFromNote(_map(env)?['note'] as String?);
+    withheld.add(why == null ? key : '$key ($why)');
+  }
 
   if (period == BriefingPeriod.morning) {
-    _put(out, 'readiness', _metricNum(daily['readiness']), round: 0);
-    _put(out, 'resting_hr', _metricNum(daily['resting_hr']), round: 0);
+    take('readiness', daily['readiness'], round: 0);
+    take('resting_hr', daily['resting_hr'], round: 0);
     final hrv = _map(t['hrv']);
-    _put(out, 'hrv_rmssd', _num(hrv?['rmssd']), round: 1);
+    take('hrv_rmssd', hrv?['rmssd'], round: 1);
 
     // The overnight bundle Today is showing (may be yesterday's sleep if this
     // day hasn't derived yet) — same source of truth as the Sleep screen.
     final status = _map(t['status']);
     final sleepDay =
         (status?['overnight_day'] as String?) ?? todayLabel(now);
+    Map<String, dynamic>? ds;
     try {
-      final ds = await repo.getDaySleep(sleepDay);
-      if (ds['has_sleep'] == true || _num(ds['duration_min']) != null) {
-        _put(out, 'sleep_min', _num(ds['duration_min']), round: 0);
-        final eff = _num(ds['efficiency']);
-        _put(out, 'sleep_efficiency_pct',
-            eff == null ? null : (eff <= 1 ? eff * 100 : eff),
-            round: 0);
-        _put(out, 'sleep_debt_min', _num(ds['debt_min']), round: 0);
-        _put(out, 'deep_min', _num(ds['deep_min']), round: 0);
-        _put(out, 'rem_min', _num(ds['rem_min']), round: 0);
-        _put(out, 'awake_min', _num(ds['awake_min']), round: 0);
-        final onset = _num(ds['onset_ts'])?.toInt();
-        final wake = _num(ds['wake_ts'])?.toInt();
-        if (onset != null && onset > 0) {
-          out['bedtime'] = _hhmm(
-              DateTime.fromMillisecondsSinceEpoch(onset * 1000));
-        }
-        if (wake != null && wake > 0) {
-          out['wake_time'] =
-              _hhmm(DateTime.fromMillisecondsSinceEpoch(wake * 1000));
-        }
+      final read = await repo.getDaySleep(sleepDay);
+      if (read['has_sleep'] == true || _num(read['duration_min']) != null) {
+        ds = read;
       }
     } catch (_) {/* sleep detail absent → morning runs on the daily scalars */}
-  } else {
-    _put(out, 'strain_0_21', _metricNum(daily['strain']), round: 1);
-    _put(out, 'steps', _metricNum(daily['steps']), round: 0);
-    _put(out, 'step_goal', _num(t['step_goal']), round: 0);
-    _put(out, 'calories_total_kcal', _metricNum(daily['calories_total']),
-        round: 0);
-    _put(out, 'wear_min', _metricNum(daily['wear_min']), round: 0);
-    final stress = _map(t['stress']);
-    _put(out, 'stress_0_100', _metricNum(stress?['score'] ?? stress?['value']),
-        round: 0);
-
-    // Today's workouts (manual + auto-detected, manual wins) — compact lines.
-    try {
-      final dayStart = now ?? DateTime.now();
-      final startSec = DateTime(dayStart.year, dayStart.month, dayStart.day)
-              .millisecondsSinceEpoch ~/
-          1000;
-      final sessions = await repo.getSessions(from: startSec);
-      final w = <String>[];
-      for (final s in sessions) {
-        final st = _num(s['start_ts'])?.toInt();
-        if (st == null || st < startSec) continue;
-        final en = _num(s['end_ts'])?.toInt();
-        final durMin = _num(s['duration_min'])?.round() ??
-            (en != null ? ((en - st) / 60).round() : null);
-        final type = (s['type'] ?? s['sport'] ?? s['label'] ?? 'workout')
-            .toString();
-        w.add(durMin == null ? type : '$type ${durMin}min');
-        if (w.length >= 5) break;
+    if (ds == null) {
+      // One refusal for the whole night, not five for its parts: there is no
+      // night, so no per-field gate ever ran and none of them has a reason.
+      withheld.add('sleep (no scored night)');
+    } else {
+      take('sleep_min', ds['duration_min'], round: 0);
+      final eff = _num(ds['efficiency']);
+      take('sleep_efficiency_pct',
+          eff == null ? null : (eff <= 1 ? eff * 100 : eff), round: 0);
+      take('sleep_debt_min', ds['debt_min'], round: 0);
+      take('deep_min', ds['deep_min'], round: 0);
+      take('rem_min', ds['rem_min'], round: 0);
+      take('awake_min', ds['awake_min'], round: 0);
+      final onset = _num(ds['onset_ts'])?.toInt();
+      final wake = _num(ds['wake_ts'])?.toInt();
+      // Named when absent, like every other field — [take] cannot do these two
+      // because they are clock strings rather than numbers, and that is the
+      // whole of the difference. A scored night with no onset used to hand over
+      // six sleep numbers and no refusal rule for the seventh, which is exactly
+      // the hole `withheld` exists to close. Bare, with no reason: these are
+      // raw columns, not metric envelopes, so there is no note to read one from.
+      if (onset != null && onset > 0) {
+        out['bedtime'] = _hhmm(
+            DateTime.fromMillisecondsSinceEpoch(onset * 1000));
+      } else {
+        withheld.add('bedtime');
       }
-      if (w.isNotEmpty) out['workouts'] = w;
-    } catch (_) {/* sessions unavailable → recap runs on the daily scalars */}
+      if (wake != null && wake > 0) {
+        out['wake_time'] =
+            _hhmm(DateTime.fromMillisecondsSinceEpoch(wake * 1000));
+      } else {
+        withheld.add('wake_time');
+      }
+    }
+    if (withheld.isNotEmpty) out[kWithheldKey] = withheld;
+  } else {
+    // The evening pass is the nightly SWEEP, not a recap. It used to hand over
+    // strain, steps, calories, stress and the day's workouts, which produced
+    // exactly what you would expect: the day's numbers read back to someone who
+    // had just looked at them. Nothing but findings goes now — see
+    // nightly_sweep.dart for the bar one has to clear, and note that an empty
+    // map here is the normal, correct answer on most days.
+    return sweepInputs(
+      sweepFindings(await collectSweepSeries(repo, now ?? DateTime.now())),
+      recommendedBedtime: await _recommendedBedtime(repo),
+    );
   }
   return out;
+}
+
+/// The metrics the sweep looks at, keyed by the name [LocalRepository.getChart]
+/// speaks (it maps those onto series keys itself). Deliberately short: every
+/// one of these is a number the user already has a screen for, so a finding
+/// about it can be checked.
+const Map<String, ({String key, String label, String unit, int dp})>
+    kSweepMetrics = {
+  'recovery': (key: 'readiness', label: 'readiness', unit: '', dp: 0),
+  'resting_hr': (key: 'rhr', label: 'resting heart rate', unit: 'bpm', dp: 0),
+  'hrv': (key: 'rmssd', label: 'HRV', unit: 'ms', dp: 0),
+  'strain': (key: 'strain', label: 'strain', unit: '', dp: 1),
+  'steps': (key: 'steps', label: 'steps', unit: '', dp: 0),
+  'sleep': (key: 'tst_min', label: 'time asleep', unit: 'min', dp: 0),
+  'efficiency': (
+    key: 'efficiency',
+    label: 'sleep efficiency',
+    unit: '%',
+    dp: 0
+  ),
+};
+
+/// Today's value plus its own trailing history, per metric, read from the same
+/// derived store the trend screens draw. A metric with no value TODAY is left
+/// out entirely — there is nothing to have a finding about.
+///
+/// The window stops at the most recent algo-version break. Values either side
+/// of one are not comparable, and a version bump reported as "the lowest in 60
+/// days" would be a finding about us, not about the user.
+Future<List<SweepSeries>> collectSweepSeries(
+  LocalRepository repo,
+  DateTime now,
+) async {
+  final today = todayLabel(now);
+  final out = <SweepSeries>[];
+  for (final e in kSweepMetrics.entries) {
+    try {
+      final chart = await repo.getChart(e.key);
+      final points = chart['points'];
+      if (points is! List) continue;
+      var cutoff = 0;
+      final breaks = chart['algo_breaks'];
+      if (breaks is List) {
+        for (final b in breaks) {
+          final t = b is Map ? _num(b['t'])?.toInt() : null;
+          if (t != null && t > cutoff) cutoff = t;
+        }
+      }
+      double? todayValue;
+      final history = <double>[];
+      for (final p in points) {
+        if (p is! Map) continue;
+        final t = _num(p['t'])?.toInt();
+        final v = _num(p['v'])?.toDouble();
+        if (t == null || v == null || !v.isFinite) continue;
+        final day = todayLabel(DateTime.fromMillisecondsSinceEpoch(t * 1000));
+        if (day == today) {
+          todayValue = v;
+        } else if (day.compareTo(today) < 0 && t >= cutoff) {
+          history.add(v);
+        }
+      }
+      if (todayValue == null) continue;
+      final m = e.value;
+      out.add(SweepSeries(
+        key: m.key,
+        label: m.label,
+        unit: m.unit,
+        decimals: m.dp,
+        today: todayValue,
+        history: history,
+      ));
+    } catch (_) {/* a series we cannot read is a series with no finding */}
+  }
+  return out;
+}
+
+/// The sleep coach's recommended bedtime as `HH:MM`, or null when it has not
+/// earned one yet (it needs free-day nights before it says anything).
+Future<String?> _recommendedBedtime(LocalRepository repo) async {
+  try {
+    final coach = _map((await repo.getInsights())['sleep_coach']);
+    final v = _map(_map(coach?['bedtime'])?['value']);
+    final min = _num(v?['bedtime_min_of_day'])?.round();
+    if (min == null || min < 0) return null;
+    final m = min % 1440;
+    return '${(m ~/ 60).toString().padLeft(2, '0')}:'
+        '${(m % 60).toString().padLeft(2, '0')}';
+  } catch (_) {
+    return null;
+  }
 }
 
 // ── prompt building (PURE — unit-tested on sample data) ───────────────────────
@@ -153,23 +287,60 @@ String partOfDay(DateTime now) {
 /// and can contradict the score itself (a 16/100 read as "strong overnight
 /// recovery"). The band is declared authoritative in the system prompt.
 ///
-/// THE single source of truth for readiness-score banding — also used by
-/// the Today ring's status word (`TodayVitals._orbitHero` in
-/// today_screen.dart maps good/moderate/low → Push/Focus/Recover).
-/// These cuts (40/66) MUST match the ring's own thresholds: a briefing band
-/// computed from different cuts than the ring's word is exactly the
-/// tone-vs-score contradiction this function exists to prevent, just moved
-/// from "sub-metrics vs score" to "briefing vs ring".
-String readinessBand(num v) {
-  if (v < 40) return 'low';
-  if (v < 66) return 'moderate';
-  return 'good';
-}
+/// DERIVED FROM THE RING, never re-declared. It used to carry its own 40/66
+/// cuts with a comment insisting they match the ring's — and then #250 moved
+/// the ring to the score's own quantiles (26/37/61) and left these behind. A
+/// 61 was "Good to go" on Home and "moderate" in the briefing on the same
+/// morning: the tone-vs-score contradiction this function exists to prevent,
+/// arrived from the one direction the comment could not police.
+///
+/// So there is one classifier ([readinessBand] in home_screen.dart) and this
+/// is a PRESENTATION of it: four tiers folded to the three words the prompt
+/// speaks, with both warning tiers reading "low".
+String readinessBand(num v) => switch (ring.readinessBand(v).tier) {
+      3 => 'good',
+      2 => 'moderate',
+      _ => 'low',
+    };
+
+/// The nightly sweep's rules.
+///
+/// Written against the failure it exists to prevent: a note that restates the
+/// day back, wrapped in hedges, ending in nothing to do. The model is given
+/// ONLY findings — every number in the payload is already unusual for this
+/// user — so there is no ordinary number for it to pad with, and these rules
+/// close the remaining ways to say nothing at length.
+String _sweepSystemPrompt() =>
+    'You write one short note at the end of the day for a local-first fitness '
+        'band app.\n'
+        'You are given only FINDINGS: things measured as unusual for THIS '
+        'user, against their own history. You were not given the ordinary '
+        'numbers of their day, and there is nothing wrong with that.\n'
+        'HARD RULES:\n'
+        '- Do not summarise the day. Do not restate a number as news. Every '
+        'number you write must be one you were given.\n'
+        '- No diagnosis, no severity, no "consult a professional", and no '
+        'disclaimer of any kind. A hedge is filler; it is not caution.\n'
+        '- No praise, no encouragement, no streaks, no score, no grade.\n'
+        '- Never assert a cause. Two findings on the same day are two '
+        'findings; say they coincided, never that one caused the other.\n'
+        '- Give ONE concrete thing to do tomorrow, and attach the finding it '
+        'follows from. If the findings do not support an action, say what '
+        'stood out and stop — that is a complete note.\n'
+        '- Do not open with a greeting or any reference to the time of day — '
+        'this text can be read hours after it was written. Direct, second '
+        'person, plain. No emojis, no headers.\n'
+        'OUTPUT FORMAT (exactly):\n'
+        'Line 1: one plain-text sentence, max 140 characters — the finding '
+        'that matters most. No markdown.\n'
+        'Line 2: ---\n'
+        'Then 2-3 markdown bullet points (each starting with "- "), max 14 '
+        'words each. One fact or one action per bullet, nothing else.';
 
 String briefingSystemPrompt(BriefingPeriod period) {
-  final scope = period == BriefingPeriod.morning
-      ? 'last night\'s sleep and recovery, and what they mean for the day ahead'
-      : 'today\'s activity, strain and stress, and how the day landed';
+  if (period == BriefingPeriod.evening) return _sweepSystemPrompt();
+  const scope =
+      'last night\'s sleep and recovery, and what they mean for the day ahead';
   return 'You write a health briefing for a local-first fitness band app. '
       'Summarize $scope.\n'
       'HARD RULES:\n'
@@ -179,6 +350,12 @@ String briefingSystemPrompt(BriefingPeriod period) {
       'written. Start straight with the substance.\n'
       '- Use ONLY the numbers provided. Never invent, estimate or mention a '
       'metric that is not in the data. No medical advice or diagnosis.\n'
+      '- Anything under "withheld" was REFUSED by the measurement layer, not '
+      'merely forgotten. You may say it is unavailable and give the reason '
+      'shown, and nothing else: never a value, never a range, never a '
+      'direction, never a quality word for what it measures — and never '
+      'reasoned out of the numbers you WERE given. Calling recovery strong '
+      'while readiness is withheld IS stating the withheld number.\n'
       '- If a "readiness" value is given, its parenthesized band label '
       '(low / moderate / good) is AUTHORITATIVE for tone: a low or moderate '
       'band must never be described as strong, solid or good recovery, even '
@@ -203,12 +380,24 @@ String buildBriefingUserPrompt(
     ..writeln(period == BriefingPeriod.morning
         ? 'Overnight briefing for $day (reader\'s local time: $timeOfDay). '
             'Overnight data:'
-        : 'Evening recap for $day (reader\'s local time: $timeOfDay). '
-            'Today\'s data so far:');
-  if (inputs.isEmpty) {
+        : 'Nightly sweep for $day (reader\'s local time: $timeOfDay). What '
+            'came back as unusual for this person, and nothing else:');
+  // A payload of nothing but refusals is still a payload of no measurements,
+  // so the "nothing yet" line is keyed off the MEASURED entries, not the map.
+  //
+  // The null/`'—'` filter is the structural half of the withheld rule, and it
+  // is HERE rather than in the collector because every prompt routes through
+  // this function while collectors can be added. `'$v'` renders an absent
+  // metric as the word "null" or as the store's em-dash placeholder
+  // (`local_repository_impl._scalarMetric` writes `value: v ?? '—'`), and
+  // either one is a refused metric arriving in the prompt looking like data.
+  final measured = inputs.keys.where((k) =>
+      k != kWithheldKey && inputs[k] != null && inputs[k] != '—');
+  if (measured.isEmpty) {
     b.writeln('(no metrics available yet)');
   } else {
-    inputs.forEach((k, v) {
+    for (final k in measured) {
+      final v = inputs[k];
       if (k == 'readiness' && v is num) {
         // Inject the band label the model must treat as authoritative (see
         // the system prompt) — a bare "readiness: 16" otherwise reads as
@@ -217,7 +406,16 @@ String buildBriefingUserPrompt(
       } else {
         b.writeln(v is List ? '$k: ${v.join(', ')}' : '$k: $v');
       }
-    });
+    }
+  }
+  // Last, under its own header, so the rule in the system prompt has something
+  // to name and a refusal can never be read as just another line of data.
+  final w = inputs[kWithheldKey];
+  if (w is List && w.isNotEmpty) {
+    b.writeln('withheld (refused — see the withheld rule):');
+    for (final e in w) {
+      b.writeln('- $e');
+    }
   }
   return b.toString().trimRight();
 }
@@ -286,6 +484,23 @@ class BriefingEngine {
     final day = todayLabel(effectiveNow);
     final tod = partOfDay(effectiveNow);
     final inputs = await collectBriefingInputs(repo, period, now: effectiveNow);
+    // NOTHING TO SAY IS AN ANSWER. The evening sweep hands back an empty map on
+    // any day where nothing was unusual for this user, which is most days. No
+    // model is called — there is no question to ask — so nothing leaves the
+    // device, and the "what was sent" screen has an empty payload to show
+    // because the payload really was empty.
+    if (period == BriefingPeriod.evening && inputs.isEmpty) {
+      final b = Briefing(
+        day: day,
+        period: period,
+        oneLiner: kNothingStoodOut,
+        breakdownMd: '',
+        generatedAtMs: effectiveNow.millisecondsSinceEpoch,
+        inputs: const {},
+      );
+      BriefingStore.write(b);
+      return b;
+    }
     final raw = await (complete ??
         (({required String system, required String user}) =>
             CoachEngine.completeText(

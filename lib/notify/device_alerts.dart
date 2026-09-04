@@ -3,8 +3,9 @@
 // Fed the latest DeviceState on every BLE update (AppState._onEngineState), but
 // it is EDGE-TRIGGERED and de-duped, so it fires at most once per real event —
 // never on every tick:
-//   • Low battery (< 15%, not charging): once per drain. Re-arms only after the
-//     battery recovers past 25% (hysteresis) or goes back on the charger.
+//   • Low battery (below the user's threshold — default 15% — not charging):
+//     once per drain. Re-arms only after the battery recovers past
+//     threshold+10 (hysteresis) or goes back on the charger.
 //   • Charging started: once per plug-in, gated by [ChargeAlertPolicy].
 //
 // THE EDGE STATE IS PERSISTED (issue #179). It used to live only in RAM, which
@@ -16,38 +17,49 @@
 // the "repeated 'band is on the charger'" report. Anything that must fire "once
 // per real event" cannot key off in-memory state alone here.
 //
-// Presentation goes through NotificationService, the single display layer that a
-// future FCM/server-push system also uses — so adding push later doesn't touch
-// this file or risk colliding with these alerts.
+// Presentation goes through NotificationCenter — the single emitter — NOT
+// straight to the plugin. It used to call NotificationService.showDevice, which
+// wrote to the plugin directly and so consulted neither the user's quiet hours
+// nor their category switch: putting the strap on the charger at 23:30 buzzed
+// the phone at Importance.high. It also passed no payload, so the tap did
+// nothing. Both are properties of the shared gate, which is why the fix is to
+// use it rather than to re-implement it here.
+//
+// These two alerts keep FIXED OS ids (see NotificationEvent.osId) because this
+// file also has to CANCEL the "Charging" card when the puck comes off.
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../data/day_label.dart';
 import 'charge_alert_policy.dart';
+import 'notification_center.dart';
+import 'notification_event.dart';
+import 'notification_prefs.dart';
 import 'notification_service.dart';
+import 'tap_router.dart';
 
-/// Narrow presentation seam. [NotificationService] has a private constructor and
-/// cannot be subclassed from a test, so the alert logic would otherwise only be
-/// exercisable against the real platform plugin.
+/// Narrow presentation seam. [NotificationCenter] is a singleton and
+/// [NotificationService] has a private constructor, so the alert logic would
+/// otherwise only be exercisable against the real platform plugin.
 abstract class DeviceAlertSink {
-  Future<void> show({
-    required int id,
-    required String title,
-    required String body,
-  });
+  /// True only if the alert was actually presented. False means the shared
+  /// gate dropped it (quiet hours, category off, no permission) — it is NOT
+  /// queued for later, so a caller holding a once-per-drain latch must not
+  /// spend that latch on a false.
+  Future<bool> show(NotificationEvent e);
   Future<void> cancel(int id);
 }
 
-class _NotificationServiceSink implements DeviceAlertSink {
-  const _NotificationServiceSink();
+class _NotificationCenterSink implements DeviceAlertSink {
+  const _NotificationCenterSink();
 
   @override
-  Future<void> show({
-    required int id,
-    required String title,
-    required String body,
-  }) =>
-      NotificationService.instance.showDevice(id: id, title: title, body: body);
+  Future<bool> show(NotificationEvent e) {
+    // Band alerts fire from the BLE state pipeline, which runs headless on both
+    // platforms — never prompt for permission from there.
+    return NotificationCenter.instance.emit(e, allowPermissionPrompt: false);
+  }
 
   @override
   Future<void> cancel(int id) => NotificationService.instance.cancel(id);
@@ -81,8 +93,15 @@ class _PrefsDeviceAlertStore implements DeviceAlertStore {
 }
 
 class DeviceAlerts {
-  static const double _lowPct = 15;
-  static const double _rearmPct = 25; // hysteresis so we don't re-fire near 15%
+  /// The default low-battery threshold. The live value is the user's
+  /// [NotificationPrefs.batteryAlertPct], read back from the persisted store
+  /// in [_restore] (same key the settings screen writes) — this constant is
+  /// only what a store with nothing in it degrades to.
+  static const int _defaultLowPct = NotificationPrefs.batteryPctDefault;
+
+  /// How far above the threshold the battery must climb before a low alert
+  /// re-arms (hysteresis so we don't re-fire around the threshold).
+  static const int _rearmGapPct = 10;
 
   static const String _kLastChargeTs = 'device_alerts.last_charge_event_ts';
   static const String _kLastChargeWall = 'device_alerts.last_charge_wall_sec';
@@ -106,6 +125,12 @@ class DeviceAlerts {
   int? _lastAnnouncedEventTs; // strap ts of the last announced charge session
   int? _lastAnnouncedWallSec; // wall time of that announcement
 
+  /// The live low-battery threshold, in percent. Set in [_restore] from the
+  /// user's pref (NotificationPrefs.batteryPctPrefKey); until that read lands,
+  /// [_defaultLowPct]. An int from prefs, held as double because the battery
+  /// percentage arriving off the strap is one.
+  double _lowPct = _defaultLowPct.toDouble();
+
   final DeviceAlertSink _notes;
   final DeviceAlertStore _store;
 
@@ -121,7 +146,7 @@ class DeviceAlerts {
   Future<void> _queue = Future<void>.value();
 
   DeviceAlerts({DeviceAlertSink? sink, DeviceAlertStore? store})
-      : _notes = sink ?? const _NotificationServiceSink(),
+      : _notes = sink ?? const _NotificationCenterSink(),
         _store = store ?? const _PrefsDeviceAlertStore();
 
   /// Completes when all queued alert work has settled. Tests only.
@@ -146,10 +171,38 @@ class DeviceAlerts {
       _lastAnnouncedEventTs = (eventTs != null && eventTs > 0) ? eventTs : null;
       _lastAnnouncedWallSec = wallSec;
       if (armed != null) _lowArmed = armed != 0;
+      // The user's threshold. Same key NotificationPrefs writes; clamped to
+      // the same bounds, so a hand-edited or stale value can't push the alert
+      // out of its sane range.
+      final pct = await _store.readInt(NotificationPrefs.batteryPctPrefKey);
+      if (pct != null) {
+        _lowPct = pct
+            .clamp(NotificationPrefs.batteryPctMin, NotificationPrefs.batteryPctMax)
+            .toDouble();
+      }
     } catch (_) {
       _lastAnnouncedEventTs = null;
       _lastAnnouncedWallSec = null;
     }
+  }
+
+  /// Re-read the user's threshold from the persisted store. Called when
+  /// NotificationPrefs change (the settings screen saves first) — [_restore]
+  /// is memoised, so without this a threshold change would not apply until
+  /// the next process create. Rides the same serialized queue as
+  /// [onDeviceState] so the mutation can't interleave an in-flight decision.
+  void refreshThreshold() {
+    _queue = _queue.then((_) async {
+      final pct = await _store.readInt(NotificationPrefs.batteryPctPrefKey);
+      if (pct != null) {
+        _lowPct = pct
+            .clamp(
+                NotificationPrefs.batteryPctMin, NotificationPrefs.batteryPctMax)
+            .toDouble();
+      }
+    }).catchError((_) {
+      // A stale threshold for one drain beats breaking the state pipeline.
+    });
   }
 
   /// Call with the latest device state. Cheap and safe to call on every update.
@@ -248,15 +301,16 @@ class DeviceAlerts {
 
     // Low-battery hysteresis, same precedence as before: a real plug-in re-arms
     // the next drain, so does a battery that recovered past the ceiling.
+    final rearmPct = _lowPct + _rearmGapPct;
     var lowArmed = _lowArmed;
     if (announce) lowArmed = true;
-    if (batteryPct != null && batteryPct >= _rearmPct) lowArmed = true;
+    if (batteryPct != null && batteryPct >= rearmPct) lowArmed = true;
     final fireLow = batteryPct != null &&
         charging != true &&
         batteryPct < _lowPct &&
         lowArmed;
     if (fireLow) lowArmed = false;
-    final lowArmedChanged = lowArmed != _lowArmed;
+    final armedBefore = _lowArmed;
     _lowArmed = lowArmed;
 
     // ── ACT ───────────────────────────────────────────────────────────────────
@@ -271,11 +325,16 @@ class DeviceAlerts {
       await _io(() => _notes.cancel(NotificationService.idCharging));
     }
     if (announce) {
-      await _io(() => _notes.show(
-            id: NotificationService.idCharging,
+      await _io(() => _notes.show(_event(
+            osId: NotificationService.idCharging,
+            // The strap event's own timestamp IS the identity of this charge
+            // session (that is what ChargeAlertPolicy arbitrates on), so a
+            // genuine second plug-in the same day is a genuinely new key while
+            // a re-announcement of the same one is not. Date-prefixed so
+            // FiredKeyStore's retention sweep can reach it.
+            kind: 'band_charging:${chargingTs ?? nowSec}',
             title: 'Charging',
-            body: 'Your band is on the charger.',
-          ));
+          )));
       await _io(() => _store.writeInt(_kLastChargeWall, nowSec));
       if (persistEventTs != null) {
         await _io(() => _store.writeInt(_kLastChargeTs, persistEventTs!));
@@ -284,15 +343,56 @@ class DeviceAlerts {
       await _io(() => _notes.cancel(NotificationService.idLowBattery));
     }
     if (fireLow) {
-      await _io(() => _notes.show(
-            id: NotificationService.idLowBattery,
+      final dropped = await _showWasDropped(() => _notes.show(_event(
+            osId: NotificationService.idLowBattery,
+            // One drain per key: the hysteresis above already means a re-arm
+            // needs the battery to climb past 25% or go on the charger, so the
+            // percentage is a stable identity for THIS drain.
+            kind: 'band_low:${batteryPct.round()}',
             title: 'Low battery',
             body: 'Your band is at ${batteryPct.round()}%. Charge it soon.',
-          ));
+          )));
+      if (dropped) {
+        // The shared gate refused it — quiet hours, the device category off, no
+        // OS permission. `emit` DROPS; it does not defer, so nothing will ever
+        // present this alert later. Spending the once-per-drain latch on it
+        // means the user is never told the band is flat for the rest of this
+        // drain (re-arming needs 25% or a charger), so put the latch back and
+        // let the next state update try again.
+        lowArmed = true;
+        _lowArmed = true;
+      }
     }
-    if (lowArmedChanged) {
+    if (lowArmed != armedBefore) {
       await _io(() => _store.writeInt(_kLowArmed, lowArmed ? 1 : 0));
     }
+  }
+
+  /// One band alert, in the currency the shared emitter speaks.
+  ///
+  /// `route: '/profile'` — the band's battery, charge state and last-sync time
+  /// live on the source detail screen under Profile, which is the only place in
+  /// the app that can answer "how flat is it?".
+  static NotificationEvent _event({
+    required int osId,
+    required String kind,
+    required String title,
+    String body = '',
+  }) {
+    final day = todayLabel();
+    return NotificationEvent(
+      dedupeKey: '$day:$kind',
+      category: NotifCategory.device,
+      // Normal priority is subject to quiet hours, and quiet hours DROP —
+      // there is no queue and no deferral anywhere in NotificationCenter. The
+      // fireLow path re-arms its latch on a drop for exactly that reason.
+      priority: NotifPriority.normal,
+      title: title,
+      body: body,
+      date: day,
+      route: kRouteProfile,
+      osId: osId,
+    );
   }
 
   /// Run one presentation/persistence step, absorbing its failure. See the ACT
@@ -301,5 +401,21 @@ class DeviceAlerts {
     try {
       await step();
     } catch (_) {}
+  }
+
+  /// Present one alert; true when the shared gate DROPPED it (never shown,
+  /// never queued) so a latch must not be spent on it.
+  ///
+  /// A THROWING sink deliberately reports false — "spend the latch". That is
+  /// the failure AGENTS.md §4.3 is about: we cannot know what the plugin did,
+  /// and re-firing on every BLE state update is worse than one lost alert. A
+  /// sink that returns false told us plainly that nothing was shown, which is
+  /// a different fact and gets the opposite answer.
+  Future<bool> _showWasDropped(Future<bool> Function() step) async {
+    try {
+      return !await step();
+    } catch (_) {
+      return false;
+    }
   }
 }

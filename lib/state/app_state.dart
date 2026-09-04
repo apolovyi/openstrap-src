@@ -26,13 +26,20 @@ import 'package:flutter/widgets.dart';
 import '../ai/ai_prefs.dart';
 import '../ai/briefing.dart';
 import '../ai/briefing_engine.dart';
+import '../ai/nightly_sweep.dart';
 import '../coach/coach_config.dart';
 import '../models/app_status.dart';
 import '../ble/accessory_setup.dart';
+import '../ble/adapters/_registry.dart' show kWhoopGen4;
+import '../ble/adapters/host.dart' show BandHost;
+import '../ble/adapters/whoop_gen4.dart' show WhoopFramedAdapter;
 import '../ble/android_background.dart';
 import '../ble/ble_engine.dart';
+import '../ble/hrs_link.dart';
+import '../ble/live_cadence.dart';
+import '../ble/live_step_runs.dart';
 import '../ble/ble_state.dart'
-    show AlarmConfirmation, AlarmEffect, LiveStepDayWindow, SyncActivityWindow;
+    show AlarmConfirmation, AlarmEffect, SyncActivityWindow;
 import '../ble/ios_ble_restore.dart';
 import '../cloud/companion_client.dart';
 import '../compute/derivation_engine.dart';
@@ -41,25 +48,35 @@ import '../compute/manual_session.dart' show strainFromPerMinuteHr;
 import '../compute/hr_max.dart';
 import '../compute/profile.dart';
 import '../data/day_label.dart';
+import '../data/journal_fields.dart'
+    show JournalMetricValue, kJournalFieldsByKey;
+import '../data/med_store.dart' show MedDb, MedDef;
 import '../data/auto_backup.dart'
     show BackupCadence, BackupOutcome, runBackup;
-import '../ui/stress/breath_phases.dart';
+import '../stress/breath_phases.dart';
 // `runBackupIfDue` is also the name of the AppState method below, so the pure
 // scheduler is imported under an alias rather than shadowed by it.
 import '../data/auto_backup.dart' as backup show runBackupIfDue;
+import 'alarm_schedule.dart';
 import 'prefs.dart';
+import '../ble/adapters/signals.dart' show InputSignal;
+import '../ui2/profile/devices.dart' show liveSources, rankSources;
 import '../data/db.dart';
 import '../data/live_coverage_policy.dart';
 import '../data/local_repository.dart';
 import '../gps/gps_source.dart';
 import '../gps/route_tracker.dart';
+import '../gps/route_types.dart';
 import '../gps/screen_wake.dart';
 import '../data/local_repository_impl.dart';
+import '../data/series_codec.dart';
 import '../notify/battery_forecast.dart';
+import '../notify/med_buzzer.dart';
 import '../notify/notification_center.dart';
 import '../notify/notification_event.dart';
 import '../notify/notification_prefs.dart';
 import '../gestures/gesture_settings.dart';
+import '../health/auto_workout_import.dart';
 import '../health/health_export.dart';
 import '../health/phone_pedometer.dart';
 import '../import/noop_import.dart';
@@ -84,21 +101,24 @@ import '../sync/sync_policy.dart'
     show
         isLinkStale,
         ReconnectSupervisorAction,
-        StalenessTier,
-        stalenessTierFor,
         superviseReconnect;
 import '../sync/update_service.dart';
 import '../telemetry/telemetry_service.dart';
 import '../telemetry/health_uploader.dart';
 import '../widget/widget_service.dart';
 import '../sync/file_log.dart';
+import 'workout_idle.dart';
 import 'package:uuid/uuid.dart';
 
 /// The onboarding/app gate states, in order. See [AppState.route].
 /// Flow: loading → pairing → profile (only if incomplete) → shell. The profile
 /// step collects age/weight/height/sex so the on-device analytics can
 /// personalize (HRmax, calories, TRIMP); it's skipped once those are set.
-enum AppRoute { loading, welcome, pairing, profile, shell }
+///
+/// [failed] is start-up itself failing — a state the app can BE in, with a name
+/// and a retry, rather than the bare untimed spinner [loading] used to sit on
+/// forever when anything in `_init` threw.
+enum AppRoute { loading, failed, welcome, pairing, profile, shell }
 
 /// The healed pairing to persist when the band reports [reportedSerial], or
 /// null when nothing should change.
@@ -118,11 +138,17 @@ PairedDevice? healedPairing(PairedDevice? current, String? reportedSerial) {
   final clean = cleanDeviceLabel(reportedSerial);
   if (clean == null || clean == current.serial) return null;
   if (current.remoteId.isEmpty) return null;
-  return PairedDevice(current.remoteId, clean);
+  return PairedDevice(current.remoteId, clean, generation: current.generation);
 }
 
 class AppState extends ChangeNotifier {
   late final BleEngine engine;
+
+  /// The primary band's route through [BandHost.commitNativeBatch] — see
+  /// `WhoopFramedAdapter`'s own header for why `run()` stays unwired this
+  /// wave. Constructed right after [engine] since [WhoopFramedAdapter]
+  /// delegates to it.
+  late final BandHost _bandHost;
   PairedDevice? paired;
   BandLease? _foregroundLease;
 
@@ -133,8 +159,9 @@ class AppState extends ChangeNotifier {
   LocalRepository? repo;
 
   /// The on-device compute orchestrator. Kicked (light) after every drain/flush
-  /// completion, and (heavy) on foreground finalize. Background heavy passes run
-  /// via WorkManager (Android) — see lib/compute/background_derivation.dart.
+  /// completion, and (heavy) on foreground finalize + throttled reconnect
+  /// backlogs. (The old WorkManager background heavy pass was removed — see the
+  /// tombstone in lib/compute/background_derivation.dart.)
   // `background` is final on the engine and picks the concurrency + per-day
   // timeout, so seeding the scheduler alone left a headless first sweep running
   // the foreground budget. Late-initialized, so this reads the value both
@@ -165,9 +192,20 @@ class AppState extends ChangeNotifier {
     isConnected: () => engine.isConnected,
   );
 
-  /// Fires a strap haptic at each hydration-reminder slot (best-effort, only when
-  /// the band is connected). Armed at launch + whenever notification prefs change.
+  /// Fires a strap haptic at each water-reminder slot (best-effort, only when
+  /// the band is connected). Armed at launch + whenever the toggle changes.
   late final WaterBuzzer _waterBuzzer = WaterBuzzer(
+    buzz: () => engine.buzz(),
+    isConnected: () => engine.isConnected,
+  );
+
+  /// Fires a strap haptic at each scheduled medication dose (best-effort, only
+  /// when the band is connected). Same trade as [_waterBuzzer]: the OS
+  /// notification is what actually reminds; the buzz is the bonus half that
+  /// only works with a live link. Armed from `_ensureRemindersScheduled`,
+  /// which is where the med schedule is already read for the OS slots — one
+  /// read feeds both surfaces, so they cannot drift apart.
+  late final MedBuzzer _medBuzzer = MedBuzzer(
     buzz: () => engine.buzz(),
     isConnected: () => engine.isConnected,
   );
@@ -184,9 +222,7 @@ class AppState extends ChangeNotifier {
   // "last data: …" indicator must show. Seeded from the DB at init, advanced as
   // records (drained + live) flow in.
   int? _lastRecTs;
-  Map<String, int> dbCounts = {'raw': 0, 'pending': 0};
   final List<String> logLines = [];
-  String? lastError;
   bool busy = false;
 
   bool _keepAlive = false;
@@ -219,6 +255,26 @@ class AppState extends ChangeNotifier {
   String? _widgetBattName;
   int? _storedBatteryPct;
 
+  /// Raw strapName last seen from the engine — change-gates the per-tick
+  /// cleanDeviceLabel/Prefs work in [_onEngineState].
+  String? _lastSeenStrapNameRaw;
+
+  /// Band id last seen from the engine — change-gates the `device.adapter_id`
+  /// write in [_onEngineState].
+  String? _lastSeenGeneration;
+
+  /// Minute-of-day last checked by [_maybeWarnOvernightBattery]'s clock
+  /// pre-gate (it runs off the ~1 Hz engine-state pipeline).
+  int? _lastForecastGateMin;
+
+  /// Last backgrounded heavy-derive request — throttles reconnect-driven heavy
+  /// passes while a flappy link churns in the background (30-min floor).
+  DateTime? _lastBackgroundHeavyAt;
+
+  /// Last backgrounded wake-window re-plan (its inputs change at most daily;
+  /// see the throttle in [_runPeriodicBackfill]).
+  DateTime? _lastWakeWindowRefreshAt;
+
   /// Last time the overnight battery forecast ran. `_onEngineState` fires on
   /// every device-state update, and the forecast reads a few hundred rows, so
   /// it is throttled rather than run per tick. The user-visible fire-once
@@ -234,6 +290,33 @@ class AppState extends ChangeNotifier {
   bool _background = false;
 
   bool get isPaired => paired != null;
+
+  /// Sensors paired ALONGSIDE the primary band — a chest strap, a ring.
+  ///
+  /// Raw `device` rows, minus the primary. Not `PairedDevice`: that type is the
+  /// one band the offload engine drives, and it holds a serial, a trim cursor
+  /// and a restore identity none of which a notify-class sensor has. These rows
+  /// are the whole of what a sensor is (`id`, `adapter_id`, `remote_id`,
+  /// `label`, `tier`), and `id` is the `device_id` its measurements carry.
+  ///
+  /// Read once at startup and after a pair or a forget — a `device` row only
+  /// changes when the user changes it, so nothing polls this.
+  List<Map<String, Object?>> _sensors = const [];
+  List<Map<String, Object?>> get sensors => _sensors;
+
+  /// Re-read the sensor rows. Call after pairing or forgetting one.
+  Future<void> refreshSensors() async {
+    final rows = await LocalDb.deviceRows();
+    _sensors = [
+      for (final r in rows)
+        if (r['id'] != LocalDb.kPrimaryDeviceId) r,
+    ];
+    // Same reason `_sensors` does not poll: a `signal_priority` row changes
+    // only when the user changes it.
+    _hrPriority =
+        (await LocalDb.signalPriorities())[InputSignal.hr1Hz.name] ?? const [];
+    notifyListeners();
+  }
 
   static const Duration _backfillInterval = Duration(minutes: 10);
 
@@ -343,9 +426,11 @@ class AppState extends ChangeNotifier {
   }
 
   // ── data imports (NOOP raw CSV / Edge backup / WHOOP export) ────────────────
-  // Reachable from onboarding AND Profile (a returning user is past the welcome
-  // gate). Each runs against the engine + local profile, then notifies so every
-  // screen re-reads the freshly imported days.
+  // Reachable from onboarding (welcome.dart) AND from Settings › Your data
+  // (ui2/profile/data.dart) — both go through `runImport`, so there is one
+  // router. Each runs against the engine + local profile, then notifies so
+  // every screen re-reads the freshly imported days. None of them overwrites a
+  // day the band measured (LocalDb.isMeasuredDay).
 
   /// NOOP raw-sensor CSV → FULL 1 Hz re-derivation (memory-bounded streaming).
   Future<int> importNoopCsv(
@@ -359,6 +444,11 @@ class AppState extends ChangeNotifier {
       onProgress: onProgress,
     );
     lastNoopImport = res;
+    // The rows are durable — tell the screens that read them. Without this an
+    // import landed days, sessions and journal rows into a database every live
+    // tab had already finished reading, and the only way to see them was to
+    // relaunch the app.
+    bumpInsights();
     notifyListeners();
     return res.days;
   }
@@ -368,6 +458,12 @@ class AppState extends ChangeNotifier {
   /// for the following day but never derived, and "imported N days" alone would
   /// hide that.
   NoopImportResult? lastNoopImport;
+
+  /// The most recent vendor-CSV import, for the same reason [lastNoopImport]
+  /// exists: the workouts it wrote and the days it refused to overwrite are
+  /// not in the day count, and "0 days imported" alone reported an import that
+  /// landed sixty sessions as a no-op.
+  WhoopImportResult? lastWhoopImport;
 
   /// WHOOP export CSV(s) → derived-snapshot days (+ workouts). BETA.
   Future<int> importWhoopCsvs(
@@ -380,31 +476,52 @@ class AppState extends ChangeNotifier {
       profile: _profile,
       onProgress: onProgress,
     );
+    lastWhoopImport = res;
+    bumpInsights(); // see importNoopCsv — imported rows have to reach the tabs
     notifyListeners();
     return res.days;
   }
 
   /// Another device's exported OpenStrap DB (.db) → merge into the local store.
   /// Returns total rows copied across tables.
+  /// Set when an import landed its rows but the rollup rebuild after it threw.
+  /// The days are in the database and the summaries built from them are not, so
+  /// reporting only the row count would claim a success the user does not have.
+  String? importRollupError;
+
   Future<int> importEdgeBackup(String path) async {
+    importRollupError = null;
+    // Gzipped auto-backups (`.db.gz`) are inflated INSIDE importFromDbFile —
+    // do not add it back here. Its inflate checks the gzip trailer, so a
+    // truncated backup fails loudly; `gzip.decoder` returns partial output
+    // without raising and would restore short while reporting success.
     final counts = await LocalDb.importFromDbFile(path);
     // Imported rows include derived day_result/metric_series → refresh rollups.
     try {
       await _derive.finalizeImport(_profile);
-    } catch (_) {
-      /* best-effort */
+    } catch (e) {
+      importRollupError = '$e';
     }
+    bumpInsights(); // see importNoopCsv — imported rows have to reach the tabs
     notifyListeners();
-    return counts.values.fold<int>(0, (a, b) => a + b);
+    // DAYS, not rows. `_days` is a distinct day_id count taken from the source
+    // file; the caller reports "N days imported" and a row total is not that.
+    return counts['_days'] ?? 0;
   }
 
   // ── platform health export (Apple Health / Health Connect) ──────────────────
-  final HealthExporter _healthExport = HealthExporter();
+  // The shared instance, not a private one: the coach and the log-workout
+  // sheet reach the exporter through `HealthExporter.exportWorkoutId` with no
+  // AppState in hand, and two exporters would mean two `Health()` handles and
+  // two Health-Connect availability probes doing the same work.
+  final HealthExporter _healthExport = HealthExporter.shared;
   final HealthExportSingleFlight _healthExportSingleFlight =
       HealthExportSingleFlight();
   HealthLinkState healthState = HealthLinkState.unknown;
   bool healthSyncEnabled = false;
-  static const String _kHealthSync = 'health_sync';
+  // Shared with `HealthExporter.exportWorkoutId`, which has to honour this
+  // switch from callers that never see this class.
+  static const String _kHealthSync = kHealthSyncPref;
 
   /// "Apple Health" (iOS) or "Health Connect" (Android).
   String get healthStoreName => HealthExporter.storeName;
@@ -455,9 +572,10 @@ class AppState extends ChangeNotifier {
     // Gate on the user's own preference. `disablePhoneSteps` deliberately does
     // NOT revoke the platform permission (that is the user's to do in
     // Settings), so an unconditional sync here would write phone rows straight
-    // back after the user turned the feature off — and since `liveStepsForDay`
-    // prefers phone rows outright, it would re-suppress the band count, the
-    // exact outcome `disablePhoneSteps` exists to prevent.
+    // back after the user turned the feature off — and the ladder ranks a
+    // phone span above any band span that does not look like gait, so those
+    // rows would go on taking steps off the band. The exact outcome
+    // `disablePhoneSteps` exists to prevent.
     // An explicit health sync is a user gesture — take the full window.
     if (phoneStepsEnabled) {
       unawaited(syncPhoneSteps(days: PhonePedometer.fullSyncDays));
@@ -470,17 +588,30 @@ class AppState extends ChangeNotifier {
         () => _healthExport.exportAll(forceRetry: forceRetry),
       );
 
-  // ── phone pedometer (the ONLY source of real 24/7 step counts) ─────────────
+  // ── phone pedometer — the fallback tier, and the only 24/7 one ────────────
+  // Not "the only real source": the strap's 100 Hz counter is measured and
+  // ranks above it, but only inside a gait workout, and the gen5 on-chip
+  // counter only exists on a gen5. Both are windows; this is the one that
+  // covers a whole day.
   final PhonePedometer _phonePedometer = PhonePedometer();
   bool phoneStepsEnabled = false;
   static const String _kPhoneSteps = 'phone_steps';
 
-  /// Ask for READ access to the phone's own step counts (user gesture).
+  /// Ask the OS for this phone's own step SENSOR (user gesture).
   ///
-  /// The band cannot count steps: it is on the wrist, and its 24/7 stream is
-  /// 1 Hz, where gait is sub-Nyquist. The phone rides in a pocket and already
-  /// counts steps continuously into the on-device health store — this reads
-  /// them. Nothing is uploaded and nothing is written back.
+  /// `CMPedometer` on iOS, `Sensor.TYPE_STEP_COUNTER` on Android, read straight
+  /// off the device — see [PhonePedometer] for why a pocket beats a wrist here.
+  /// It is the FALLBACK tier of the step ladder: our 100 Hz strap counter only
+  /// runs inside a gait workout and the gen5 on-chip counter only exists on a
+  /// gen5, so with a WHOOP 4 and this off a user gets steps for the workout and
+  /// nothing for the other twenty-odd hours.
+  ///
+  /// NOT the health store, and nobody may "restore" that. This used to read
+  /// `HealthDataType.STEPS`, which is a multi-writer aggregate any app can
+  /// write into (an `HKStatisticsQuery` sum on iOS, a `StepsRecord` aggregate
+  /// on Android) — so "real pedometer measurements only" was not enforceable
+  /// while we read it. The sensor is the one writer we actually want. Nothing
+  /// is uploaded and nothing is written back.
   Future<bool> requestPhoneSteps() async {
     final ok = await _phonePedometer.requestPermission();
     // PERSIST BEFORE mutating in-memory state. Setting the field first and
@@ -523,10 +654,11 @@ class AppState extends ChangeNotifier {
   /// Turn phone steps off and DROP the counts we pulled.
   ///
   /// Leaving the rows behind would keep serving phone-sourced steps from a
-  /// source the user just switched off, and `liveStepsForDay` prefers phone
-  /// rows over band rows — so a stale row would keep overriding the band
-  /// indefinitely. Revoking the platform permission is the user's to do in
-  /// Settings; all we can do is stop reading and forget what we read.
+  /// source the user just switched off, and the ladder in `resolveDaySteps`
+  /// ranks a phone span ABOVE any band span that does not look like gait — so
+  /// a stale phone row would go on taking steps off the band indefinitely.
+  /// Revoking the OS motion permission is the user's to do in Settings; all we
+  /// can do is stop reading and forget what we read.
   ///
   /// Clearing `live_coverage` only changes what FUTURE derives compute — the
   /// screens read scalars persisted in `day_result`/`metric_series`. So this
@@ -547,6 +679,10 @@ class AppState extends ChangeNotifier {
     phoneStepsLastTotal = null;
     phoneStepsToday = 0;
     _phoneStepsDay = null;
+    // Stop the sensor BEFORE dropping the rows: on Android the counter keeps
+    // accumulating into its own on-device store, so clearing `live_coverage`
+    // alone would leave this app counting a user who just asked it to stop.
+    await _phonePedometer.stop();
     try {
       await LocalDb.clearPhoneCoverage();
     } catch (e) {
@@ -566,29 +702,20 @@ class AppState extends ChangeNotifier {
   int? phoneStepsLastTotal;
 
   /// Steps the PHONE has banked for today, mirroring `liveStepsForDay`'s own
-  /// source rule (phone wins only when it actually has data). Screens add the
-  /// band's live count on top of the day total, and must not do that once the
-  /// phone owns the day — both count the same walk. Gating on
-  /// [phoneStepsEnabled] alone was wrong: with the toggle on and no phone data
-  /// (iOS read denied, nothing writing to Health Connect) the band still owns
-  /// the day and its live steps were being thrown away.
+  /// source rule (phone wins only when it actually has data).
+  ///
+  /// No screen reads this today. It fed `todayStepsFromPhone`, the phone-vs-band
+  /// precedence gate — deleted with [liveSteps], because no screen ever added a
+  /// live band count on top of the day total, so there was never a double-count
+  /// for it to arbitrate. The precedence rule that DOES matter is
+  /// `LocalDb.liveStepsForDay`'s, which the derivation reads.
   int phoneStepsToday = 0;
 
   /// Which local day [phoneStepsToday] was read for. The cache is worthless
   /// past midnight, and a process here routinely lives for days (Android
   /// foreground service, iOS suspend/resume), so a day-less cache would hold
-  /// yesterday's answer through the whole of today — suppressing the band's
-  /// live count on a day the phone has not contributed a single step to.
+  /// yesterday's answer through the whole of today.
   String? _phoneStepsDay;
-
-  /// True when today's step total comes from the phone, so band live steps are
-  /// already accounted for and must not be added again. Unknown-or-stale reads
-  /// as false: showing the band's live count is the safe direction (a lost
-  /// count is invisible, a doubled one is a wrong number).
-  bool get todayStepsFromPhone =>
-      phoneStepsEnabled &&
-      _phoneStepsDay == todayLabel() &&
-      phoneStepsToday > 0;
 
   Future<void> _refreshPhoneStepsToday() async {
     if (!phoneStepsEnabled) return;
@@ -627,20 +754,30 @@ class AppState extends ChangeNotifier {
   }
 
   /// Session-triggered Health export for one just-finished workout (issue
-  /// #130) — used by callers outside this class (e.g. confirming an
-  /// auto-detected workout in workouts_screen.dart) that write a `sessions`
-  /// row directly rather than going through [stopWorkout]. See
+  /// #130) — for callers outside this class that write a `sessions` row
+  /// directly rather than going through [stopWorkout]. See
   /// [HealthExporter.exportWorkout] for why this can't just wait for the next
   /// day export. Best-effort, never throws.
-  Future<bool> exportWorkoutToHealth(Map<String, Object?> session) =>
-      _healthExport.exportWorkout(session);
+  ///
+  /// This used to take the row, and its only two call sites went out with the
+  /// old `lib/ui/workouts` — leaving it callerless while `logManualWorkout`
+  /// paths (the coach, the log-workout sheet) exported nothing at all. Those
+  /// callers hold the `workout_id` the repo hands back, not the row, and most
+  /// of them have no AppState to reach for either, so the seam that matters is
+  /// [HealthExporter.exportWorkoutId] and this just forwards to it.
+  Future<bool> exportWorkoutToHealth(String? sessionId) =>
+      HealthExporter.exportWorkoutId(sessionId);
 
   // ── companion: anonymous telemetry + health-data contribution ────────────────
   // All anchored to a stable anonymous install id (no account). Two SEPARATE
-  // consent scopes, both PRE-ENABLED at enrollment (shown on the onboarding
-  // name/age screen, where the user can switch either off before continuing).
-  // `consentChosen` records that the user has passed that screen at least once,
-  // so we never retroactively flip a returning install that predates the screen.
+  // consent scopes, BOTH DEFAULTING OFF, both switchable in Settings › Privacy
+  // (ui2/profile/settings.dart). There is no consent screen in onboarding: the
+  // one the old `lib/ui` had was deleted with that package, and for a while
+  // afterwards `setHealthShareConsent` had no caller anywhere — an install
+  // carrying `consent_health_data = true` from before the rebuild kept
+  // uploading its whole database with no way to stop it. Nothing here may be
+  // enabled except by an explicit tap; `consentChosen` records only that the
+  // user has answered at least once.
   static const String _kDeviceId = 'install_device_id';
   static const String _kTelemetryConsent = 'consent_telemetry';
   static const String _kHealthShareConsent = 'consent_health_data';
@@ -691,13 +828,19 @@ class AppState extends ChangeNotifier {
       await t.load();
       if (telemetryConsent) unawaited(t.flush()); // ship last session's records
 
-      // Learn the live Terms version (and OTA/banner) — best-effort.
-      final status = await CompanionClient.getStatus();
-      final v = status?['terms']?['version'];
-      if (v is int && v > 0) {
-        termsVersion = v;
-        t.consentVersion = v;
-        HealthUploader.instance.consentVersion = v;
+      // Learn the live Terms version — best-effort, and ONLY for an install
+      // that is actually sending something. The version exists to stamp the
+      // consent records we post; someone who has consented to nothing has
+      // nothing to stamp, so fetching it was a launch-time call to the
+      // operator's server on behalf of a user who had opted out of all of it.
+      if (telemetryConsent || healthShareConsent) {
+        final status = await CompanionClient.getStatus();
+        final v = status?['terms']?['version'];
+        if (v is int && v > 0) {
+          termsVersion = v;
+          t.consentVersion = v;
+          HealthUploader.instance.consentVersion = v;
+        }
       }
     } catch (e) {
       _log('[companion] init failed (non-fatal): $e');
@@ -705,10 +848,15 @@ class AppState extends ChangeNotifier {
   }
 
   /// The live band fields folded into each telemetry batch's device snapshot.
+  ///
+  /// NOT the band's serial. It used to be, and a hardware serial is a stable
+  /// cross-install device identifier — outside what the privacy policy
+  /// enumerates as the payload ("crash reports, basic device info, coarse
+  /// performance timing"), and not something a crash report has ever needed.
+  /// Nothing here distinguishes one band from another.
   Map<String, dynamic> _bandSnapshot() {
     final s = engine.state;
     return {
-      if (s.serial != null) 'band_serial': s.serial,
       if (s.batteryPct != null) 'band_battery_pct': s.batteryPct!.round(),
       'ble_state': s.connection,
     };
@@ -831,6 +979,9 @@ class AppState extends ChangeNotifier {
 
   /// Clear the local profile + unpair the band (the former "sign out", now purely
   /// local — there is no session to end).
+  ///
+  /// This is the PROFILE half only. "Reset all data" is [resetAllData], which
+  /// calls this last; do not use this one for a destructive user action.
   Future<void> signOut() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_kProfile);
@@ -840,11 +991,80 @@ class AppState extends ChangeNotifier {
     await unpair();
   }
 
+  /// "Delete everything", and mean it.
+  ///
+  /// The old reset walked `availableDays()` — the non-skipped DERIVED days —
+  /// and deleted those, which left about twenty tables standing: blood panels,
+  /// every meal, every medication dose, every breathing session, every logged
+  /// set, the rolling baselines, the raw of any day that never derived. It
+  /// then removed exactly two preferences, so the install id, the consent
+  /// flags, the keychain API key, the home-screen widget's copy of yesterday's
+  /// readiness and every scheduled notification all survived a dialog that
+  /// said they would not.
+  ///
+  /// Order matters and is deliberate:
+  ///   1. Stop the network paths FIRST. Everything below takes time, and a
+  ///      derive or backup finishing mid-reset must not upload or write a
+  ///      snapshot of data the user just asked to destroy.
+  ///   2. The database, then the preferences, then the keychain — the reads
+  ///      that could re-create state are all downstream of the writes.
+  ///   3. [signOut] last, because it flips the route and the UI unwinds.
+  Future<void> resetAllData() async {
+    // 1 · nothing further leaves this phone, starting now.
+    telemetryConsent = false;
+    healthShareConsent = false;
+    consentChosen = false;
+    TelemetryService.instance.applyConsent(false);
+    HealthUploader.instance.deviceId = null; // maybeUpload bails without one
+    deviceId = '';
+
+    // 2 · every row in every table (see LocalDb.wipeAll for why it is not a
+    // hand-written table list, and for the sync_cursor decision).
+    await LocalDb.wipeAll();
+
+    // Surfaces outside the database that were still showing it.
+    await NotificationService.instance.cancelAll();
+    await WidgetService.clear();
+    try {
+      await coachConfig?.save(apiKey: ''); // deletes the keychain entry
+    } catch (e) {
+      _log('[reset] keychain clear failed: $e');
+    }
+
+    // 3 · the whole preference namespace, not a remembered subset — same
+    // reason as wipeAll. A fresh install is the state being restored, and a
+    // fresh install has no preferences. The install id regenerates on the next
+    // launch, which is the point: the old anonymous id must not follow the
+    // user through a "delete everything".
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.clear();
+    } catch (e) {
+      _log('[reset] prefs clear failed: $e');
+    }
+    appStatus = null;
+    _savedAlarm = null;
+
+    // 4 · the in-memory mirrors of what we just deleted. These are plain
+    // fields, restored only by the profile load at launch, so leaving them
+    // alone kept both features RUNNING against the wiped database for the rest
+    // of the session — a re-pair without a relaunch would find phone steps
+    // still on and health export still syncing, which is not "a fresh install".
+    healthSyncEnabled = false;
+    healthState = HealthLinkState.unknown;
+    phoneStepsEnabled = false;
+    phoneStepsToday = 0;
+    _phoneStepsDay = null;
+
+    await signOut();
+  }
+
   /// The single onboarding/route the UI gate is in. `_Gate` selects on THIS so it
   /// rebuilds only on a real route transition — NOT on every ~1 Hz notifyListeners
   /// (live HR, log lines), which used to repaint the whole home stack each second
   /// and starve the background BLE connection.
   AppRoute get route {
+    if (initError != null) return AppRoute.failed;
     if (!initialized) return AppRoute.loading;
     // First run, fresh install: offer "existing v2 user vs new user" before we
     // ask anyone to pair. A returning (already-paired) user skips it even if the
@@ -858,12 +1078,16 @@ class AppState extends ChangeNotifier {
   /// True once the profile has the fields the analytics personalization needs.
   bool get profileComplete => _profile.isComplete;
 
-  // ── app status: OTA update pointer + admin-pushed alert banner ──────────────
-  // Now fetched directly by UpdateService from a public, unauthenticated pointer
+  // ── app status: the OTA update pointer ──────────────────────────────────────
+  // Fetched directly by UpdateService from a public, unauthenticated pointer
   // URL — independent of any backend / JWT (the authed client was deleted).
+  //
+  // The operator-pushed alert banner that used to live here is GONE: it was
+  // fetched, dismissible and persisted, but no screen ever drew one, so the
+  // dismissed-id set could only ever be empty. Deleted rather than wired —
+  // nothing in the product asks for an operator broadcast channel.
   AppStatus? appStatus;
   int _currentBuild = 0; // our build number (from package_info); 0 if unknown
-  final Set<String> _dismissedBanners = {};
 
   UpdateInfo? get _update => appStatus?.update;
 
@@ -886,16 +1110,6 @@ class AppState extends ChangeNotifier {
       _currentBuild > 0 &&
       _currentBuild < _update!.minBuild;
 
-  UpdateInfo? get update => _update;
-
-  /// The admin banner to show right now (null if none, or dismissed + dismissible).
-  BannerInfo? get activeBanner {
-    final b = appStatus?.banner;
-    if (b == null) return null;
-    if (b.dismissible && _dismissedBanners.contains(b.id)) return null;
-    return b;
-  }
-
   Future<void> _loadAppStatus() async {
     try {
       final info = await PackageInfo.fromPlatform();
@@ -903,27 +1117,58 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       /* keep 0 → update prompts simply won't fire */
     }
-    final prefs = await SharedPreferences.getInstance();
-    _dismissedBanners.addAll(
-      prefs.getStringList('dismissed_banners') ?? const [],
-    );
     await refreshAppStatus();
+  }
+
+  /// Whether the Cycle tab exists at all.
+  ///
+  /// OFF by default and opt-in, which is the opposite of every other sub-tab.
+  /// Cycle is the one surface that is irrelevant — not merely empty — for most
+  /// of the people who open this app, and an empty tab that can never fill is
+  /// worse than no tab: it reads as a feature you failed to use. Nothing about
+  /// the switch is inferred from anything; it is asked for or it is absent.
+  ///
+  /// Turning it off hides the tab and stops its query running. It deletes
+  /// NOTHING — cycle entries already logged stay on disk and come back intact
+  /// if it is switched on again.
+  static const String _kCycleTracking = 'cycle_tracking_enabled';
+  bool get cycleTrackingEnabled => Prefs.getBool(_kCycleTracking, false);
+
+  Future<void> setCycleTrackingEnabled(bool on) async {
+    Prefs.setBool(_kCycleTracking, on);
+    notifyListeners();
+  }
+
+  /// Whether this install checks for updates. Only meaningful on a sideload
+  /// build ([kSideloadOtaEnabled]) — that is the only build whose binary can
+  /// contact the endpoint at all. Defaults ON there, because a sideloaded app
+  /// has no store to tell it a fix exists, but it is refusable and the
+  /// Settings row says what the check discloses.
+  static const String _kUpdateChecks = 'update_checks_enabled';
+  bool get updateChecksEnabled => Prefs.getBool(_kUpdateChecks, true);
+
+  /// Whether the update-check row should appear at all: a build with the
+  /// feature compiled out has nothing to switch.
+  bool get updateChecksAvailable => kSideloadOtaEnabled;
+
+  Future<void> setUpdateChecksEnabled(bool on) async {
+    Prefs.setBool(_kUpdateChecks, on);
+    if (!on) {
+      appStatus = null; // drop whatever the last check answered
+    }
+    notifyListeners();
+    if (on) await refreshAppStatus();
   }
 
   /// Re-poll the update pointer (best-effort; called on launch and on app resume).
   Future<void> refreshAppStatus() async {
+    if (!updateChecksEnabled) return;
     final status = await UpdateService.fetchStatus();
     if (status == null) return;
     appStatus = status;
     notifyListeners();
   }
 
-  Future<void> dismissBanner(String id) async {
-    _dismissedBanners.add(id);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList('dismissed_banners', _dismissedBanners.toList());
-    notifyListeners();
-  }
 
   /// A tapped notification asks the shell to switch to this tab index. The shell
   /// listens; it resets to -1 after consuming. Kept off the ChangeNotifier path so
@@ -961,24 +1206,33 @@ class AppState extends ChangeNotifier {
       log: _log,
       onMarkMoment: _markMomentFromGesture,
       onWorkoutToggle: _toggleWorkoutFromGesture,
+      onLogWater: _logWaterFromGesture,
     );
     engine = BleEngine(
       onRecord: _onRecord,
-      onState: _onEngineState,
+      onState: (s) => _onEngineState(LocalDb.kPrimaryDeviceId, s),
       log: _log,
-      onEvent: _onLiveEvent,
+      // M2: forward the session's real device id once DeviceSession exists;
+      // BleEngine's EventSink typedef has no device field, so the id names
+      // itself at this construction closure rather than widening the
+      // engine's callback shape for a value it does not have.
+      onEvent: (id, ts, hex) =>
+          _onLiveEvent(id, ts, hex, LocalDb.kPrimaryDeviceId),
       onRecordsBatch: LocalDb.insertRecordsBatch,
       // RESUMABLE SYNC: atomic commit of decoded rows + continuation cursor
       // before the HISTORY_END ACK, and a reader to seed the offload frontier
-      // from the durable high-water on (re)connect.
-      onCommitBatch: (raws, samples, trimTokenHex, {archives}) =>
-          LocalDb.commitSyncBatch(raws, samples,
-              trimToken: trimTokenHex,
-              archives: archives,
-              onCheckpoint: (msg) => _log('[COMMIT] $msg')),
+      // from the durable high-water on (re)connect. Routed through BandHost
+      // (M1a) rather than calling LocalDb.commitSyncBatch directly — same
+      // durable commit, same arguments, one extra await frame, and the SAME
+      // failure contract: `commitNativeBatch` rethrows so
+      // `DrainController.commit` still reads durability from a throw.
+      onCommitBatch: (raws, samples, trimTokenHex, {archives, deviceFamily}) =>
+          _bandHost.commitNativeBatch(raws, samples, trimTokenHex,
+              archives: archives, deviceFamily: deviceFamily),
       // Pre-setup fallback only: the drain path archives inside commitSyncBatch.
       onArchiveRecord: LocalDb.archiveRawRecord,
-      cursorReader: LocalDb.getCursorInt,
+      cursorReader: (base) =>
+          LocalDb.getCursorInt(LocalDb.cursorKeyFor(base, LocalDb.kPrimaryDeviceId)),
       // Debounced compute trigger: with continuous listening there's no discrete
       // "sync done", so the engine coalesces stored-record bursts and fires this
       // once a burst goes quiet. Light pass = freshness-first (TODAY when data has
@@ -987,7 +1241,7 @@ class AppState extends ChangeNotifier {
       onDataStored: _onDataStored,
       onOffloadState: (active) => _deriveScheduler.setOffloadActive(active),
       // LIVE high-rate frames (0x28/0x2B/0x33) are ephemeral — routed here for the
-      // live UI / spot-check, never persisted.
+      // live UI / breathing session, never persisted.
       onLiveFrame: _onLiveFrame,
       deriveDataStaleness: () {
         final ts = _lastRecTs;
@@ -1005,6 +1259,11 @@ class AppState extends ChangeNotifier {
       // nothing new and keeps both signals consistent with each other.
       isForegroundActive: () => !_background,
     );
+    _bandHost = BandHost(
+      adapter: WhoopFramedAdapter(engine, kWhoopGen4),
+      deviceId: LocalDb.kPrimaryDeviceId,
+      onLog: (msg) => _log('[COMMIT] $msg'),
+    );
     // Seed the engine's link-power state (issue #200). `setBackground` is
     // otherwise only called on TRANSITIONS, and a headless start begins
     // backgrounded — without this the very case that most needs the cheap
@@ -1015,12 +1274,19 @@ class AppState extends ChangeNotifier {
     // otherwise only flips on a transition, so a headless start paced its very
     // first sweep as if the app were on screen.
     _deriveScheduler.setBackground(_background);
-    repo = LocalRepositoryImpl(getProfileMap: () => user);
+    repo = LocalRepositoryImpl(
+      getProfileMap: () => user,
+      saveProfileFields: updateProfile,
+    );
     // iOS BGProcessing/BGAppRefresh wakes while the FOREGROUND app owns the band
     // skip the headless BLE path (it would fight FBP for the peripheral) — route
     // them to a catch-up pull over the existing live connection instead.
     IosBgTask.foregroundPull = foregroundCatchUp;
     taskerBridge; // force init: register the method channel handler
+    // A paired sensor's live beats, into the same trace as the band's. Touches
+    // no radio — `HrsLink.reading` is a plain notifier whose identity survives
+    // arm/disarm, which is why one listener for the life of this object works.
+    HrsLink.instance.reading.addListener(_onHrsReading);
     _init();
     // Notification taps → request a tab switch (the shell listens to navRequest).
     _tapSub = NotificationService.instance.taps.listen(_handleTapRoute);
@@ -1044,14 +1310,20 @@ class AppState extends ChangeNotifier {
       log: _log,
       onMarkMoment: _markMomentFromGesture,
       onWorkoutToggle: _toggleWorkoutFromGesture,
+      onLogWater: _logWaterFromGesture,
     );
     this.engine = engine ??
         BleEngine(
           onRecord: _onRecord,
-          onState: _onEngineState,
+          onState: (s) => _onEngineState(LocalDb.kPrimaryDeviceId, s),
           log: _log,
-          onEvent: _onLiveEvent,
+          // M2: same marker as the constructor above.
+          onEvent: (id, ts, hex) =>
+              _onLiveEvent(id, ts, hex, LocalDb.kPrimaryDeviceId),
         );
+    // Same wiring as the real constructor, and for the same reason it is safe
+    // here: a ValueNotifier, no plugin.
+    HrsLink.instance.reading.addListener(_onHrsReading);
   }
 
   /// A Siri/Shortcuts App Intent (e.g. "start breathing") may have set a
@@ -1086,7 +1358,7 @@ class AppState extends ChangeNotifier {
     _syncQuietTimer?.cancel();
     _syncQuietTimer = null;
     _disposed = true;
-    // EVERY timer this object owns, not just three of them. _spotTimer,
+    // EVERY timer this object owns, not just three of them.
     // _breathingRecomputeTimer and _workoutTimer used to survive dispose, and
     // each of their callbacks ends in notifyListeners() on a disposed
     // ChangeNotifier (which throws in release).
@@ -1095,16 +1367,22 @@ class AppState extends ChangeNotifier {
     _stopReconnectSupervisor();
     _alarmGraceTimer?.cancel();
     _alarmGraceTimer = null;
-    _spotTimer?.cancel();
-    _spotTimer = null;
     _breathingRecomputeTimer?.cancel();
     _breathingRecomputeTimer = null;
     _workoutTimer?.cancel();
     _workoutTimer = null;
+    // The sensor's notifier OUTLIVES this object (HrsLink is a singleton), so
+    // a listener left on it is a leak that calls into a disposed
+    // ChangeNotifier on the next beat.
+    HrsLink.instance.reading.removeListener(_onHrsReading);
+    final hrsId = _hrsTraceId;
+    _hrsTraceId = null;
+    if (hrsId != null) _clearLiveHrTrace(hrsId);
     BandOwnership.markForegroundIntent(false);
     _releaseForegroundLease();
     _deriveScheduler.dispose();
     _waterBuzzer.dispose();
+    _medBuzzer.dispose();
     // Owned notifiers/observers. notificationRelay in particular holds a
     // WidgetsBindingObserver, a 120 s Timer.periodic and a StreamSubscription —
     // its observer accumulated on the binding across every hot restart.
@@ -1123,7 +1401,6 @@ class AppState extends ChangeNotifier {
   void debugArmOwnedTimers() {
     _backfillTimer ??= Timer.periodic(_backfillInterval, (_) {});
     _alarmGraceTimer ??= Timer(const Duration(minutes: 5), () {});
-    _spotTimer ??= Timer.periodic(const Duration(seconds: 1), (_) {});
     _breathingRecomputeTimer ??=
         Timer.periodic(_breathingRecomputeInterval, (_) {});
     _workoutTimer ??= Timer.periodic(const Duration(seconds: 1), (_) {});
@@ -1133,6 +1410,11 @@ class AppState extends ChangeNotifier {
   /// the gate [_maybeDowngradeLiveForBackground] consults. Tests only.
   @visibleForTesting
   bool get debugHasLiveConsumer => _hasLiveConsumer;
+
+  /// Run start-up (guarded, exactly as the constructor fires it) so a test can
+  /// drive the failure path. Tests only.
+  @visibleForTesting
+  Future<void> debugInit() => _init();
 
   /// Run the orphaned-live-workout reconcile directly. Tests only — in the app
   /// it is kicked unawaited from [_init].
@@ -1153,10 +1435,15 @@ class AppState extends ChangeNotifier {
     _trackCoverage(recTs);
   }
 
-  /// End the live-pedometer session (persist the coverage window, fold the bout
-  /// into the cadence calibration) without a BLE disconnect. Tests only.
+  /// End the live-pedometer session (persist the coverage window) without a
+  /// BLE disconnect. Tests only.
   @visibleForTesting
   Future<void> debugFinalizeLivePedometer() => _finalizeLivePedometer();
+
+  /// Run one 1 Hz live-workout tick without the timer. Tests only — the tick is
+  /// where a stale heart rate would be billed into zone-seconds and strain.
+  @visibleForTesting
+  void debugTickWorkout() => _tickWorkout();
 
   /// Feed a strap alarm-lifecycle event (56 set / 57–58 fired / 59 cleared)
   /// without going through the BLE event path. Tests only.
@@ -1164,16 +1451,30 @@ class AppState extends ChangeNotifier {
   void debugHandleAlarmEvent(int id) =>
       _handleAlarmEvent(id, DateTime.now().millisecondsSinceEpoch ~/ 1000);
 
-  /// (Re)arm the strap-buzz timer for the hydration reminder from the current
-  /// notification prefs. Call at launch and whenever the prefs change (the
-  /// Notifications screen passes [prefs] so we skip a reload). Slot times come
-  /// from the same NotificationCenter helper the OS scheduler uses.
+  /// Feed one `DeviceState` through [_onEngineState] for [deviceId], exactly
+  /// as `BleEngine`'s `onState` callback does. Tests only — lets a test drive
+  /// the per-device live-HR dedupe (M6 §11) without a real BLE stream.
+  @visibleForTesting
+  void debugFeedEngineState(String deviceId, DeviceState s) =>
+      _onEngineState(deviceId, s);
+
+  /// (Re)arm the strap-buzz timer for the water reminder from the current
+  /// notification prefs. Call at launch and whenever the toggle changes (the
+  /// Notifications screen passes [prefs] so we skip a reload). Timers don't
+  /// persist, so launch is not optional.
   Future<void> armWaterReminder([NotificationPrefs? prefs]) async {
     final p = prefs ?? await NotificationPrefs.load();
     _waterBuzzer.configure(
-      enabled: p.waterEnabled && p.remindersEnabled,
+      enabled: p.waterEnabled,
       slotMinutes: NotificationCenter.waterSlotMinutes(p),
     );
+  }
+
+  /// Push a just-saved low-battery threshold into the device-alert pipeline.
+  /// DeviceAlerts restores its threshold once per process; without this a
+  /// change made in Settings would not apply until the next restart.
+  Future<void> refreshBatteryThreshold(NotificationPrefs prefs) async {
+    _deviceAlerts.refreshThreshold();
   }
 
   /// Compute trigger: kick the DerivationEngine after data is persisted.
@@ -1198,7 +1499,6 @@ class AppState extends ChangeNotifier {
         heavy: heavy,
         onDayDone: (day, index, total) async {
           if (index == total || index == 1 || index % 3 == 0) {
-            dbCounts = await LocalDb.counts();
             notifyListeners();
           }
         },
@@ -1222,8 +1522,11 @@ class AppState extends ChangeNotifier {
         _log('[derive] session rescore failed: $e');
       }
       await LocalDb.refreshComputeFreshness();
-      _bumpInsightsRevision();
+      bumpInsights();
       notifyListeners(); // screens re-fetch from the derived store
+      // Same signal, for the surfaces that can't listen: home/lock-screen
+      // widget, Watch mirror, Siri intents (WidgetService.refresh).
+      unawaited(WidgetService.refresh(repo));
       // A heavy finalize is where a freshly-closed sleep window + recovery for a
       // new physiological day lands — fire the "recovery ready" push off it.
       if (heavy) {
@@ -1264,6 +1567,7 @@ class AppState extends ChangeNotifier {
       if (heavy && healthShareConsent) {
         unawaited(HealthUploader.instance.maybeUpload(consented: true));
       }
+      if (heavy) unawaited(_maybeReclaimDiskSpace());
     } catch (e, st) {
       _log('[derive] post-drain failed: $e');
       // Was silently swallowed before — this is a real pipeline failure
@@ -1272,6 +1576,38 @@ class AppState extends ChangeNotifier {
       TelemetryService.instance.recordNonFatal(e, st, reason: 'post_drain_failed');
     } finally {
       TelemetryService.instance.setContext('derive_active', false);
+    }
+  }
+
+  bool _vacuumedThisLaunch = false;
+
+  /// Give the FILESYSTEM back the pages the retention prune freed.
+  ///
+  /// Deleting rows only moves pages to SQLite's freelist; the file never
+  /// shrinks below its all-time high-water mark, so an install that once let a
+  /// substrate backlog build (or that went through v39's two shadow-copy
+  /// migrations) keeps that size forever even though the space is unused. See
+  /// [LocalDb.vacuumIfBloated] for why this is a one-off VACUUM and not
+  /// `auto_vacuum`.
+  ///
+  /// A VACUUM rewrites the whole file under an exclusive lock and wants ~2× the
+  /// file size free on disk, so it runs at exactly one moment: right after a
+  /// FOREGROUND heavy derive, with no live session and nothing else in flight.
+  /// Never on the sync/ACK path, never backgrounded, and at most once a launch
+  /// — steady state has nothing left to reclaim on a second pass.
+  Future<void> _maybeReclaimDiskSpace() async {
+    if (_vacuumedThisLaunch || _disposed) return;
+    if (_background || busy || _hasLiveConsumer) return;
+    _vacuumedThisLaunch = true;
+    try {
+      final freed = await LocalDb.vacuumIfBloated();
+      if (freed > 0) {
+        _log('[db] vacuum returned ${freed >> 20} MB to the filesystem');
+      }
+    } catch (e) {
+      // Out of disk, or another connection holds a lock. Storage hygiene —
+      // nothing user-facing depends on it, and the next launch tries again.
+      _log('[db] vacuum skipped: $e');
     }
   }
 
@@ -1301,8 +1637,10 @@ class AppState extends ChangeNotifier {
       // Sleep hours from the day's bundle accounting (tst), for the body copy.
       String slept = '';
       try {
-        final payload = jsonDecode((row['payload_json'] ?? '{}').toString());
-        if (payload is Map) {
+        final payload = SeriesCodec.decodePayloadJson(
+          (row['payload_json'] ?? '{}').toString(),
+        );
+        if (payload != null) {
           final acct = ((payload['sleep'] as Map?)?['accounting'] as Map?);
           final tstSec = ((acct?['value'] as Map?)?['tst_sec'] as num?)
               ?.toDouble();
@@ -1329,9 +1667,13 @@ class AppState extends ChangeNotifier {
           category: NotifCategory.recovery,
           priority: NotifPriority.normal,
           title: 'Your recovery is ready',
-          body: 'Recovery $score$slept. Tap to see today.',
+          body: 'Recovery $score$slept.',
           date: dayId,
-          route: '/today',
+          // kRouteRecovery, NOT the bare /today: this event sat dead for
+          // months because the recovery channel was one `classOf` dropped —
+          // it is the route that re-sanctions it as a prompt (and
+          // recoveryEnabled that mutes it).
+          route: kRouteRecovery,
         ),
       );
       if (fired) {
@@ -1352,6 +1694,11 @@ class AppState extends ChangeNotifier {
       await _ensureRemindersScheduled();
       await _maybeNotifyStepGoal();
       await _maybeNotifyInactivity();
+      // Opt-in auto-import of Health workouts (off by default; self-gates on
+      // permission + a 1 h throttle — see AutoWorkoutImport). Foreground
+      // cadence is the trigger: workouts are not live data, and this never
+      // prompts.
+      unawaited(AutoWorkoutImport.maybeRun());
       await _maybeGenerateBriefing();
       unawaited(_checkSchemaHealth()); // throttled internally to 24h
       // Staleness-escalation meta-layer: the SAME check the headless path
@@ -1409,7 +1756,14 @@ class AppState extends ChangeNotifier {
       final ai = await AiPrefs.load();
       final minOfDay = at.hour * 60 + at.minute;
       BriefingPeriod? want;
-      if (ai.eveningEnabled && minOfDay >= ai.eveningMin) {
+      // The SAME resolved time the sweep notification is armed for. Reading
+      // the raw `eveningMin` here would generate — and permanently cache —
+      // tonight's sweep at 20:00 for a user whose slot is 21:45, off a day
+      // that was not over yet.
+      final eveningMin = ai.resolvedEveningMin(
+        bedtimeMinOfDay: (await _readCrossdaySummary()).bedtimeMin,
+      );
+      if (ai.eveningEnabled && minOfDay >= eveningMin) {
         want = BriefingPeriod.evening;
       } else if (ai.morningEnabled && at.hour >= 5) {
         want = BriefingPeriod.morning;
@@ -1458,12 +1812,15 @@ class AppState extends ChangeNotifier {
         e: NotificationEvent(
           dedupeKey: '$date:step_goal',
           category: NotifCategory.reminders,
-          priority: NotifPriority.low,
+          // NORMAL + kRouteSteps, not low + /today: reminders-at-low was one
+          // of the dropped pairs, so this achievement never once reached a
+          // shade. It is a prompt now (route-keyed), muted via
+          // stepGoalEnabled.
+          priority: NotifPriority.normal,
           title: 'Step goal reached',
-          body:
-              'You hit about $steps steps — at or above your $goal goal. Nice work.',
+          body: 'You hit about $steps steps — at or above your $goal goal.',
           date: date,
-          route: '/today',
+          route: kRouteSteps,
         ),
       );
     } catch (_) {
@@ -1477,6 +1834,14 @@ class AppState extends ChangeNotifier {
   /// is a short rolling ~15 min window, not a monotonic idle timer, so it
   /// doesn't translate into a single OS-scheduled instant the way the
   /// "time to move" nudge below does; still foreground-only for now).
+  ///
+  /// WIRED under the Movement-nudge switch: this event used to emit on
+  /// reminders/low with a bare `/today` route — exactly the pair `classOf`
+  /// drops — so it never once reached a shade (the stillness nudge's own
+  /// history, pre-schedulableIds). It now rides [kRouteMovement] at prompt
+  /// class, gated by `movementEnabled`, and on a real present it also buzzes
+  /// the band — safe because this only ever runs with recent live IMU, i.e. a
+  /// link that was alive moments ago.
   static const String _kLastInactivityMs = 'last_inactivity_ms';
   Future<void> _maybeNotifyInactivity() async {
     try {
@@ -1493,24 +1858,36 @@ class AppState extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       final lastFired = prefs.getInt(_kLastInactivityMs) ?? 0;
       if (nowMs - lastFired < 2 * 60 * 60 * 1000) return; // rate-limit to /2h
-      await prefs.setInt(_kLastInactivityMs, nowMs);
 
       // CodeRabbit caught this as un-padded (e.g. "2026-7-5" instead of
       // "2026-07-05") — breaks the YYYY-MM-DD convention every other
       // dedupeKey/date field in this file already follows.
       final today = todayLabel();
-      await NotificationCenter.instance.emit(
+      // GUARD AFTER PRESENT — same shape as the two above. Stamping the
+      // rate-limit before the emit meant a nudge dropped by quiet hours or a
+      // muted category silenced the check for the next two hours, so unmuting
+      // it at 09:20 bought you nothing until 11:05.
+      final fired = await NotificationCenter.instance.emit(
         NotificationEvent(
           dedupeKey: '$today:posture:${nowMs ~/ (2 * 60 * 60 * 1000)}',
           category: NotifCategory.reminders,
-          priority: NotifPriority.low,
-          title: 'Posture Check & Stretch',
+          // NORMAL, not low: reminders-at-low is one of the dropped pairs,
+          // and prompt class requires normal priority.
+          priority: NotifPriority.normal,
+          title: 'Time to move',
           body:
-              'You’ve been in a typing posture for over 90 minutes without walking. Time to stretch your legs and reset your posture!',
+              'You’ve been in a typing posture for over 90 minutes without walking.',
           date: today,
-          route: '/today',
+          route: kRouteMovement,
         ),
       );
+      if (fired) {
+        await prefs.setInt(_kLastInactivityMs, nowMs);
+        // Strap haptic alongside the shade card — the WaterBuzzer trade in a
+        // place that doesn't need its own timer: the live IMU feed this check
+        // just read IS the proof of a recent link.
+        unawaited(engine.buzz());
+      }
     } catch (_) {
       /* best-effort */
     }
@@ -1536,6 +1913,13 @@ class AppState extends ChangeNotifier {
     if (nowMs - _lastStillnessScheduleMs < 10 * 60 * 1000) return;
     _lastStillnessScheduleMs = nowMs;
     try {
+      // Opt-in, off by default. Read here rather than cached because this runs
+      // at most once every ten minutes and SharedPreferences is already in
+      // memory — and because the switch has to bite on the next movement, not
+      // at the next launch. It is also what makes the slot allow-listed at all
+      // (NotificationService.schedulableIds): a nudge with no off switch was
+      // refused there, and had never once fired.
+      if (!(await NotificationPrefs.load()).movementEnabled) return;
       await NotificationService.instance.cancel(NotificationService.idStillness);
       final at =
           DateTime.fromMillisecondsSinceEpoch(nowMs).add(const Duration(hours: 2));
@@ -1544,8 +1928,7 @@ class AppState extends ChangeNotifier {
         id: NotificationService.idStillness,
         category: NotifCategory.reminders,
         title: 'Time to move',
-        body:
-            "You've been still for a couple of hours — a short walk keeps your energy and circulation up.",
+        body: "You've been still for a couple of hours.",
         at: at,
         route: '/today',
       );
@@ -1580,14 +1963,12 @@ class AppState extends ChangeNotifier {
         onDayDone: (day, index, total) async {
           reanalyzeProgress = 'Analyzing $index/$total';
           if (index == total || index == 1 || index % 3 == 0) {
-            dbCounts = await LocalDb.counts();
             notifyListeners();
           }
         },
       );
       await LocalDb.refreshComputeFreshness();
-      _bumpInsightsRevision();
-      dbCounts = await LocalDb.counts();
+      bumpInsights();
       return n;
     } catch (e) {
       _log('[derive] reanalyze failed: $e');
@@ -1640,6 +2021,32 @@ class AppState extends ChangeNotifier {
     await _reanalyzeForOverride();
   }
 
+  /// Reject a day's detected main sleep entirely — "this was not sleep at
+  /// all", the missing counterpart to [confirmSleep] (naps already have this
+  /// via `sleep_nap` source='rejected'; main-sleep sessions didn't — edge#248).
+  /// Same table, same force-re-derive; `source: 'rejected'` tells
+  /// `calendarDays` (substrate.dart) to skip staging this window rather than
+  /// force it, so the day re-derives with no main sleep at all. Reversible
+  /// the same way as any other override: [clearSleepOverride].
+  Future<void> rejectSleep(String date) async {
+    if (repo == null) return;
+    final sleep = await repo!.getDaySleep(date);
+    final onset = (sleep['onset_ts'] as num?)?.toInt();
+    final offset = (sleep['wake_ts'] as num?)?.toInt();
+    // The rejected window is stored for the record, same as a rejected nap —
+    // it is never read back once source is 'rejected' (staging is skipped
+    // outright), so an absent detected window falls back to a harmless
+    // same-day placeholder rather than blocking the rejection.
+    final fallback = DateTime.parse(date).millisecondsSinceEpoch ~/ 1000;
+    await LocalDb.putSleepOverride(
+      dayId: date,
+      onsetTs: onset ?? fallback,
+      offsetTs: offset ?? (fallback + 1),
+      source: 'rejected',
+    );
+    await _reanalyzeForOverride();
+  }
+
   /// Remove a manual/confirmed override for [date] — revert to auto/fallback.
   Future<void> clearSleepOverride(String date) async {
     await LocalDb.deleteSleepOverride(date);
@@ -1655,7 +2062,9 @@ class AppState extends ChangeNotifier {
     try {
       await _derive.run(_profile, force: true);
       await LocalDb.refreshComputeFreshness();
-      dbCounts = await LocalDb.counts();
+      // The day_result rows just changed — without this no RevisionReload screen
+      // re-reads, so an override/nap edit only showed up after a restart.
+      bumpInsights();
     } catch (e) {
       _log('[derive] sleep-override re-derive failed: $e');
     } finally {
@@ -1670,40 +2079,6 @@ class AppState extends ChangeNotifier {
   /// when they are finalized.
   Future<void> reanalyzeForNapEdit() => _reanalyzeForOverride();
 
-  Future<int> reanalyzeDays(Set<String> days) async {
-    if (days.isEmpty || reanalyzing) return 0;
-    reanalyzing = true;
-    final ordered = days.toList()..sort();
-    reanalyzeProgress =
-        'Analyzing ${ordered.length} day${ordered.length == 1 ? '' : 's'}…';
-    notifyListeners();
-    try {
-      final n = await _derive.runDays(
-        _profile,
-        days,
-        force: true,
-        onDayDone: (day, index, total) async {
-          reanalyzeProgress = 'Analyzing $index/$total';
-          if (index == total || index == 1 || index % 3 == 0) {
-            dbCounts = await LocalDb.counts();
-            notifyListeners();
-          }
-        },
-      );
-      await LocalDb.refreshComputeFreshness();
-      _bumpInsightsRevision();
-      dbCounts = await LocalDb.counts();
-      return n;
-    } catch (e) {
-      _log('[derive] reanalyze selected failed: $e');
-      return 0;
-    } finally {
-      reanalyzing = false;
-      reanalyzeProgress = '';
-      notifyListeners();
-    }
-  }
-
   Future<List<Map<String, dynamic>>> dataHistoryDays() =>
       LocalDb.dataHistoryDays();
 
@@ -1715,15 +2090,20 @@ class AppState extends ChangeNotifier {
   Future<int> deleteDays(Set<String> dayIds) async {
     final deleted = await LocalDb.deleteDays(dayIds);
     await LocalDb.refreshComputeFreshness();
-    dbCounts = await LocalDb.counts();
     lastSynced = await LocalDb.latestSample();
+    // Deleting days is a durable write like any other, so the screens holding a
+    // cached read have to be told. `notifyListeners()` alone leaves a
+    // RevisionReload screen showing days that are gone until some unrelated
+    // bump or a restart — and this is the one write where the stale copy is of
+    // data the user explicitly asked to destroy.
+    if (deleted > 0) bumpInsights();
     notifyListeners();
     return deleted;
   }
 
   /// Debounced "new data stored" callback from the engine (continuous listening has
   /// no discrete sync end). The engine already coalesced the burst; we run a single
-  /// LIGHT derive over the affected day(s) and refresh DB counts for the UI.
+  /// LIGHT derive over the affected day(s).
   ///
   /// This is also THE reliable place to refresh `_lastRecTs` (the "last data"
   /// freshness banner reads it). `_runSyncBurst`'s own before/after frontier
@@ -1732,13 +2112,12 @@ class AppState extends ChangeNotifier {
   /// checkpoint-based refresh can miss a burst entirely. This callback fires
   /// on EVERY successful persist path (foreground burst, background/headless
   /// drain, live-triggered store) after the write is durable, so it can't
-  /// race it — same guarantee dbCounts already relies on above.
+  /// race it.
   void _onDataStored() {
     // Synchronously, before the async read below: this is the moment records
     // became durable, and it is the only path that sees every commit.
     _markSyncActivity();
     unawaited(() async {
-      dbCounts = await LocalDb.counts();
       final recTsHw = await LocalDb.getCursorInt('rec_ts_hw');
       if (recTsHw != null && recTsHw > (_lastRecTs ?? 0)) {
         _lastRecTs = recTsHw;
@@ -1751,14 +2130,74 @@ class AppState extends ChangeNotifier {
   // Live (foreground / kept-alive) event path: persist every event, then let the
   // gesture dispatcher act on it. Headless drain (background_sync) persists only —
   // it must never replay an old tap as a live action.
-  void _onLiveEvent(int id, int ts, String hex) {
-    LocalDb.insertEvent(id, ts, hex);
+  void _onLiveEvent(int id, int ts, String hex, String deviceId) {
+    LocalDb.insertEvent(id, ts, hex, deviceId: deviceId);
+    // M3: gesture dispatch and the alarm handler stay unscoped — neither is
+    // device-scoped in M3's scope, and a double-tap on either band should
+    // still log water.
     _handleAlarmEvent(id, ts);
     _gestureDispatcher.onEvent(id, ts, hex);
   }
 
+  /// Why start-up failed, or null if it did not. Drives [AppRoute.failed].
+  ///
+  /// The message is whatever actually threw, verbatim. It is not translated
+  /// into a friendlier guess: if the app does not know why it could not start,
+  /// it says what it does know rather than inventing a cause.
+  String? initError;
+
+  /// The database had to be rebuilt on this launch — see [LocalDb.lastRebuild].
+  /// Non-null means the old file is parked on disk and only what
+  /// `salvaged` lists came back. The user has to be TOLD; a rebuild the user
+  /// never hears about is indistinguishable from data quietly vanishing.
+  DbRebuild? get dbRebuild => LocalDb.lastRebuild;
+
+  bool _retryingInit = false;
+
+  /// Run start-up again after [AppRoute.failed]. Every step in [_initSteps] is
+  /// idempotent (prefs/DB reads, and `openSession` is guarded by `busy`), so a
+  /// retry that partially succeeded before simply redoes it.
+  Future<void> retryInit() async {
+    if (initialized || _retryingInit) return;
+    _retryingInit = true;
+    initError = null;
+    notifyListeners(); // back to the spinner while this runs
+    try {
+      await _init();
+    } finally {
+      _retryingInit = false;
+    }
+  }
+
+  /// [_initSteps], with the guard that turns a start-up failure into a state
+  /// the app can be in and get out of.
+  ///
+  /// This is fired UNAWAITED from the constructor, so before the guard any
+  /// throw — a corrupt prefs blob, a DB read, the derive scheduler's job
+  /// recovery — became an unhandled async error that skipped `initialized =
+  /// true` and reached nothing but Crashlytics. The user got `AppRoute.loading`
+  /// forever: a bare spinner with no timeout, no message and no retry, on every
+  /// single launch. `main.dart` already wraps every OTHER start-up step exactly
+  /// like this.
   Future<void> _init() async {
+    try {
+      await _initSteps();
+    } catch (e, st) {
+      _log('[init] FAILED: $e');
+      TelemetryService.instance.recordNonFatal(e, st, reason: 'app_init_failed');
+      // A throw AFTER `initialized` is a late, non-fatal step (the background
+      // BLE arm at the tail) — the shell is already usable, so it must not
+      // throw the user onto an error screen.
+      if (!initialized) {
+        initError = '$e';
+        notifyListeners();
+      }
+    }
+  }
+
+  Future<void> _initSteps() async {
     paired = await PairedDevice.load();
+    await refreshSensors();
     await _loadProfile();
     await _refreshNightlyRhr();
     await _deriveScheduler.init();
@@ -1775,9 +2214,24 @@ class AppState extends ChangeNotifier {
     // policies already trust).
     _lastRecTs =
         await LocalDb.getCursorInt('rec_ts_hw') ?? lastSynced?.tsEpoch;
-    dbCounts = await LocalDb.counts();
     await LocalDb.refreshComputeFreshness();
-    _savedAlarm = (await SharedPreferences.getInstance()).getInt('alarm_epoch');
+    final alarmPrefs = await SharedPreferences.getInstance();
+    _savedAlarm = alarmPrefs.getInt('alarm_epoch');
+    // Seed the confirmation machine from what the last session (foreground OR
+    // headless — background_sync.dart writes the same two keys) actually
+    // learned, so a relaunch doesn't forget a confirmed headless arm and
+    // wrongly read it as unconfirmed, nor trust an arm that never confirmed.
+    // `setAtMs` is stamped as "now" rather than the true original arm time —
+    // ponytail: harmless imprecision (worst case a few extra seconds of
+    // "pending" after launch before an unconfirmed arm shows its warning),
+    // add real persistence of setAtMs if that grace window ever needs to be
+    // exact across relaunches.
+    if (_savedAlarm != null) {
+      _alarm.set(_savedAlarm!, DateTime.now().millisecondsSinceEpoch);
+      _alarm.confirmed = alarmPrefs.getBool('alarm_epoch_confirmed') ?? false;
+    }
+    await _loadAlarmSchedule();
+    await _seedAlarmScheduleFromLegacyIfNeeded();
     // Band-gesture mapping: load the saved action + query native capabilities so the
     // settings UI knows what this platform supports. Best-effort, non-blocking.
     unawaited(gestureSettings.bootstrap());
@@ -1793,14 +2247,22 @@ class AppState extends ChangeNotifier {
     // Companion (anonymous telemetry + health-data contribution) — best-effort,
     // OFF the critical path so it can never block/break boot. Guarded internally.
     unawaited(_initCompanion());
-    unawaited(
-      armWaterReminder(),
-    ); // arm the hydration strap-buzz (timers don't persist)
+    // arm the water-reminder strap buzz (timers don't persist)
+    unawaited(armWaterReminder());
     // App status (OTA pointer + admin alert banner) — best-effort, non-blocking.
     unawaited(_loadAppStatus());
     // Register the recurring wall-clock nudges as real OS-scheduled notifications
     // (wind-down, weekly recap) so they fire even when the app is closed.
     if (isPaired) unawaited(_ensureRemindersScheduled());
+    // SECOND FRAMED BAND (iOS 18+): the ASK picker must run with NO
+    // CBCentralManager alive in the process. This is the only such moment —
+    // `main()`'s two flutter_blue_plus calls (setOptions/setLogLevel) return
+    // before the plugin's lazy central init, and the block below is the first
+    // start-up code that creates one. DO NOT move this later, and do not add a
+    // radio call above it.
+    if (Prefs.getBool(Prefs.kAskAddPendingKey, false)) {
+      await _provisionAdditionalAccessory();
+    }
     if (isPaired) {
       if (_background) {
         _keepAlive = true;
@@ -1813,7 +2275,8 @@ class AppState extends ChangeNotifier {
         _log('===== BACKGROUND SESSION START =====');
         try {
           await _ensureForegroundLease();
-          if (await engine.connectToRemoteId(paired!.remoteId)) {
+          if (await engine.connectToRemoteId(paired!.remoteId,
+              generationHint: paired!.generation)) {
             // A process kill followed by an iOS BLE-restore relaunch lands
             // HERE, not in openSession() — this is the primary case the live
             // step checkpoint exists for, so recovery has to run on this path
@@ -1821,7 +2284,21 @@ class AppState extends ChangeNotifier {
             // cold launch, so there is nothing to double-count.
             await _recoverOrphanedLiveSession();
             _resetLivePedometer();
-            _maybeDowngradeLiveForBackground();
+            // Settle any in-flight background downgrade FIRST — arming over
+            // a pending disable let its trailing OFF writes kill what we just
+            // armed.
+            await _settleBgLiveDowngrade();
+            if (Platform.isIOS && !engine.liveEnabled) {
+              // A background cold-launch connects with NO stream armed, and
+              // _maybeDowngradeLiveForBackground no-ops when live is already
+              // off — but on iOS zero inbound traffic can stall the suspended
+              // process's Dart timers (the 1 Hz notification is what keeps it
+              // schedulable; see the downgrade doc). Arm HR-only directly.
+              // Android correctly stays stream-less here.
+              unawaited(engine.enableHrOnlyLive());
+            } else {
+              _maybeDowngradeLiveForBackground();
+            }
             _startBackfillTimer();
           } else {
             // Connect attempt didn't succeed on this background cold-launch —
@@ -1888,6 +2365,51 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// One-shot: release the restore central, show the ASK picker for an additional
+  /// accessory, re-create the restore central around the new band, and re-arm the
+  /// primary. The flag is cleared in `finally` — a cancelled or failed picker must
+  /// not re-open the sheet on every launch forever.
+  ///
+  /// NOT surfaced from any UI in M4 (see devices.dart's addFramedBand) — this is
+  /// plumbing + its test only, since no second framed band exists to provision
+  /// against yet.
+  Future<void> _provisionAdditionalAccessory() async {
+    try {
+      if (!await AccessorySetup.isSupported()) return;
+      // NOT disarm(): that clears the persisted band list too, and a process death
+      // between here and `provisioned` below would leave the primary with no
+      // restore key and no error anywhere. See ios_ble_restore.releaseCentralForPicker.
+      await IosBleRestore.releaseCentralForPicker();
+      final remoteId = await AccessorySetup.showPicker(addAnother: true);
+      // Recreates the restore central and appends to the band list.
+      await IosBleRestore.provisioned(remoteId);
+      // Arm policy is unchanged: the PRIMARY is what gets background restore.
+      // The new band is provisioned and connectable in the foreground.
+      final p = paired;
+      if (p != null) await IosBleRestore.arm(p.remoteId);
+      // NO FAMILY CLAIM. `AccessorySetup.showPicker` offers both the WHOOP 4.0
+      // and the WHOOP 5.0/MG display items and hands back only an
+      // `ASAccessory.bluetoothIdentifier` — nothing here knows which one the
+      // user chose. Stamping `gen4` filed a WHOOP 5 under gen4's decode
+      // constants; a null `adapter_id` is the honest answer until discovery
+      // reads the service and says. That also means no `HrsLink.mintDeviceId`
+      // call is possible yet (its prefix IS the family), so the row keeps a
+      // provisional id.
+      await LocalDb.upsertDevice(
+        id: 'whoop:$remoteId',
+        remoteId: remoteId,
+      );
+    } catch (e) {
+      debugPrint('[ask] additional accessory not provisioned: $e');
+      // The restore central is gone at this point if the picker threw after the
+      // release. Put it back for the primary, or overnight sync silently stops.
+      final p = paired;
+      if (p != null) await IosBleRestore.provisioned(p.remoteId);
+    } finally {
+      Prefs.setBool(Prefs.kAskAddPendingKey, false);
+    }
+  }
+
   /// Poll [check] every 500ms until it's true or [timeout] elapses. Small and
   /// generic on purpose — currently only used for the Tasker pending-buzz
   /// handoff, which needs to wait for a real BLE connection rather than a
@@ -1906,38 +2428,174 @@ class AppState extends ChangeNotifier {
   Future<void> _ensureRemindersScheduled() async {
     try {
       final prefs = await NotificationPrefs.load();
-      // Fire the "time to sleep" nudge at the Sleep Coach's recommended bedtime
-      // when we have one (from the crossday rollup), else the fixed default.
-      double? bedtimeMin;
-      try {
-        final cd = await LocalDb.baseline('crossday');
-        final m = cd?['payload_json'];
-        if (m is String) {
-          final j = jsonDecode(m);
-          final bt = j is Map ? ((j['sleep_coach'] as Map?)?['bedtime']) : null;
-          final v = bt is Map ? bt['value'] : null;
-          final b = v is Map ? (v['bedtime_min_of_day'] as num?) : null;
-          bedtimeMin = b?.toDouble();
-        }
-      } catch (_) {
-        /* fall back to default bedtime */
-      }
+      // ONE crossday read feeds every schedule that hangs off the rollup:
+      // the Sleep Coach bedtime (check-in, wind-down, nightly sweep) AND the
+      // weekly lookback's finding. Two separate baseline reads were how this
+      // used to be written; the second one is also where the weekly finding
+      // silently never got computed at all.
+      final cd = await _readCrossdaySummary();
+      final meds = await _medScheduleToday(prefs);
       await NotificationCenter.instance.scheduleStandingReminders(
         prefs,
-        bedtimeMinOfDay: bedtimeMin,
+        bedtimeMinOfDay: cd.bedtimeMin,
+        weeklyFinding: prefs.remindersEnabled
+            ? NotificationCenter.weeklyLookbackFinding(cd.recent)
+            : null,
+        checkInDoneToday: await _checkInDoneToday(),
+        medDefs: meds.defs,
+        medDosesToday: meds.doses,
+        armedTonight: _alarmArmedTonight,
       );
-      // AI nudges (morning/evening briefing prompts + pre-sleep journal).
+      // The strap-buzz half of the medication reminder, off the SAME schedule
+      // read the OS dose slots above were armed from — one read feeds both
+      // surfaces. Three answers, matching the scheduler's own rule: the
+      // switch OFF is an explicit choice and CLEARS the armed buzzes (a timer
+      // left standing would buzz for doses the user has muted); a real
+      // (possibly empty) schedule re-arms from it; only a FAILED read while
+      // enabled preserves, because cancelling would disarm doses that are
+      // still real.
+      if (!prefs.medsEnabled) {
+        _medBuzzer.configure(slotInstants: const []);
+      } else if (meds.defs != null) {
+        final instants = <DateTime>[];
+        for (final s in NotificationCenter.medPromptSlots(
+            prefs, meds.defs!, meds.doses)) {
+          final at = NotificationCenter.medSlotInstant(s);
+          if (at != null) instants.add(at);
+        }
+        _medBuzzer.configure(slotInstants: instants);
+      }
+      // AI slots. The nightly sweep is armed only when today actually produced
+      // a finding — see [_sweepHeadlineNow], which is also where the body of
+      // that notification comes from.
       final ai = await AiPrefs.load();
       await NotificationCenter.instance.scheduleAiReminders(
         prefs,
         ai,
         aiConfigured: coachConfig?.hasKey ?? false,
-        bedtimeMinOfDay: bedtimeMin,
+        bedtimeMinOfDay: cd.bedtimeMin,
         journalDoneToday: BriefingStore.journalDoneToday(),
+        sweepHeadline: await _sweepHeadlineNow(),
       );
     } catch (e) {
       _log('[notify] schedule reminders skipped: $e');
     }
+  }
+
+  /// Everything the reminder scheduler needs from the crossday rollup, in ONE
+  /// read: the Sleep Coach's recommended bedtime (local minutes past midnight,
+  /// or null when not yet learned) and the per-day `recent[]` rows the weekly
+  /// lookback's finding summarizes. Read in one place because three schedules
+  /// hang off it — check-in, wind-down, nightly sweep, weekly lookback — and
+  /// a second copy of this parse is a second thing to get wrong.
+  Future<({double? bedtimeMin, List<Map<String, dynamic>> recent})>
+      _readCrossdaySummary() async {
+    try {
+      final cd = await LocalDb.baseline('crossday');
+      final m = cd?['payload_json'];
+      if (m is! String) {
+        return (bedtimeMin: null, recent: const <Map<String, dynamic>>[]);
+      }
+      final j = jsonDecode(m);
+      if (j is! Map) {
+        return (bedtimeMin: null, recent: const <Map<String, dynamic>>[]);
+      }
+      final bt = (j['sleep_coach'] as Map?)?['bedtime'];
+      final v = bt is Map ? bt['value'] : null;
+      final bedtime =
+          (v is Map ? (v['bedtime_min_of_day'] as num?) : null)?.toDouble();
+      // Same rows `DerivationEngine._runNotifications` consumes for the daily
+      // exception — {date, rhr, unsettled, illness, anomaly, temp}.
+      final rawRecent = j['recent'];
+      final recent = <Map<String, dynamic>>[
+        if (rawRecent is List)
+          for (final r in rawRecent)
+            if (r is Map) r.cast<String, dynamic>(),
+      ];
+      return (bedtimeMin: bedtime, recent: recent);
+    } catch (_) {
+      // No rollup → no learned bedtime and an empty week: every consumer has
+      // its own honest silence for that.
+      return (bedtimeMin: null, recent: const <Map<String, dynamic>>[]);
+    }
+  }
+
+  /// Whether today's self-report is already written — the check-in prompt's
+  /// "do not ask for something already logged" gate.
+  ///
+  /// NOT `BriefingStore.journalDoneToday()`, which reads a flag that
+  /// `markJournalDone` would set and nothing anywhere calls: it is false for
+  /// every user on every day. The journal rows are the truth.
+  /// NULL, NOT FALSE, when the journal could not be read. The scheduler reads
+  /// `false` as "today is known to be unanswered" and arms the prompt on it —
+  /// so a transient read failure asked a user who had already written their
+  /// rating how their day was. Null is the answer it already has a branch for:
+  /// leave the check-in exactly as it is and let the next pass decide.
+  Future<bool?> _checkInDoneToday() async {
+    try {
+      return NotificationCenter.checkInDone(
+          await LocalDb.journalMetricsForDay(todayLabel()));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// The medication schedule + today's recorded doses. Two indexed reads, only
+  /// on the path that will use them.
+  ///
+  /// NULL `defs` means UNREAD — the switch is off, or the read threw — and is
+  /// not the same answer as an empty list, which means "this user has no
+  /// medications". The scheduler cancels the armed doses on the second and
+  /// preserves them on the first; returning `[]` for a failed read handed it
+  /// the wrong one of those.
+  Future<({List<MedDef>? defs, Map<String, Map<int, Map<String, Object?>>> doses})>
+      _medScheduleToday(NotificationPrefs prefs) async {
+    const empty = <String, Map<int, Map<String, Object?>>>{};
+    if (!prefs.medsEnabled) return (defs: null, doses: empty);
+    try {
+      final db = await LocalDb.instance;
+      return (
+        defs: await MedDb.defs(db),
+        doses: await MedDb.dosesForDay(db, todayLabel()),
+      );
+    } catch (_) {
+      return (defs: null, doses: empty);
+    }
+  }
+
+  String? _sweepHeadline;
+  String _sweepDay = '';
+  int _lastSweepScanMs = 0;
+
+  /// Today's strongest sweep finding, or null when nothing stands out — which
+  /// is most days, and is the answer that keeps tonight's notification silent.
+  ///
+  /// Pure-Dart and offline: no model is involved in DECIDING there is something
+  /// to say, only in phrasing it afterwards. Not run before midday (the day is
+  /// not in yet) and at most hourly, because this sits on the foreground
+  /// cadence path and it is seven trend queries.
+  Future<String?> _sweepHeadlineNow({DateTime? now}) async {
+    final r = repo;
+    final at = now ?? DateTime.now();
+    final day = todayLabel(at);
+    if (day != _sweepDay) {
+      _sweepDay = day;
+      _sweepHeadline = null;
+      _lastSweepScanMs = 0;
+    }
+    if (r == null || at.hour < 12) return null;
+    if (_lastSweepScanMs != 0 &&
+        at.millisecondsSinceEpoch - _lastSweepScanMs < 60 * 60 * 1000) {
+      return _sweepHeadline;
+    }
+    _lastSweepScanMs = at.millisecondsSinceEpoch;
+    try {
+      _sweepHeadline =
+          sweepHeadline(sweepFindings(await collectSweepSeries(r, at)));
+    } catch (e) {
+      _log('[ai] sweep scan skipped: $e');
+    }
+    return _sweepHeadline;
   }
 
   void _log(String line) {
@@ -1955,7 +2613,6 @@ class AppState extends ChangeNotifier {
   /// via the existing foreground cadence (runCadenceChecks) so it doesn't
   /// need its own timer infrastructure. Best-effort, never blocks boot.
   static const Duration _schemaHealthCheckInterval = Duration(hours: 24);
-  Map<String, dynamic>? schemaHealth;
   DateTime? _lastSchemaHealthCheckAt;
 
   Future<void> _checkSchemaHealth({bool force = false}) async {
@@ -1967,18 +2624,26 @@ class AppState extends ChangeNotifier {
     }
     _lastSchemaHealthCheckAt = DateTime.now();
     try {
+      // The result is LOGGED, not stored: the field that used to hold it had
+      // no reader, and a failing integrity check needs a human looking at the
+      // log, not a widget nobody built.
       final health = await LocalDb.schemaHealth();
-      schemaHealth = health;
       if (health['ok'] != true) {
         _log('[db] schemaHealth FAILED: $health');
       }
-      notifyListeners();
     } catch (e) {
       _log('[db] schemaHealth check skipped: $e');
     }
   }
 
-  void _bumpInsightsRevision() {
+  /// Say that the DURABLE data changed, so every screen reading it re-reads.
+  ///
+  /// Public because the writers are not all in here: the log-workout sheet
+  /// writes a session, and an import writes days, sessions and journal rows.
+  /// `notifyListeners` is NOT that signal — it also ticks at ~1 Hz with live
+  /// HR, so screens listen to this instead and re-read only when something
+  /// actually landed.
+  void bumpInsights() {
     insightsRevision.value = insightsRevision.value + 1;
   }
 
@@ -2005,7 +2670,7 @@ class AppState extends ChangeNotifier {
     // Capture keeps running; queued derive jobs drain on foreground return.
     _deriveScheduler.setBackground(true);
     // LIVE-FLOOD SUPPRESSION GUARD: with no foreground consumer of the live
-    // streams (no workout / spot check / step calibration), downgrade live to
+    // streams (no workout / breathing session), downgrade live to
     // HR-only so the high-rate raw flood can't starve the periodic R24 offloads
     // while backgrounded. Full live is restored on foreground reclaim.
     _maybeDowngradeLiveForBackground();
@@ -2032,18 +2697,67 @@ class AppState extends ChangeNotifier {
   }
 
   /// True while some foreground feature is actively consuming the live streams
-  /// (workout coach, HRV spot check, breathing session).
+  /// (workout coach, breathing session).
   bool get _hasLiveConsumer =>
-      activeWorkout != null || spotActive || breathingActive;
+      activeWorkout != null || breathingActive || breathingWindowOpen;
 
-  /// Downgrade live to HR-only when backgrounded with no live consumer. The
-  /// keep-alive re-arm respects the HR-only mode, so the downgrade sticks until
-  /// [openSession]'s fast reclaim (or a reconnect in the foreground) restores
-  /// the full set.
+  /// Step live down when backgrounded with no live consumer. Platform-split:
+  ///
+  ///   • Android: live goes fully OFF. The EdgeTracking foreground service
+  ///     keeps the process alive without any inbound stream, so the 1 Hz
+  ///     HR-only stream bought nothing here — it was ~86,400 CPU/radio wakes
+  ///     per day (each one decode → state mutation → notifyListeners) with no
+  ///     consumer, the single largest steady drain on the phone. Liveness is
+  ///     covered by the keep-alive's forced battery poll (see
+  ///     kNoStreamPollSilenceSeconds) — a swap, not a removal: ~86,400
+  ///     notifications/day become ~1,440 get-battery round-trips/day, still
+  ///     the largest net win here. The resume paths judge freshness by the
+  ///     no-stream bar (isLinkStale liveStreamArmed: false), whose 90 s bar
+  ///     already tolerates one dropped poll reply. Records keep landing via
+  ///     the 15-min flash backfill. NOTE: `state.wristOn` is written from
+  ///     LIVE/hello paths only — it freezes for the backgrounded stretch
+  ///     (derived wear still comes from historical HR; nothing branches on
+  ///     the frozen flag). wristOn/liveHr simply stop updating in realtime.
+  ///
+  ///   • iOS: HR-only downgrade, as before. The inbound 1 Hz notification is
+  ///     what keeps the suspended process schedulable (bluetooth-central
+  ///     resumes us per notification) — with zero inbound traffic the Dart
+  ///     timers (keep-alive, backfill) may never run, stalling continuous
+  ///     background capture. The stream is load-bearing there, not waste.
+  ///
+  /// [openSession]'s fast reclaim (or a foreground reconnect) restores the
+  /// full set either way.
+  /// The in-flight background live downgrade, if any. `disableLiveStreams`
+  /// (Android) clears `liveEnabled`/`liveHrOnly` only AFTER its ~300 ms write
+  /// sequence, so a foreground reclaim landing inside that window must AWAIT
+  /// this before deciding whether to re-arm — otherwise it reads stale
+  /// full-live flags, skips `enableLiveStreams`, and the pending disable's OFF
+  /// writes then leave foreground live off. See [openSession].
+  Future<void>? _bgLiveDowngrade;
+
   void _maybeDowngradeLiveForBackground() {
     if (!engine.isConnected || !engine.liveEnabled) return;
     if (_hasLiveConsumer) return;
-    unawaited(engine.enableHrOnlyLive());
+    _bgLiveDowngrade = Platform.isAndroid
+        ? engine.disableLiveStreams()
+        : engine.enableHrOnlyLive();
+    unawaited(_bgLiveDowngrade!);
+  }
+
+  /// Await every in-flight background live downgrade before (re-)arming live
+  /// streams, so ON writes cannot interleave with a disable's trailing OFF
+  /// writes. Drains CHAINED downgrades too: a newer one started while an
+  /// older was awaited is awaited as well, never dropped.
+  Future<void> _settleBgLiveDowngrade() async {
+    while (_bgLiveDowngrade != null) {
+      final pending = _bgLiveDowngrade!;
+      try {
+        await pending;
+      } catch (_) {/* a failed downgrade still cleared its flags or didn't;
+                       either way the reclaim re-reads live state fresh */}
+      // Only clear when no NEWER downgrade replaced it while we awaited.
+      if (identical(_bgLiveDowngrade, pending)) _bgLiveDowngrade = null;
+    }
   }
 
   /// iOS recovery: release the band to the native restore central's no-timeout pending
@@ -2068,9 +2782,9 @@ class AppState extends ChangeNotifier {
     await LocalDb.insertRecord(raw, sample);
   }
 
-  // Ephemeral live high-rate frame (0x28/0x2B/0x33) — NOT persisted. Spot-check
-  // taps the RR-bearing frames (0x28 compact HR, 0x2B R10) into the in-memory
-  // scan buffer. Cheap-bounded; cleared at each scan start.
+  // Ephemeral live high-rate frame (0x28/0x2B/0x33) — NOT persisted. The
+  // breathing session taps the RR-bearing frames (0x28 compact HR, 0x2B R10)
+  // into its in-memory buffer. Cheap-bounded; cleared at each session start.
   void _onLiveFrame(int pt, String hex, int? recTs) {
     // NOTE: deliberately do NOT advance _lastRecTs from live frames. Live frames
     // (0x28/0x2B/0x33) are ephemeral and NEVER persisted, and they carry the
@@ -2078,18 +2792,21 @@ class AppState extends ChangeNotifier {
     // label to "now" while the app was connected, hiding whether the overnight
     // HISTORICAL backlog had actually synced. "Last data" must reflect the newest
     // STORED record (the data edge), which only _onRecord advances.
-    if (spotActive && (pt == 0x28 || pt == 0x2B)) {
-      if (_spotFrames.length < 8000) _spotFrames.add(hex);
-    }
-    if (breathingActive && (pt == 0x28 || pt == 0x2B)) {
+    // `breathingWindowOpen` is the MIND-06 quiet window either side of the
+    // paced block — the same buffer, held open across the pacing's own start
+    // and stop so a "before" and an "after" exist at all.
+    // A 0x2B envelope also carries gen5 Maverick's rev-21 100 Hz IMU record
+    // (byte[1] != 10) — realtimeRr already yields no beats from it, but it
+    // should not occupy the breathing R-R buffer at all (edge#286).
+    final isRrBearing = pt == 0x28 || (pt == 0x2B && _isR10Record(hex));
+    if ((breathingActive || breathingWindowOpen) && isRrBearing) {
       if (_breathingFrames.length < 8000) _breathingFrames.add(hex);
     }
-    // LIVE STEP COUNTER. The dedicated 0x33 IMU stream is the high-rate live
-    // accel — it arrives ~10 frames/s (10 samples each), so it drives a smooth,
-    // responsive count. Full R10 (0x2B) is only a fallback when the IMU stream
-    // isn't flowing (and live 0x2B is often R10-LITE, which carries no accel).
-    // `frameAccel` returns |a|(g) samples for both; once 0x33 is seen we ignore
-    // 0x2B to avoid double-counting the same motion from two stream formats.
+    // LIVE STEP COUNTER. Gen4: dedicated 0x33 IMU (~10 frames/s × 10 samples)
+    // is preferred; full R10 (0x2B) is only a fallback when 0x33 isn't flowing.
+    // Gen5 Maverick: live IMU is 0x2B (rec 0x15, 100 Hz planar) — see
+    // protocol's frameAccelForBand. Once gen4 0x33 is seen we ignore 0x2B to avoid
+    // double-counting the same motion from two stream formats.
     if (pt == 0x33) {
       _imuStreamSeen = true;
       final f = _safeFrameAccel(hex);
@@ -2098,6 +2815,7 @@ class AppState extends ChangeNotifier {
         _trackCoverage(recTs);
       }
     } else if (pt == 0x2B && !_imuStreamSeen) {
+      // Gen5 Maverick live IMU is 0x2B (100 Hz planar), not top-level 0x33.
       final f = _safeFrameAccel(hex);
       if (f != null) {
         _ingestLiveMags(f);
@@ -2106,9 +2824,22 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// True iff a live inner packet's record-type byte ([1]) is 10 (R10, the
+  /// only R-R-bearing record a 0x2B envelope carries).
+  bool _isR10Record(String hex) {
+    if (hex.length < 4) return false;
+    try {
+      return int.parse(hex.substring(2, 4), radix: 16) == 10;
+    } catch (_) {
+      return false;
+    }
+  }
+
   proto.ImuFrame? _safeFrameAccel(String hex) {
     try {
-      return proto.frameAccel(hex);
+      // Gen5 Maverick live IMU is 0x2B; gen4 stays on frameAccel (0x33 / R10).
+      // protocol's gen5 path abstains unless the record is the IMU buffer.
+      return proto.frameAccelForBand(hex);
     } catch (_) {
       return null;
     }
@@ -2122,88 +2853,132 @@ class AppState extends ChangeNotifier {
   // still-filling partial minute is re-counted each frame for a live readout.
   // AN-2554's CONFIRM=8 regularity gate reads 0 at rest (rejects fidgeting).
   final List<double> _magMin = []; // current minute's magnitude signal
+  // Per-minute RAW step counts for the ACTIVE workout only, for
+  // [sessionCadenceSpm]. Bounded at 12 h of minutes; a session longer than that
+  // has enough gait-like minutes for the median already.
+  final List<int> _workoutMinuteSteps = [];
   int _committedRaw = 0; // raw (pre-gain) steps from completed minutes
-  int _liveSamples = 0; // total 100 Hz samples streamed this session
   bool _imuStreamSeen = false; // prefer the 0x33 IMU stream once it appears
   static const int _minuteSamples = 6000; // 60 s @ 100 Hz — calibration chunk
   int _lastWalkMs = 0; // last time steps were accumulated
   int _lastProneMs = 0; // last time the wrist was in a flat/typing posture
   int _lastLiveUiNotifyMs = 0;
-  // DEVICE-time window (epoch sec) the live pedometer covered this session — so
-  // the 1 Hz estimate can EXCLUDE these minutes (100 Hz real count wins).
-  //
-  // The band's record timestamp is the ANCHOR only: it keeps the window in the
+  // The band's record timestamp on the FIRST live frame of this session — the
+  // ANCHOR, and only the anchor. It keeps every span this session banks in the
   // same base as `decoded_onehz.rec_ts` (what `coverageWindowsOverlapping`
-  // compares against). It is NOT the duration — in practice every live frame of
-  // a session repeats the same `recTs`, so start==end and the window covered
-  // nothing. The duration comes from what we actually ingested (100 Hz sample
-  // count + the phone-clock hull of the ingest times), combined by
-  // [deriveLiveCoverageWindow]. See that function for the base reconciliation.
+  // compares against). It is never a duration: in practice every live frame of
+  // a session repeats the same `recTs`, so its own extent is 0. Duration comes
+  // from what we ingested — see [_bandTsAt].
+  //
+  // The session-END record timestamp used to be tracked alongside it, for the
+  // hull [deriveLiveCoverageWindow] built. Nothing reads a hull any more.
   int? _liveCoverStartTs;
-  int _liveCoverEndTs = 0;
   int? _liveFirstIngestMs; // phone clock at the first ingested live frame
   int? _liveLastIngestMs; // …and at the last one
   void _trackCoverage(int? recTs) {
     if (recTs == null || recTs <= 0) return;
     _liveCoverStartTs ??= recTs;
-    if (recTs > _liveCoverEndTs) _liveCoverEndTs = recTs;
   }
 
-  /// The window this session covered, or null when there is nothing defensible
-  /// to record. Pure decision lives in [deriveLiveCoverageWindow]; this only
-  /// feeds it the observations.
-  LiveCoverageWindow? _liveCoverageWindow(int steps) => deriveLiveCoverageWindow(
-        steps: steps,
-        samples100Hz: _liveSamples,
-        bandStartTs: _liveCoverStartTs,
-        bandEndTs: _liveCoverEndTs,
-        firstIngestMs: _liveFirstIngestMs,
-        lastIngestMs: _liveLastIngestMs,
-      );
+  /// The spans of THIS session in which the pedometer actually counted — what
+  /// gets banked, one `live_coverage` row each. See [GaitRuns]: a session hull
+  /// says "a live link was up", which is not a step measurement and is not
+  /// something a source ladder can rank.
+  final GaitRuns _gaitRuns = GaitRuns();
+
+  /// Map a phone-clock instant onto the BAND's record-time base, the base
+  /// `live_coverage` rows live in.
+  ///
+  /// Same rule [deriveLiveCoverageWindow] uses: the band's first record
+  /// timestamp is the ANCHOR (it places the session on the band's timeline),
+  /// the phone clock supplies the DURATION (the band repeats one record
+  /// timestamp for a whole live session, so it cannot). Null before anything
+  /// has been ingested — there is no session to place.
+  int? _bandTsAt(int nowMs) {
+    final first = _liveFirstIngestMs;
+    if (first == null) return null;
+    final band = _liveCoverStartTs;
+    final anchor = (band != null && band > 0) ? band : first ~/ 1000;
+    return anchor + (nowMs - first) ~/ 1000;
+  }
+
+  /// Record one completed pedometer chunk — [samples] of signal that finished
+  /// arriving at [endMs] (phone clock) and produced [rawSteps].
+  void _addGaitChunk(int endMs, int samples, int rawSteps) {
+    if (rawSteps <= 0 || samples <= 0) return;
+    final endTs = _bandTsAt(endMs);
+    final floorTs = _bandTsAt(_liveFirstIngestMs ?? endMs);
+    if (endTs == null || floorTs == null) return;
+    _gaitRuns.addChunk(
+      endTs: endTs,
+      // The chunk covers the time it SAMPLED, not the wall time it took to
+      // dribble in over a flaky link — see live_step_runs.dart.
+      seconds: (samples / kLiveSampleRateHz).round(),
+      rawSteps: rawSteps,
+      floorTs: floorTs,
+    );
+  }
 
   /// Steps counted on the live 100 Hz stream this connected session (real,
   /// gain-applied). Used for cadence calibration. 0 when not streaming.
-  int get _liveRaw =>
-      _committedRaw + (_magMin.isEmpty ? 0 : ana.pedometer(_magMin));
-
-  // A routine BLE disconnect zeroes the live counter for a fresh session
-  // (`_resetLivePedometer`) before the derived day_result has had a chance to
-  // fold the just-ended session's steps in — the Today tile would otherwise
-  // visibly drop then jump back once derivation catches up. Hold the ended
-  // session's total on display for a short grace window so the number never
-  // regresses; the derived total supersedes it well within that window.
-  int _sessionStepsCushion = 0;
-  int _sessionCushionSetAtMs = 0;
-  static const int _sessionCushionGraceMs = 20 * 1000;
-
-  /// The TRUE gain-applied step count for THIS connected session, with no
-  /// display cushion. Everything that PERSISTS or CALIBRATES must read this —
-  /// [liveSteps] is display-only and can deliberately report a just-ended
-  /// PRIOR session's larger total during its grace window, which would
-  /// double-count into `live_coverage` and poison the cadence model.
-  int get _rawSessionSteps => (_liveRaw * ana.StepParams.gain).round();
-
-  /// Rebases the connection-lifetime counter at local midnight — see
-  /// [LiveStepDayWindow] for why a permanently-connected band made the Today
-  /// tile carry yesterday's steps into today.
-  final LiveStepDayWindow _liveStepDay = LiveStepDayWindow();
-
-  int get liveSteps {
-    final today = todayLabel();
-    final dayChanged = _liveStepDay.day != null && _liveStepDay.day != today;
-    final raw = _liveStepDay.stepsToday(_rawSessionSteps, today);
-    // The cushion holds a PRE-midnight session total for a few seconds so the
-    // tile doesn't visibly dip on a reconnect. Carried across the boundary it
-    // would re-introduce exactly the number we just rebased away.
-    if (dayChanged) _sessionStepsCushion = 0;
-    if (_sessionStepsCushion <= 0) return raw;
-    if (DateTime.now().millisecondsSinceEpoch - _sessionCushionSetAtMs >=
-        _sessionCushionGraceMs) {
-      _sessionStepsCushion = 0;
-      return raw;
-    }
-    return math.max(raw, _sessionStepsCushion);
+  ///
+  /// The still-filling partial minute is dropped once the stream has been
+  /// MEASURED below [kMinLiveSampleRateHz] — a count off a stream that slow is
+  /// 60-90% short, so it is absent rather than wrong.
+  ///
+  /// ponytail: the rate used here is the last COMPLETED chunk's, so the first
+  /// minute of a too-slow session can still show a live readout before the
+  /// first measurement lands. It is never banked (the commit path measures its
+  /// own chunk, below). Measure the partial too only if a rate that low is ever
+  /// seen on real hardware.
+  int get _liveRaw {
+    if (_magMin.isEmpty) return _committedRaw;
+    final hz = _liveHz;
+    if (hz != null && hz < kMinLiveSampleRateHz) return _committedRaw;
+    return _committedRaw + ana.pedometer(_magMin);
   }
+
+  // ── the two safety gates on this tier — see live_step_runs.dart ────────────
+  /// Phone-clock instant the current chunk's first sample arrived AFTER, i.e.
+  /// the previous frame's arrival. The span from here to the frame that
+  /// completes the chunk is exactly the wall time those samples took.
+  int? _chunkStartMs;
+
+  /// Measured samples/second of the last completed chunk. Null until one
+  /// completes — nothing has been measured yet.
+  double? _liveHz;
+  bool _liveHzLogged = false;
+
+  /// Set when the last completed chunk was refused for running under the floor.
+  bool _liveTooSlow = false;
+
+  /// Why the strap contributed no steps right now, or null when it did.
+  ///
+  /// Never a number and never a zero: both gates make a window ABSENT, and this
+  /// is the sentence that says which one did it. A workout screen or a per-day
+  /// source view reads this instead of drawing a bare dash.
+  String? get liveStepsAbsentReason {
+    final t = activeWorkout?.type;
+    if (t != null && !isGaitStepType(t)) {
+      return 'Steps are only counted from the strap while you are on foot — '
+          'a wrist counts arm rhythm as strides. Your phone covers these '
+          'minutes.';
+    }
+    if (_liveTooSlow) {
+      final hz = _liveHz;
+      final rate = hz == null
+          ? ''
+          : ' (${hz.toStringAsFixed(0)} Hz, needs '
+              '${kMinLiveSampleRateHz.toStringAsFixed(0)})';
+      return 'The strap sent motion too slowly to count steps$rate.';
+    }
+    return null;
+  }
+
+  // The session-total getter that used to feed persistence is gone with the
+  // session-hull row it wrote. What persists is per-run now ([_bankGaitRuns]),
+  // and the gain is applied there; a second, session-level application was
+  // exactly the silent x1.23 this path should not be able to express.
 
   // Snapshot of the RAW session total at the moment a manual workout started, so
   // the live-session screen shows steps FOR THIS WORKOUT (not since connection).
@@ -2221,15 +2996,6 @@ class AppState extends ChangeNotifier {
   /// trap `_resetLivePedometer` already sidesteps for `_workoutRawBase` by
   /// rebasing it negative rather than dropping it.
   bool _workoutSawSamples = false;
-
-  /// Steps taken since the active workout started (real, live, gain-applied).
-  /// 0 when no workout is running.
-  ///
-  /// Prefer [workoutStepsMeasured] in anything user-facing: this coerces an
-  /// unmeasured workout to 0, which is only safe because the two remaining
-  /// callers treat 0 as "omit" (the finish card hides the stat, `stopWorkout`
-  /// leaves the column unset).
-  int get workoutSteps => workoutStepsMeasured ?? 0;
 
   /// Steps for the active workout, or NULL when nothing gait-capable was ever
   /// measured for it (issue #183).
@@ -2258,30 +3024,51 @@ class AppState extends ChangeNotifier {
   void _ingestLiveMagsAt(proto.ImuFrame f, int nowMs) {
     final mags = f.mags;
     if (mags.isEmpty) return;
-    // Survives `_resetLivePedometer()` — see [_workoutSawSamples].
-    if (activeWorkout != null) _workoutSawSamples = true;
-    // Append this frame's |a|(g) samples (gravity INCLUDED — AN-2554's dynamic
-    // threshold rides the ~1 g baseline). `e` is this frame's 1 Hz-equivalent
-    // ENMO (mean |a| − 1 g), read below by the stillness nudge and the posture
-    // check. It no longer feeds a cadence calibration — that was deleted along
-    // with the 1 Hz step estimator that was its only consumer (kAlgoVersion
-    // v55).
+    // `e` is this frame's 1 Hz-equivalent ENMO (mean |a| − 1 g), read below by
+    // the stillness nudge and the posture check. Computed for EVERY frame:
+    // those two are about wear and movement, not about steps, so neither gate
+    // below may switch them off. It no longer feeds a cadence calibration —
+    // that was deleted along with the 1 Hz step estimator that was its only
+    // consumer (kAlgoVersion v55).
     var magSum = 0.0;
     for (final m in mags) {
-      _magMin.add(m);
       magSum += m;
     }
-    _liveSamples += mags.length;
     final e = (magSum / mags.length) - 1.0;
+
+    // GATE 1 — gait activities only. See kGaitStepTypeKeys. No active session
+    // is countable (passive wear is the case the ladder was built for); a
+    // session that is not locomotion on foot is not.
+    final w = activeWorkout;
+    if (w == null || isGaitStepType(w.type)) {
+      // Survives `_resetLivePedometer()` — see [_workoutSawSamples].
+      if (w != null) _workoutSawSamples = true;
+      // The chunk's clock starts at the PREVIOUS frame's arrival (this one is
+      // when its samples landed), so the span measured at commit is exactly the
+      // wall time this chunk's samples took. `_liveLastIngestMs` is still the
+      // previous frame here — it is advanced below.
+      _chunkStartMs ??= _liveLastIngestMs ?? nowMs;
+      // Append this frame's |a|(g) samples (gravity INCLUDED — AN-2554's
+      // dynamic threshold rides the ~1 g baseline).
+      _magMin.addAll(mags);
+    } else if (_magMin.isNotEmpty) {
+      // Drop the partial minute rather than splice non-gait signal onto gait
+      // signal and count the seam. Up to 60 s of real walking is lost at the
+      // moment a non-gait session starts; absent beats a fabricated seam, and
+      // the pedometer re-seeds `dynVal` from each chunk's own mean anyway.
+      _magMin.clear();
+      _chunkStartMs = null;
+    }
     // Phone-clock extent of the ingested stream — the only observation that
     // reports how long this session actually ran (the band's record timestamp
-    // typically repeats). Used as a DURATION only; see [_liveCoverageWindow].
+    // typically repeats). Used as a DURATION only; see [_bandTsAt].
     _liveFirstIngestMs ??= nowMs;
     if (_liveLastIngestMs == null || nowMs > _liveLastIngestMs!) {
       _liveLastIngestMs = nowMs;
     }
-    // Stamp last real motion (for the inactivity nudge). 0.02 g over baseline is
-    // clearly dynamic movement, not resting jitter.
+    // Any real movement pushes the "Time to move" nudge back out. 0.02 g over
+    // baseline is clearly dynamic movement, not resting jitter. (The posture
+    // nudge is the sibling below, and keys off `_lastWalkMs` instead.)
     if (e > 0.02) {
       unawaited(_rescheduleStillnessNudge(nowMs));
     }
@@ -2303,21 +3090,48 @@ class AppState extends ChangeNotifier {
     while (_magMin.length >= _minuteSamples) {
       final minute = _magMin.sublist(0, _minuteSamples);
       _magMin.removeRange(0, _minuteSamples);
+      // GATE 2 — the MEASURED rate of the samples in this chunk, not
+      // kLiveSampleRateHz. See achievedSampleRateHz / kMinLiveSampleRateHz.
+      final hz = achievedSampleRateHz(_minuteSamples, _chunkStartMs, nowMs);
+      _chunkStartMs = nowMs;
+      if (hz != null) {
+        _liveHz = hz;
+        if (!_liveHzLogged) {
+          _liveHzLogged = true;
+          // The number STEPS_ALGO §5 says is documented nowhere. Once per
+          // connected session, so it finally gets recorded somewhere.
+          _log(
+            '[steps] live IMU measured ${hz.toStringAsFixed(1)} Hz '
+            '(floor ${kMinLiveSampleRateHz.toStringAsFixed(0)} Hz)',
+          );
+        }
+      }
+      _liveTooSlow = hz == null || hz < kMinLiveSampleRateHz;
+      if (_liveTooSlow) {
+        // ABSENT, never zero: nothing committed, nothing banked, no minute
+        // handed to sessionCadenceSpm. `liveStepsAbsentReason` says why.
+        continue;
+      }
       final before = _committedRaw;
-      _committedRaw += ana.pedometer(minute);
+      final minuteSteps = ana.pedometer(minute);
+      _committedRaw += minuteSteps;
       if (_committedRaw > before) _lastWalkMs = nowMs;
+      // A counting minute is a COVERED minute; a silent one is not, and does
+      // not extend the run in progress. This is what keeps a 20-minute walk
+      // inside a ten-hour connected session from claiming ten hours.
+      _addGaitChunk(nowMs, _minuteSamples, minuteSteps);
+      // A completed chunk is exactly 60 s, so its count is a steps-per-minute
+      // reading — session cadence is a summary of these, not a second decode.
+      // Workout-scoped: gen4's R10 is live-only, so there is no 24/7 cadence.
+      if (activeWorkout != null && _workoutMinuteSteps.length < 720) {
+        _workoutMinuteSteps.add(minuteSteps);
+      }
       committedThisTick = true;
     }
     // Checkpoint once a minute (only on an actual commit, not every frame) so
     // a killed process doesn't lose the whole session — only whatever hasn't
     // completed a minute yet. See _recoverOrphanedLiveSession.
     if (committedThisTick) unawaited(_checkpointLiveSession());
-    // Keep the day window current from the SAMPLE path. Reading it only when
-    // the Today tile is built would make the first read after midnight the
-    // window's first observation of any day — and a first observation counts
-    // in full, so a phone parked on another tab across midnight would carry
-    // the whole of yesterday's session into today.
-    if (committedThisTick) _liveStepDay.stepsToday(_rawSessionSteps, todayLabel());
     if (nowMs - _lastLiveUiNotifyMs >= 1000) {
       _lastLiveUiNotifyMs = nowMs;
       notifyListeners(); // live readout re-counts the partial minute on read
@@ -2328,7 +3142,7 @@ class AppState extends ChangeNotifier {
   ///
   /// This zeroes the connection-lifetime raw counter (`_liveRaw`). If a
   /// workout is active, `_workoutRawBase` was snapshotted from a *previous*
-  /// (now-stale) `_liveRaw` value — left untouched, `workoutSteps` would
+  /// (now-stale) `_liveRaw` value — left untouched, `workoutStepsMeasured` would
   /// compute a negative delta on the next BLE disconnect/reconnect blip,
   /// clamp to 0, and visibly reset the walk's step count instead of counting
   /// monotonically. Rebase it here so the already-accrued workout steps
@@ -2340,51 +3154,78 @@ class AppState extends ChangeNotifier {
     }
     _magMin.clear();
     _committedRaw = 0;
-    _liveSamples = 0;
     _lastLiveUiNotifyMs = 0;
     _imuStreamSeen = false;
+    // The measured rate is a property of THIS link — a reconnect must re-measure
+    // rather than carry a verdict (or a "too slow" note) across the gap.
+    _chunkStartMs = null;
+    _liveHz = null;
+    _liveHzLogged = false;
+    _liveTooSlow = false;
     _liveCoverStartTs = null;
-    _liveCoverEndTs = 0;
     _liveFirstIngestMs = null;
     _liveLastIngestMs = null;
+    _gaitRuns.clear();
   }
 
-  /// End-of-session: bank the REAL 100 Hz step window into `live_coverage`.
+  /// End-of-session: bank the REAL 100 Hz step spans into `live_coverage`.
+  ///
+  /// ONE ROW PER GAIT RUN, not one per session. The single row this replaces
+  /// spanned the whole connected hull, so it claimed the still hours between
+  /// two walks as measured coverage — see live_step_runs.dart for the
+  /// measurement off the owner's own export that killed it.
   ///
   /// No cadence calibration any more — its only consumer was the deleted 1 Hz
   /// `dailyStepEstimate` (see kAlgoVersion v55).
   Future<void> _finalizeLivePedometer() async {
-    // RAW, never the cushioned display value: a second short session ending
-    // inside the first one's grace window would otherwise persist the FIRST
-    // session's total again (double-counted coverage + a nonsense cadence).
-    final steps = _rawSessionSteps; // gain-applied
-    // Derive the coverage window BEFORE resetting (it reads session counters).
-    final window = _liveCoverageWindow(steps);
-    if (steps > 0) {
-      // Never LOWER a still-active cushion — a small follow-up session ending
-      // inside the grace window must not reintroduce the visible regression
-      // the cushion exists to prevent.
-      final active = liveSteps; // expires the cushion if it is already stale
-      _sessionStepsCushion = math.max(
-        steps,
-        math.max(active, _sessionStepsCushion),
-      );
-      _sessionCushionSetAtMs = DateTime.now().millisecondsSinceEpoch;
+    // The still-filling partial minute is real signal that was about to be
+    // discarded: count it over the time it actually sampled — but only if that
+    // time says it arrived fast enough to count (GATE 2). The tail has its own
+    // measurable span, so it is measured on its own rather than inheriting the
+    // last chunk's rate.
+    final tailHz = achievedSampleRateHz(
+      _magMin.length,
+      _chunkStartMs,
+      _liveLastIngestMs,
+    );
+    if (_magMin.isNotEmpty &&
+        _liveLastIngestMs != null &&
+        tailHz != null &&
+        tailHz >= kMinLiveSampleRateHz) {
+      _addGaitChunk(_liveLastIngestMs!, _magMin.length, ana.pedometer(_magMin));
     }
+    final runs = _gaitRuns.runs;
     _resetLivePedometer();
-    // Record the REAL 100 Hz step window (device time). This is BAND-sourced
-    // coverage; the derivation reads it via `liveStepsForDay`, which prefers a
-    // phone count for the day when one exists and never sums the two.
-    if (window != null) {
-      final day = dayLabelOf(
-        DateTime.fromMillisecondsSinceEpoch(window.startTs * 1000),
-      );
-      await LocalDb.addLiveCoverage(window.startTs, window.endTs, steps, day);
-    }
+    await _bankGaitRuns(runs);
     // The session ended cleanly and is now durably recorded — the checkpoint
     // that would otherwise let a killed-process session recover is no longer
     // needed.
     await _clearLiveSessionCheckpoint();
+  }
+
+  /// Persist [runs] as `live_coverage` rows under the STRAP source.
+  ///
+  /// `ana.StepParams.gain` is applied HERE and nowhere else on the persistence
+  /// path — the runs carry the raw count exactly as `pedometer()` returns it,
+  /// and this is the daily-sum layer `calcSteps` documents as the gain's home.
+  /// Applying it at both ends shipped a silent x1.23.
+  Future<void> _bankGaitRuns(List<LiveStepRun> runs) async {
+    for (final run in runs) {
+      final steps = (run.rawSteps * ana.StepParams.gain).round();
+      if (steps <= 0) continue;
+      // Per RUN, so a walk either side of midnight lands on the right days
+      // instead of both going to whichever day the session started on.
+      final day = dayLabelOf(
+        DateTime.fromMillisecondsSinceEpoch(run.startTs * 1000),
+      );
+      await LocalDb.addLiveCoverage(
+        run.startTs,
+        run.endTs,
+        steps,
+        day,
+        source: kStepSourceStrap,
+      );
+    }
   }
 
   // Whatever accrued via _committedRaw/_magMin between minute-commits is
@@ -2397,18 +3238,20 @@ class AppState extends ChangeNotifier {
   static const String _kLiveSessionCheckpoint = 'live_session_checkpoint';
 
   Future<void> _checkpointLiveSession() async {
-    if (_committedRaw <= 0 || _liveCoverStartTs == null) return;
+    if (_gaitRuns.isEmpty) return;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(
         _kLiveSessionCheckpoint,
+        // Runs are stored gain-applied, i.e. exactly the numbers
+        // [_bankGaitRuns] would have written — recovery banks them verbatim, so
+        // this path has one gain application too. Rewritten whole each minute
+        // (the open run keeps growing), never appended to.
         jsonEncode({
-          'steps': (_committedRaw * ana.StepParams.gain).round(),
-          'samples': _liveSamples,
-          'cover_start_ts': _liveCoverStartTs,
-          'cover_end_ts': _liveCoverEndTs,
-          'first_ingest_ms': _liveFirstIngestMs,
-          'last_ingest_ms': _liveLastIngestMs,
+          'runs': [
+            for (final r in _gaitRuns.runs)
+              [r.startTs, r.endTs, (r.rawSteps * ana.StepParams.gain).round()],
+          ],
         }),
       );
     } catch (e) {
@@ -2457,35 +3300,64 @@ class AppState extends ChangeNotifier {
       Future<void> drop() => prefs.remove(_kLiveSessionCheckpoint);
       final m = jsonDecode(raw);
       if (m is! Map) return await drop();
-      final steps = (m['steps'] as num?)?.toInt() ?? 0;
-      final startTs = (m['cover_start_ts'] as num?)?.toInt();
-      final endTs = (m['cover_end_ts'] as num?)?.toInt();
-      if (steps <= 0 || startTs == null || endTs == null || endTs <= startTs) {
-        return await drop();
+      // `runs` is the current shape. A checkpoint written by the PREVIOUS build
+      // carries a single session-hull window instead; it is recovered as one
+      // run, through the derivation that wrote it, so an in-flight walk is not
+      // lost to the upgrade.
+      final spans = <List<int>>[];
+      final storedRuns = m['runs'];
+      if (storedRuns is List) {
+        for (final r in storedRuns) {
+          if (r is! List || r.length < 3) continue;
+          final s = (r[0] as num).toInt();
+          final e = (r[1] as num).toInt();
+          final n = (r[2] as num).toInt();
+          if (n > 0 && e > s) spans.add([s, e, n]);
+        }
+      } else {
+        final steps = (m['steps'] as num?)?.toInt() ?? 0;
+        final startTs = (m['cover_start_ts'] as num?)?.toInt();
+        final endTs = (m['cover_end_ts'] as num?)?.toInt();
+        if (steps > 0 && startTs != null && endTs != null && endTs > startTs) {
+          final window = deriveLiveCoverageWindow(
+            steps: steps,
+            samples100Hz: (m['samples'] as num?)?.toInt() ?? 0,
+            bandStartTs: startTs,
+            bandEndTs: endTs,
+            firstIngestMs: (m['first_ingest_ms'] as num?)?.toInt(),
+            lastIngestMs: (m['last_ingest_ms'] as num?)?.toInt(),
+          );
+          if (window != null) spans.add([window.startTs, window.endTs, steps]);
+        }
       }
-      final window = deriveLiveCoverageWindow(
-        steps: steps,
-        samples100Hz: (m['samples'] as num?)?.toInt() ?? 0,
-        bandStartTs: startTs,
-        bandEndTs: endTs,
-        firstIngestMs: (m['first_ingest_ms'] as num?)?.toInt(),
-        lastIngestMs: (m['last_ingest_ms'] as num?)?.toInt(),
-      );
-      if (window == null) return await drop();
-      // The clean-shutdown path writes coverage BEFORE clearing the checkpoint,
-      // so a kill in that gap leaves a checkpoint whose bout is already banked —
-      // and `live_coverage` has no uniqueness on the window, so replaying it
-      // would silently inflate the day. Skip anything already recorded.
-      if (await LocalDb.hasLiveCoverageWindow(window.startTs, window.endTs)) {
-        _log('[steps] orphan checkpoint already banked — not re-adding');
-        return await drop();
+      if (spans.isEmpty) return await drop();
+      var recovered = 0;
+      for (final s in spans) {
+        // The clean-shutdown path writes coverage BEFORE clearing the
+        // checkpoint, so a kill in that gap leaves a checkpoint whose runs are
+        // already banked — and `live_coverage` has no uniqueness on the window,
+        // so replaying it would silently inflate the day. Skip what is already
+        // recorded.
+        if (await LocalDb.hasLiveCoverageWindow(s[0], s[1])) continue;
+        final day = dayLabelOf(
+          DateTime.fromMillisecondsSinceEpoch(s[0] * 1000),
+        );
+        await LocalDb.addLiveCoverage(
+          s[0],
+          s[1],
+          s[2],
+          day,
+          source: kStepSourceStrap,
+        );
+        recovered += s[2];
       }
-      final day = dayLabelOf(
-        DateTime.fromMillisecondsSinceEpoch(window.startTs * 1000),
-      );
-      await LocalDb.addLiveCoverage(window.startTs, window.endTs, steps, day);
       await drop();
-      _log('[steps] recovered $steps orphaned step(s) from a killed session');
+      if (recovered == 0) {
+        _log('[steps] orphan checkpoint already banked — not re-adding');
+      } else {
+        _log('[steps] recovered $recovered orphaned step(s) '
+            'from a killed session');
+      }
     } catch (e) {
       _log('[steps] orphan recovery skipped: $e');
     }
@@ -2513,6 +3385,15 @@ class AppState extends ChangeNotifier {
       if (last != null && now.difference(last) < const Duration(minutes: 15)) {
         return;
       }
+      // Clock-only pre-gate: this runs off _onEngineState, which fires ~1 Hz
+      // during live HR — and the 15-min stamp above is (deliberately) written
+      // only once the evening-window check passes, so outside the window every
+      // tick fell through to the prefs load below. One check per wall-clock
+      // minute is plenty; the first tick of a minute still runs the full path,
+      // so the first evening forecast is delayed by <1 min at most.
+      final gateMin = now.hour * 60 + now.minute;
+      if (gateMin == _lastForecastGateMin) return;
+      _lastForecastGateMin = gateMin;
 
       final prefs = await NotificationPrefs.load();
       final nowMin = now.hour * 60 + now.minute;
@@ -2552,6 +3433,11 @@ class AppState extends ChangeNotifier {
           date: day,
           route: '/profile',
         ),
+        // This runs off the BLE state pipeline, which is headless on both
+        // platforms — the same reason DeviceAlerts' sink passes false. An OS
+        // authorization prompt with no foreground scene to show it in is a
+        // prompt the user never sees and cannot answer.
+        allowPermissionPrompt: false,
       );
     } catch (e) {
       // A forecast is a nicety; it must never take down the state update that
@@ -2560,7 +3446,209 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  void _onEngineState(DeviceState s) {
+  /// The last readings the live stream delivered, newest last.
+  ///
+  /// Lives here rather than in the widget that draws it: `lib/ui2` is
+  /// presentation, and a `Timer.periodic` inside a card is both a design-system
+  /// violation (see the ungated-Duration rule) and a trace that resets every
+  /// time the screen is opened. The engine already pushes state at about 1 Hz
+  /// while streaming, so appending here is the natural sampling point.
+  static const int liveHrTraceMax = 90;
+
+  /// A RECORD PER SAMPLE, not a bare bpm. Two devices streaming at once is two
+  /// signals, and a flat `List<int>` drew them as one line with one headline
+  /// (final-plan §5.2). The `deviceId` is what lets the card show exactly ONE
+  /// device's trace — never a merge, never an average, never two traces on one
+  /// card.
+  ///
+  /// STILL NEVER PERSISTED (invariant 1). RAM, capped at [liveHrTraceMax] PER
+  /// DEVICE.
+  final List<({int at, int hr, String deviceId})> _liveHrTrace = [];
+
+  /// Last delivered stamp PER DEVICE — what the old scalar was always trying
+  /// to be. Two devices reporting in the same second are two samples; one
+  /// device reporting the same stamp twice is one.
+  final Map<String, int> _liveHrTraceAt = {};
+
+  /// One device's recent readings, newest last, bpm only — the shape
+  /// `LiveHrCard` already draws. Null [deviceId] means [liveHrDeviceId], the
+  /// device the priority order says wins.
+  List<int> liveHrTrace([String? deviceId]) {
+    final id = deviceId ?? liveHrDeviceId;
+    if (id == null) return const [];
+    return [for (final e in _liveHrTrace) if (e.deviceId == id) e.hr];
+  }
+
+  /// Bumped on every appended sample. A `select` on the trace's LENGTH stops
+  /// firing the moment the buffer is full — length is pinned at
+  /// [liveHrTraceMax] from then on — so a card watching length would draw the
+  /// first 90 readings and then freeze while the numbers kept arriving. This is
+  /// the thing that actually changes.
+  int liveHrTraceRev = 0;
+
+  /// The devices' priority order for `hr1Hz`, highest first. Loaded once and
+  /// refreshed with the device rows — a `signal_priority` row changes only when
+  /// the user changes it, which is the same reason `_sensors` does not poll.
+  List<String> _hrPriority = const [];
+
+  bool _isStreaming(String id) {
+    final at = _liveHrTraceAt[id];
+    return at != null &&
+        DateTime.now().millisecondsSinceEpoch - at <= liveHrMaxAge.inMilliseconds;
+  }
+
+  /// THE DEVICE WHOSE LIVE TRACE IS SHOWN, or null when nothing is streaming.
+  ///
+  /// The resolver's rule — exclusive ownership — applied to the live axis. Not
+  /// merged, not averaged, not interleaved. Resolved from [_hrPriority] against
+  /// the in-memory dedupe map, so it costs no query and works while the app is
+  /// mid-stream with no derived day in sight.
+  String? get liveHrDeviceId {
+    final override = _liveHrDeviceOverride;
+    if (override != null && _isStreaming(override)) return override;
+    for (final id in _hrPriority) {
+      if (_isStreaming(id)) return id;
+    }
+    // No priority row for any streaming device: fall through to the physics
+    // ladder, which is precedence rule 3 (final-plan §4.5). `rankSources`
+    // already answers it and needs no table.
+    for (final s in rankSources(liveSources(this))) {
+      final id = s.isBand ? LocalDb.kPrimaryDeviceId : s.deviceId;
+      if (id != null && _isStreaming(id)) return id;
+    }
+    return null;
+  }
+
+  /// TWO OR MORE DEVICES HAVE DELIVERED A LIVE READING INSIDE [liveHrMaxAge]
+  /// — i.e. are streaming, not merely paired.
+  ///
+  /// Read off the in-memory dedupe map, which is the only place that knows.
+  /// No query, and nothing persisted (invariant 1).
+  bool get liveHrMultiDevice {
+    if (_liveHrTraceAt.length < 2) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    var live = 0;
+    for (final at in _liveHrTraceAt.values) {
+      if (now - at <= liveHrMaxAge.inMilliseconds && ++live >= 2) return true;
+    }
+    return false;
+  }
+
+  /// The user's tap on the card's pill. Session-only and deliberately NOT
+  /// persisted: it is "show me the other one for a moment", not a preference.
+  /// A preference is `signal_priority`, and the way to set one is the metric
+  /// screen's "Prefer this device" or the priority editor.
+  String? _liveHrDeviceOverride;
+  void showLiveHrFrom(String? deviceId) {
+    _liveHrDeviceOverride = deviceId;
+    liveHrTraceRev++; // the card watches this, not the map
+    notifyListeners();
+  }
+
+  /// ONE SAMPLE PER DELIVERED READING PER DEVICE. Keyed on (device, stamp):
+  /// keyed on the stamp alone, a second band reporting in the same second was
+  /// dropped and which one survived depended on notification arrival order.
+  ///
+  /// The ONE way a reading enters the trace, whichever radio delivered it —
+  /// the band's engine state or a `HrsLink` sensor's notifier. A second
+  /// append path is a second dedupe rule, and the pair of them is what makes
+  /// `liveHrMultiDevice` disagree with the chart. Returns true when it took
+  /// the sample, i.e. when a listener has something new to draw.
+  bool _appendLiveHr(String deviceId, int? hr, int? at) {
+    if (hr == null || hr <= 0 || at == null || at == _liveHrTraceAt[deviceId]) {
+      return false;
+    }
+    _liveHrTraceAt[deviceId] = at;
+    _liveHrTrace.add((at: at, hr: hr, deviceId: deviceId));
+    // The cap is PER DEVICE, so a second band cannot evict the first band's
+    // trace by streaming faster.
+    // ponytail: reverse scan is O(n) at n <= 90 * devices, once per
+    // delivered reading (~1 Hz). A per-device ring buffer is the upgrade if
+    // a device count ever makes that matter, which two bands does not.
+    var n = 0;
+    for (var i = _liveHrTrace.length - 1; i >= 0; i--) {
+      if (_liveHrTrace[i].deviceId != deviceId) continue;
+      if (++n > liveHrTraceMax) {
+        _liveHrTrace.removeAt(i);
+        break;
+      }
+    }
+    liveHrTraceRev++;
+    return true;
+  }
+
+  /// Forget one device's live trace. A dropped link ends a session; the next
+  /// one is not a continuation of it, and splicing the two draws a line across
+  /// a gap that never happened.
+  bool _clearLiveHrTrace(String deviceId) {
+    if (!_liveHrTraceAt.containsKey(deviceId)) return false;
+    _liveHrTrace.removeWhere((e) => e.deviceId == deviceId);
+    _liveHrTraceAt.remove(deviceId);
+    liveHrTraceRev++;
+    return true;
+  }
+
+  /// The HRS sensor whose samples are in the trace right now. Remembered
+  /// because [HrsLink.disarm] drops its host BEFORE it clears the reading, so
+  /// the disarm tick cannot name the device it is ending.
+  String? _hrsTraceId;
+
+  /// A paired heart-rate sensor's reading, into the SAME trace the band's
+  /// engine state feeds.
+  ///
+  /// Without this the multi-device live axis is structurally dead in
+  /// production: `_onEngineState` only ever runs for the primary band, so
+  /// `_liveHrTraceAt` never held a second key, `liveHrMultiDevice` was always
+  /// false and `liveHrDeviceId` could never name the strap that was actually
+  /// measuring. NOT a second persistence path — nothing here writes; the
+  /// sensor's own rows are banked by `BandHost` (invariant 1 unchanged).
+  ///
+  /// Oura is deliberately absent: `OuraAdapter.signals` is empty and the ring
+  /// delivers no live reading at all, so it has nothing to select between.
+  void _onHrsReading() {
+    if (_disposed) return;
+    final r = HrsLink.instance.reading.value;
+    final id = HrsLink.instance.deviceId ?? _hrsTraceId;
+    if (id == null) return;
+    if (r == null) {
+      // Disarmed. Same rule as the band's disconnect below.
+      _hrsTraceId = null;
+      if (_clearLiveHrTrace(id)) notifyListeners();
+      return;
+    }
+    // `HrsReading()` with no bpm is the armed-but-searching state, not a
+    // measurement — it is never billed as one.
+    _hrsTraceId = id;
+    final atSec = r.atSec ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    if (_appendLiveHr(id, r.bpm, atSec * 1000)) notifyListeners();
+  }
+
+  void _onEngineState(String deviceId, DeviceState s) {
+    _appendLiveHr(deviceId, s.liveHr, s.liveHrAt);
+    // Bank the name the moment the band says it, so it survives the
+    // disconnect. Written through `cleanDeviceLabel` for the same reason the
+    // BLE side reads through it: a garbled response must never become the
+    // remembered name. Change-gated on the RAW value first (same pattern as
+    // _widgetBattName below): this handler fires ~1 Hz during live HR, and
+    // cleanDeviceLabel's regex work per tick is pure waste when the name
+    // hasn't moved.
+    // WHICH band this is, the moment the link says so — service discovery is
+    // the only place it is ever known, and `_persistPaired` runs before any
+    // session exists. Without this `device.adapter_id` (schema 49) is
+    // structurally blank for everyone who paired once, and every per-family
+    // metric abstains for a reason that is our bookkeeping, not the band's.
+    // Change-gated: this handler fires ~1 Hz during live HR.
+    if (s.generation != null && s.generation != _lastSeenGeneration) {
+      _lastSeenGeneration = s.generation;
+      unawaited(LocalDb.upsertDevice(adapterId: s.generation));
+    }
+    if (s.strapName != _lastSeenStrapNameRaw) {
+      _lastSeenStrapNameRaw = s.strapName;
+      final nm = cleanDeviceLabel(s.strapName);
+      if (nm != null && nm != Prefs.getString(_kStrapName, '')) {
+        Prefs.setString(_kStrapName, nm);
+      }
+    }
     // Battery-low / charging OS notifications (edge-triggered + de-duped inside).
     _deviceAlerts.onDeviceState(
       batteryPct: s.batteryPct,
@@ -2578,6 +3666,9 @@ class AppState extends ChangeNotifier {
       unawaited(
         LocalDb.insertBandBatterySample(
           ts: nowSec,
+          // `_onEngineState` drives the PRIMARY band's engine, so this is the
+          // real originating device, not a placeholder.
+          deviceId: LocalDb.kPrimaryDeviceId,
           batteryPct: roundedPct?.toDouble(),
           charging: s.charging,
           wristOn: s.wristOn,
@@ -2595,7 +3686,21 @@ class AppState extends ChangeNotifier {
     final healed = healedPairing(paired, s.serial);
     if (healed != null) {
       paired = healed;
-      unawaited(PairedDevice.save(healed.remoteId, healed.serial));
+      unawaited(PairedDevice.save(healed.remoteId, healed.serial,
+          generation: s.generation));
+    }
+    // Pin the discovered generation onto the pairing record (HEAL ONLY — same
+    // rule as the serial above: never CREATE a pairing here). A known-device
+    // reconnect skips scanning, and the official gen5 connect order differs
+    // before discovery, so the next connect needs this persisted hint.
+    final p = paired;
+    if (p != null &&
+        (s.generation == 'gen4' || s.generation == 'gen5') &&
+        s.generation != p.generation) {
+      paired =
+          PairedDevice(p.remoteId, p.serial, generation: s.generation);
+      unawaited(
+          PairedDevice.save(p.remoteId, p.serial, generation: s.generation));
     }
     // Keep the lock-screen Band Battery widget current — only when it changed.
     final battPct = roundedPct ?? -1;
@@ -2614,9 +3719,15 @@ class AppState extends ChangeNotifier {
       );
     }
     if (_prevConn != 'disconnected' && s.connection == 'disconnected') {
-      // Live stream ended → fold this bout into the personal cadence calibration
-      // (best-effort; only credible walking updates it) and reset the counter.
+      // Live stream ended → bank this bout's step window into `live_coverage`
+      // and reset the counter. (No cadence calibration is involved: it was
+      // removed with the 1 Hz step estimator at v55/v56.)
       unawaited(_finalizeLivePedometer());
+      // A new connection is a new live-HR session: without this the trace
+      // buffer spliced readings from before the drop (or from a previously
+      // paired band) onto the next session's chart as one continuous line.
+      // THIS device only — a second device's trace is a separate session.
+      _clearLiveHrTrace(deviceId);
       if (_keepAlive && isPaired && !_reconnecting && !device.autoReconnectPaused) {
         _log('Connection dropped — reconnecting…');
         _stopBackfillTimer();
@@ -2654,6 +3765,11 @@ class AppState extends ChangeNotifier {
   /// Cadence of the reconnect supervisor. Cheap — the tick reads local flags
   /// and does nothing at all unless the app is paired, wants a link, and does
   /// not have one.
+  ///
+  /// Deliberately 1 min, not lengthened for battery: this supervisor is what
+  /// restarts a dead link (#208), and stretching it trades a few free boolean
+  /// reads inside an already-doze-exempt, link-holding process for up to 5
+  /// minutes of lost sync after exactly the failure it exists to catch.
   static const Duration _reconnectSupervisorInterval = Duration(minutes: 1);
 
   /// Start the level-triggered reconnect supervision (issue #208).
@@ -2673,7 +3789,7 @@ class AppState extends ChangeNotifier {
 
   /// Stop supervising. Called from `dispose` and from every path that stops
   /// wanting a link at all (unpair / endSession) — otherwise the tick outlives
-  /// its purpose and keeps poking the engine once a minute forever.
+  /// its purpose and keeps poking the engine every few minutes forever.
   void _stopReconnectSupervisor() {
     _reconnectSupervisor?.cancel();
     _reconnectSupervisor = null;
@@ -2753,10 +3869,22 @@ class AppState extends ChangeNotifier {
       // 90-minute pre-wake window opens. Skipping it outright meant a band
       // that connected at 22:00 and stayed connected never armed high-frequency
       // sync for that night at all.
-      try {
-        await _refreshHighFreqWakeWindow();
-      } catch (e) {
-        _log('Wake-window refresh failed: $e');
+      //
+      // Throttled to every 25 min while backgrounded (every third 10-min
+      // tick): the plan's input (habitual wake median off 14 derived days)
+      // changes at most once a day, and the window it arms is 90 min wide —
+      // a ~30-min check still opens it with ≥60 min of lead. Re-running the
+      // 14-day DB read + JSON decode every 10 min all night bought nothing.
+      final lastRefresh = _lastWakeWindowRefreshAt;
+      if (lastRefresh == null ||
+          DateTime.now().difference(lastRefresh) >=
+              const Duration(minutes: 25)) {
+        _lastWakeWindowRefreshAt = DateTime.now();
+        try {
+          await _refreshHighFreqWakeWindow();
+        } catch (e) {
+          _log('Wake-window refresh failed: $e');
+        }
       }
       _log('Periodic history refresh skipped — backgrounded; the engine\'s '
           'floored 15-min backfill owns the offload.');
@@ -2775,7 +3903,6 @@ class AppState extends ChangeNotifier {
         '(${report.complete ? "complete" : "stopped early"}).',
       );
       if (report.records > 0) {
-        dbCounts = await LocalDb.counts();
         _deriveScheduler.markStoredData();
       }
     } catch (e) {
@@ -2813,6 +3940,18 @@ class AppState extends ChangeNotifier {
   }) async {
     var last = SyncReport(0, 0, false);
     for (var i = 0; i < maxSessions && engine.isConnected; i++) {
+      // Terminal `Stuck`: a burst failed validation
+      // 15 times and the abort went out, so this connection's history is over.
+      // The engine refuses every further drain trigger, but stopping here too
+      // keeps the loop from spending its remaining sessions waiting out an idle
+      // timeout apiece against a link that will never answer.
+      if (engine.historyStuckThisSession) {
+        _log(
+          'Backfill stop — history is terminal (Stuck) for this connection; '
+          'the band keeps its checkpoint until the next one.',
+        );
+        break;
+      }
       // rec_ts_hw, not lastDecodedRecTs() — see the boot-time seed above for
       // why: an R10-lite-heavy backlog can genuinely advance without ever
       // touching decoded_onehz, and this "did we make progress" check must
@@ -2929,7 +4068,18 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _persistPaired(String remoteId, String? serial) async {
-    await PairedDevice.save(remoteId, serial ?? device.serial);
+    // Which band this is, if the link has already said. Passed HERE and not at
+    // the two call sites (`pairWith`, `pairViaAccessorySetup`) so neither can
+    // forget it — and COALESCE'd inside `upsertDevice`, so a null leaves
+    // whatever the row already knows.
+    //
+    // It is null on a FIRST pair, always: `DeviceState.generation` is only set
+    // at service discovery and pairing runs before any session exists. That is
+    // why `_onEngineState` stamps it too — this line alone would leave
+    // `device.adapter_id` blank on every install that pairs once and never
+    // re-pairs.
+    await PairedDevice.save(remoteId, serial ?? device.serial,
+        generation: device.generation);
     paired = await PairedDevice.load();
     // Now that there's a band to alert about, ask for notification permission
     // (a natural moment; battery/charging alerts depend on it). Best-effort.
@@ -2978,20 +4128,236 @@ class AppState extends ChangeNotifier {
     await engine.disconnect();
     _releaseForegroundLease();
     await PairedDevice.clear();
+    // Everything the old band told us about itself. The engine's DeviceState
+    // lives as long as the process and the persisted strap name outlives even
+    // that, so without both of these a re-pair — with a DIFFERENT band —
+    // inherits the forgotten one's name, serial, generation and bond verdicts.
+    device.reset();
+    Prefs.setString(_kStrapName, '');
+    // AND THE CHANGE GATES THAT GUARD WHAT THOSE TWO LINES JUST CLEARED. Both
+    // are per-tick caches in [_onEngineState], and both compare against the
+    // OLD band: pair a second band that reports the same generation and the
+    // `device.adapter_id` write is skipped, leaving the new pairing's adapter
+    // structurally blank (schema 49) and every per-family metric abstaining for
+    // a reason that is our bookkeeping. Same for a same-named band and the
+    // strap-name pref this method just emptied.
+    _lastSeenGeneration = null;
+    _lastSeenStrapNameRaw = null;
     paired = null;
     notifyListeners();
   }
 
   // ── alarm + strap name (require a live connection) ──────────────────────────
   bool get isConnected => device.connection == 'connected';
+
+  /// How old a live HR reading may be and still be a reading of NOW.
+  ///
+  /// CALIBRATION KNOB. The foreground stream delivers roughly 1 Hz, so this is
+  /// about ten missed frames: long enough to ride out a radio hiccup, short
+  /// enough that a band which stopped reporting is not still being billed as a
+  /// live measurement. Widen it if real straps turn out to gap more than this
+  /// under load.
+  static const Duration liveHrMaxAge = Duration(seconds: 10);
+
+  /// The band's heart rate RIGHT NOW, or null when there isn't one.
+  ///
+  /// `DeviceState.liveHr` on its own is only "the last value the engine saw":
+  /// nothing clears it on an unintentional drop (the teardown path never calls
+  /// `disableLiveStreams`), so it keeps reading like a measurement long after
+  /// the band is gone. Freshness rather than connection alone is the test,
+  /// because it also covers the connected-but-stalled stream, which no
+  /// disconnect hook can see. Every live consumer must read THIS.
+  int? get liveHr {
+    final id = liveHrDeviceId;
+    if (id != null) {
+      // The newest sample from the device that won, which is by construction
+      // inside `liveHrMaxAge` (that is what `_isStreaming` tested).
+      //
+      // THE BAND'S CONNECTION IS NOT THE GATE HERE. `liveHrDeviceId` can name
+      // a chest strap or a ring driven by `HrsLink` over its own GATT link,
+      // and `isConnected` reads the PRIMARY band's engine state. Gating on it
+      // meant that starting a workout with the strap on and the band on its
+      // charger returned null from a device that was streaming: `_tickWorkout`
+      // then banked no zone seconds, no strain and no calories from a real
+      // measurement. `_isStreaming` is already the stricter freshness test.
+      for (var i = _liveHrTrace.length - 1; i >= 0; i--) {
+        if (_liveHrTrace[i].deviceId == id) return _liveHrTrace[i].hr;
+      }
+    }
+    // The fallback below IS the band's, so it keeps the band's gate.
+    if (!isConnected) return null;
+    // FALLBACK: nothing in the trace yet — a caller that sets `DeviceState`
+    // directly without going through `_onEngineState` (every existing test,
+    // and any future path that bypasses the engine callback). The original
+    // single-device freshness check on `device.liveHr` itself, so behaviour
+    // stays byte-identical for anything that never reaches the trace.
+    final at = device.liveHrAt;
+    if (at == null) return null;
+    final age = DateTime.now().millisecondsSinceEpoch - at;
+    if (age > liveHrMaxAge.inMilliseconds) return null;
+    return device.liveHr;
+  }
   // The locally-set value is authoritative: the band has no independent alarm
   // source (its alarm is always what the app last wrote, and SET_ALARM is
   // HW-verified), while the GET_ALARM readback format is unconfirmed and was
   // clobbering the display (see the parked block in ble_engine._onDecoded).
   // device.alarmEpoch = this-session optimistic set; _savedAlarm = persisted.
   int? get alarmEpoch => device.alarmEpoch ?? _savedAlarm;
-  String? get strapName => device.strapName;
+  /// The band's advertising name, LAST KNOWN when the link has not answered.
+  ///
+  /// `DeviceState.strapName` only exists after a connect and a GET round-trip,
+  /// and [PairedDevice] persists the remote id and serial but never this — so
+  /// every cold start, and every minute spent disconnected, showed the generic
+  /// "WHOOP band" instead of whatever the user named their strap. A name the
+  /// band told us once does not stop being true while the radio is off.
+  static const String _kStrapName = 'band.strap_name';
+  String? get strapName {
+    final live = device.strapName;
+    if (live != null && live.isNotEmpty) return live;
+    final saved = Prefs.getString(_kStrapName, '');
+    return saved.isEmpty ? null : saved;
+  }
   int? _savedAlarm;
+
+  // ── weekly alarm schedule (replaces a single next-occurrence value) ────────
+  // The 7-day schedule lives in `alarm_schedule` (lib/data/db.dart); this cache
+  // is always exactly 7 entries (see fillDefaultAlarmSchedule) so the UI can
+  // render every weekday row unconditionally, and [_armNextAlarmOccurrence]
+  // never has to special-case a weekday nobody has touched.
+  List<AlarmScheduleEntry> _schedule = fillDefaultAlarmSchedule(const []);
+  List<AlarmScheduleEntry> get alarmSchedule => _schedule;
+
+  Future<void> _loadAlarmSchedule() async {
+    try {
+      final rows = await LocalDb.alarmScheduleRows();
+      _schedule = fillDefaultAlarmSchedule(
+          [for (final r in rows) AlarmScheduleEntry.fromRow(r)]);
+    } catch (e) {
+      _log('[alarm] schedule load failed: $e');
+    }
+  }
+
+  /// One-time 49→50 seed: a legacy single-alarm value with nothing yet in
+  /// `alarm_schedule` becomes that weekday's slot. Safe to call on every
+  /// launch — it is a no-op the moment ANY row exists, including a schedule
+  /// the user has since cleared via Cancel-all, which must stay cleared
+  /// rather than resurrect the old value.
+  Future<void> _seedAlarmScheduleFromLegacyIfNeeded() async {
+    try {
+      if (_savedAlarm == null) return;
+      final rows = await LocalDb.alarmScheduleRows();
+      if (rows.isNotEmpty) return;
+      final seed = seedEntryFromLegacyEpoch(_savedAlarm!);
+      await LocalDb.setAlarmScheduleDay(
+        weekday: seed.weekday,
+        hour: seed.hour,
+        minute: seed.minute,
+        enabled: seed.enabled,
+      );
+      await _loadAlarmSchedule();
+    } catch (e) {
+      _log('[alarm] legacy schedule seed failed: $e');
+    }
+  }
+
+  /// Change one weekday's slot and re-arm immediately when connected —
+  /// waiting for the next connect/sync would leave the band holding the OLD
+  /// schedule while the screen already claims the new one.
+  Future<void> setScheduleDay({
+    required int weekday,
+    int? hour,
+    int? minute,
+    bool? enabled,
+  }) async {
+    final current = _schedule.firstWhere(
+      (e) => e.weekday == weekday,
+      orElse: () => AlarmScheduleEntry(
+          weekday: weekday,
+          hour: defaultAlarmHour,
+          minute: defaultAlarmMinute,
+          enabled: false),
+    );
+    final next =
+        current.copyWith(hour: hour, minute: minute, enabled: enabled);
+    await LocalDb.setAlarmScheduleDay(
+      weekday: next.weekday,
+      hour: next.hour,
+      minute: next.minute,
+      enabled: next.enabled,
+    );
+    await _loadAlarmSchedule();
+    notifyListeners();
+    if (isConnected) await _armNextAlarmOccurrence();
+  }
+
+  /// Compute + arm the next scheduled occurrence, skipping the write when it
+  /// already matches what's armed (don't hammer the strap on every sync).
+  /// Called after every successful connect and after each sync completes —
+  /// see the `_armNextAlarmOccurrence()` call sites in openSession,
+  /// _reconnect, and their `_kickSyncBurst` completion callbacks — so an
+  /// edited schedule or a just-fired alarm re-arms with no manual step, and a
+  /// fired one-shot (which clears `_savedAlarm`) picks up its next occurrence
+  /// on the very next connect.
+  Future<void> _armNextAlarmOccurrence() async {
+    if (!isConnected) return;
+    try {
+      // A headless re-arm (background_sync.dart) can have rewritten
+      // `alarm_epoch`/`alarm_epoch_confirmed` under this same live process
+      // since init() last read them — refresh from the shared store before
+      // comparing, or a stale in-memory `_savedAlarm` makes this issue a
+      // needless duplicate setAlarm write on every connect.
+      final prefs = await SharedPreferences.getInstance();
+      final onDisk = prefs.getInt('alarm_epoch');
+      if (onDisk != _savedAlarm) {
+        _savedAlarm = onDisk;
+        if (onDisk != null) {
+          _alarm.set(onDisk, DateTime.now().millisecondsSinceEpoch);
+          _alarm.confirmed = prefs.getBool('alarm_epoch_confirmed') ?? false;
+        } else {
+          _alarm.disable();
+        }
+      }
+      final result = await armNextScheduledOccurrence(
+        engine: engine,
+        schedule: _schedule,
+        currentArmedEpoch: _savedAlarm ?? device.alarmEpoch,
+      );
+      if (result.disabled) {
+        // Every weekday got disabled since the last arm — the strap doesn't
+        // give up its old alarm on its own (PR #329 review).
+        _clearArmedAlarmState();
+        notifyListeners();
+        return;
+      }
+      final epoch = result.epoch;
+      if (epoch == null) return;
+      await _onArmed(DateTime.fromMillisecondsSinceEpoch(epoch * 1000), epoch);
+    } catch (e) {
+      _log('[alarm] weekly-schedule arm failed: $e');
+    }
+  }
+
+  /// Whether the currently-armed alarm — from either source, the schedule
+  /// engine or a still-live manual arm — fires during tonight's upcoming
+  /// overnight sleep. Feeds the 7pm "no alarm set for tonight" check
+  /// (Feature 2.2): the honest, real armed state, not merely that today's
+  /// schedule row happens to be enabled — a slot that never latched is not
+  /// something this may claim is armed. Delegates to the pure
+  /// [alarmArmsTonight], whose window is "after now, before noon tomorrow" —
+  /// a wake alarm armed tonight for tomorrow morning still counts, unlike a
+  /// same-calendar-date check would (see PR #329).
+  bool get _alarmArmedTonight {
+    final epoch = alarmEpoch;
+    if (!alarmArmsTonight(epoch, DateTime.now())) return false;
+    // The window match alone isn't enough — an epoch that was WRITTEN but
+    // never actually latched (headless failure, or the write is still inside
+    // its grace window with no confirmation yet) must not suppress the 7pm
+    // check; that gap is exactly what this check exists to catch (CodeRabbit
+    // review, PR #329).
+    if (_alarm.targetEpoch != epoch) return false;
+    return _alarm.confirmed ||
+        _alarm.isPending(DateTime.now().millisecondsSinceEpoch);
+  }
 
   // ── alarm confirmation state machine ────────────────────────────────────────
   // The strap CONFIRMS an alarm actually latched via event 56 (ALARM_SET) and
@@ -3018,36 +4384,41 @@ class AppState extends ChangeNotifier {
   bool get alarmPending =>
       _alarm.isPending(DateTime.now().millisecondsSinceEpoch);
 
-  /// Set but neither confirmed nor still pending — show a soft warning (the band
-  /// took the write but never confirmed it latched).
-  bool get alarmUnconfirmed =>
-      _alarm.isUnconfirmed(DateTime.now().millisecondsSinceEpoch);
-
-  int? get alarmLastEventId => _alarm.lastEventId;
-  int? get alarmFiredAt => _alarm.firedAt;
-
   Future<void> setAlarm(DateTime when) async {
     if (!isConnected) throw Exception('Connect to your strap first');
-    final epoch =
-        when.millisecondsSinceEpoch ~/ 1000; // local wall-clock → unix
     // Pass the DateTime through so the engine computes REAL sub-seconds for the
     // rich 20-byte firing form (a hardcoded 0 subsec would still fire, but the
-    // engine owns the exact on-wire layout).
-    final ok = await engine.setAlarm(when);
-    if (!ok) {
-      // The arm write never reached the band — do NOT persist or start the
-      // confirmation machine, or we'd strand a phantom alarm "waiting for the
-      // strap to confirm" that can never fire. Surface it so the UI reflects
-      // "couldn't send" (the coach/profile callers snackbar on a throw).
-      _log('[alarm] arm write FAILED — not persisting; alarm not set.');
-      throw Exception('Alarm not sent — the strap did not accept the write');
+    // engine owns the exact on-wire layout). Persist the wall instant the
+    // engine reports armed (null = write never reached the band).
+    final armed = await engine.setAlarm(when);
+    if (armed == null) {
+      // Do NOT persist or start the confirmation machine, or we'd strand a
+      // phantom alarm "waiting for the strap to confirm" that can never fire.
+      // Null now covers two cases: the write never left the phone, and the
+      // strap answered and REFUSED the alarm. Both mean the band holds no alarm, so both
+      // must stay out of persistence; the engine log says which one it was.
+      _log('[alarm] the band did not take the alarm — not persisting.');
+      // Neutral on purpose: null covers both a write that never left the
+      // phone and an explicit refusal — the engine log says which.
+      throw Exception('Alarm not set');
     }
+    await _onArmed(armed, armed.millisecondsSinceEpoch ~/ 1000);
+  }
+
+  /// Shared bookkeeping for anything that just armed the band: optimistic
+  /// display, the confirmation machine, the persisted epoch, and the grace
+  /// timer. [setAlarm] (an explicit write) and [_armNextAlarmOccurrence] (the
+  /// schedule engine) both funnel through here so the two can never drift
+  /// apart on what "armed" means.
+  Future<void> _onArmed(DateTime when, int epoch) async {
     _savedAlarm = epoch;
     device.alarmEpoch = epoch; // optimistic display
     _alarm.set(epoch, DateTime.now().millisecondsSinceEpoch); // await event 56
-    _alarmAutoRetried = false; // fresh user-initiated set gets its one retry
+    _alarmAutoRetried = false; // a fresh arm gets its one retry
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('alarm_epoch', epoch);
+    // Not confirmed yet — event 56 (below, in _handleAlarmEvent) flips this.
+    await prefs.setBool('alarm_epoch_confirmed', false);
     // Nudge the UI once the grace window elapses so an unconfirmed alarm flips to
     // its soft warning even if no event ever arrives.
     _armAlarmGraceTimer(when);
@@ -3076,12 +4447,16 @@ class AppState extends ChangeNotifier {
     if (_savedAlarm != epoch) return;
     if (_alarmAutoRetried || !isConnected) {
       notifyListeners();
+      unawaited(_notifyAlarmLatchFailed(epoch));
       return;
     }
     _alarmAutoRetried = true;
     var rearmed = false;
     try {
-      rearmed = await engine.setAlarm(when);
+      // gen5 made setAlarm return the armed instant (null = the write never
+      // reached the band) where it used to return a bool. Same signal, so the
+      // retry bookkeeping below is unchanged.
+      rearmed = await engine.setAlarm(when) != null;
     } catch (e) {
       _log('[alarm] auto-retry re-arm failed: $e');
     }
@@ -3099,6 +4474,36 @@ class AppState extends ChangeNotifier {
       return;
     }
     notifyListeners();
+    unawaited(_notifyAlarmLatchFailed(epoch));
+  }
+
+  /// The "alarm not confirmed" safety notification (Feature 2.1): fires once
+  /// per armed epoch, only once every retry this grace window can offer is
+  /// exhausted and the strap still never confirmed. Respects its own toggle
+  /// (default ON). Category device + critical priority rides the same
+  /// quiet-hours exemption as the band's other own-failure alerts (flat
+  /// battery, gone quiet) — a wake alarm that silently didn't latch is
+  /// exactly the kind of thing quiet hours must not swallow.
+  Future<void> _notifyAlarmLatchFailed(int epoch) async {
+    try {
+      final prefs = await NotificationPrefs.load();
+      if (!alarmLatchFailed(_alarm, epoch,
+          enabled: prefs.alarmLatchFailedEnabled)) {
+        return;
+      }
+      await NotificationCenter.instance.emit(NotificationEvent(
+        dedupeKey: 'alarm_latch_failed:$epoch',
+        category: NotifCategory.device,
+        priority: NotifPriority.critical,
+        title: 'Alarm not confirmed',
+        body: 'The band did not confirm this alarm — check the strap.',
+        date: todayLabel(),
+        route: kRouteAlarm,
+        osId: NotificationService.idAlarmLatchFailed,
+      ));
+    } catch (e) {
+      _log('[alarm] latch-failure notification skipped: $e');
+    }
   }
 
   /// Fire the strap's alarm haptics immediately — a "test buzz" so the user can
@@ -3125,11 +4530,9 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Live signal strength of the band in dBm, or null when unmeasurable.
-  /// Deliberately raw — all smoothing and labelling belongs to
-  /// ProximityTracker, which is testable without a radio.
-  Future<int?> readBandRssi() => engine.readRssi();
-
+  /// The UI's "Cancel-all": DISABLE_ALARM on the band, and clear the whole
+  /// weekly schedule — not just the currently-armed instant — so nothing left
+  /// in `alarm_schedule` can silently re-arm this on the next connect/sync.
   Future<void> disableAlarm() async {
     if (!isConnected) throw Exception('Connect to your strap first');
     await engine.disableAlarm();
@@ -3139,6 +4542,9 @@ class AppState extends ChangeNotifier {
     _alarmGraceTimer?.cancel();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('alarm_epoch');
+    await prefs.remove('alarm_epoch_confirmed');
+    await LocalDb.clearAlarmSchedule();
+    _schedule = fillDefaultAlarmSchedule(const []);
     notifyListeners();
   }
 
@@ -3159,6 +4565,14 @@ class AppState extends ChangeNotifier {
         // Diagnostic: ALARM_SET (event 56) means the arm LATCHED on the band.
         // Its absence after a SET is the tell that the write never took.
         _log('[alarm] strap CONFIRMED arm — ALARM_SET (event $id) received.');
+        unawaited(() async {
+          try {
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setBool('alarm_epoch_confirmed', true);
+          } catch (e) {
+            _log('[alarm] persisting confirmation failed: $e');
+          }
+        }());
         break;
       case AlarmEffect.fired:
         _log('[alarm] strap FIRED — EXECUTED (event $id) received.');
@@ -3193,6 +4607,7 @@ class AppState extends ChangeNotifier {
       try {
         final prefs = await SharedPreferences.getInstance();
         await prefs.remove('alarm_epoch');
+        await prefs.remove('alarm_epoch_confirmed');
       } catch (e) {
         _log('[alarm] clearing the persisted epoch failed: $e');
       }
@@ -3241,6 +4656,11 @@ class AppState extends ChangeNotifier {
     // Back in the foreground with an OS CPU/memory budget again — let the
     // scheduler drain any derive jobs that queued (durably) while backgrounded.
     _deriveScheduler.setBackground(false);
+    // A background live downgrade may still be writing (its flags clear only on
+    // completion). Let it finish before any reclaim path below re-arms live, so
+    // the re-arm sees settled flags and its ON writes can't interleave with the
+    // disable's trailing OFF writes.
+    await _settleBgLiveDowngrade();
     if (wasBackground && engine.isConnected) {
       IosBleRestore.foregroundActive = true;
       await IosBleRestore.setOwnsBand(true);
@@ -3251,7 +4671,10 @@ class AppState extends ChangeNotifier {
       // notification arrived recently the link is genuinely live → keep the fast reclaim.
       // Otherwise it's stale → tear it down and fall through to a clean reconnect, which
       // re-subscribes (the only place setNotifyValue runs) and drains the gap.
-      if (!isLinkStale(engine.sinceLastRx)) {
+      if (!isLinkStale(
+        engine.sinceLastRx,
+        liveStreamArmed: engine.liveEnabled,
+      )) {
         // Healthy link → fast reclaim. But the fast path skips the band polls the full
         // connect path runs, so the cached battery %/charging/strap-name go stale.
         // Re-poll them in the background so the UI stays current. Non-blocking.
@@ -3263,9 +4686,12 @@ class AppState extends ChangeNotifier {
             await engine.getStrapName();
           } catch (_) {}
         }());
-        // Backgrounding downgraded live to HR-only (no raw flood) — restore the
-        // full live set now that the foreground UI is consuming it again.
-        if (engine.liveHrOnly) unawaited(engine.enableLiveStreams());
+        // Backgrounding downgraded live to HR-only (iOS) or fully OFF
+        // (Android) — restore the full live set now that the foreground UI is
+        // consuming it again.
+        if (!engine.liveEnabled || engine.liveHrOnly) {
+          unawaited(engine.enableLiveStreams());
+        }
         // FOREGROUND CATCH-UP: R24 drains on a ~15-min timer while backgrounded,
         // so "last data" can lag up to 15 min behind a healthy link. The user
         // just opened the app — pull the flash backlog now. Floored at 90 s
@@ -3282,7 +4708,6 @@ class AppState extends ChangeNotifier {
       // fall through to the full connect → subscribe → drain path below
     }
     _setBusy(true);
-    lastError = null;
     _keepAlive = true;
     // From here on we WANT a link for the life of the process, so the level-
     // triggered supervisor runs from here on too (issue #208).
@@ -3306,7 +4731,7 @@ class AppState extends ChangeNotifier {
       // The foreground guard stops a wake from fighting this live session for the band.
       IosBleRestore.foregroundActive = true;
       IosBleRestore.arm(band.remoteId);
-      _log('===== SESSION START ===== raw=${dbCounts['raw']}');
+      _log('===== SESSION START =====');
       await _ensureForegroundLease();
       // connect() now subscribes → SET_CLOCK → INIT, so the historical offload is
       // ALREADY streaming the moment this returns.
@@ -3315,10 +4740,13 @@ class AppState extends ChangeNotifier {
       // config) and live-stream toggles ride the same link as the historical
       // burst. The per-revision packet accounting counts data-role frames only,
       // so these command exchanges don't perturb the burst packet counts.
-      if (!await engine.connectToRemoteId(band.remoteId)) {
-        lastError =
-            'Could not reach your band. Is it nearby and free '
-            '(official WHOOP app force-quit)?';
+      // No message is kept here on purpose: the engine already knows WHY the
+      // link is not up (blocker, bond refusal, repair, quarantine…) and says so
+      // through `engine.bandStatus`, which every surface renders. A second,
+      // staler sentence stored beside it could only disagree with it.
+      if (!await engine.connectToRemoteId(band.remoteId,
+          generationHint: band.generation)) {
+        _log('Session start: could not reach the band.');
         return;
       }
       await engine.getBattery();
@@ -3328,6 +4756,9 @@ class AppState extends ChangeNotifier {
       // Arm the strap's high-frequency sync window when a wake alarm is near
       // (denser flushes → fresher overnight data ahead of the alarm).
       await _refreshHighFreqWakeWindow();
+      // Compute + arm the next weekly-schedule occurrence on every successful
+      // connect (Feature 1's arming engine) — see _armNextAlarmOccurrence.
+      await _armNextAlarmOccurrence();
       _log('Listening — live streams on, historical burst runs concurrently.');
       // Enable live streams PROMPTLY, then let the historical burst run
       // CONCURRENTLY (unawaited, single-flight via _kickSyncBurst). History and
@@ -3345,16 +4776,17 @@ class AppState extends ChangeNotifier {
       await _recoverOrphanedLiveSession();
       _resetLivePedometer(); // fresh live step count for this connected session
       await engine.enableLiveStreams();
-      dbCounts = await LocalDb.counts();
       unawaited(
         _kickSyncBurst(kickFirst: false).then((report) async {
           _log(
             'Backlog drained: ${report.records} records in ${report.batches} '
             'batches (${report.complete ? "complete" : "stopped early"}).',
           );
-          dbCounts = await LocalDb.counts();
           // Re-evaluate the high-frequency wake window now the backlog landed.
           await _refreshHighFreqWakeWindow();
+          // Re-arm the weekly schedule now the sync completed (Feature 1: "on
+          // every successful connect AND after each sync").
+          await _armNextAlarmOccurrence();
           // The whole backlog landed → heavy foreground finalize (full sleep
           // staging + 24-h spectra over every stale day).
           _deriveScheduler.requestHeavy();
@@ -3365,7 +4797,7 @@ class AppState extends ChangeNotifier {
       );
       _startBackfillTimer();
     } catch (e) {
-      lastError = e.toString();
+      _log('Session start failed: $e');
     } finally {
       if (!engine.isConnected || !_keepAlive) {
         _stopBackfillTimer();
@@ -3442,7 +4874,8 @@ class AppState extends ChangeNotifier {
             // Mark band ownership before the actual GATT setup so a headless
             // wake can't fight this reconnect for the peripheral.
             await _ensureForegroundLease();
-            connected = await engine.connectToRemoteId(paired!.remoteId);
+            connected = await engine.connectToRemoteId(paired!.remoteId,
+              generationHint: paired!.generation);
           } else {
             connected = false;
           }
@@ -3450,7 +4883,8 @@ class AppState extends ChangeNotifier {
           await Future.delayed(engine.reconnectDelay(attempt));
           if (!_keepAlive) break;
           await _ensureForegroundLease();
-          connected = await engine.connectToRemoteId(paired!.remoteId);
+          connected = await engine.connectToRemoteId(paired!.remoteId,
+              generationHint: paired!.generation);
         }
         if (connected) {
           // Reclaim the band from the iOS restore central so it stops competing.
@@ -3462,13 +4896,21 @@ class AppState extends ChangeNotifier {
           // Arm the strap's high-frequency sync window when a wake alarm is
           // near (denser flushes ahead of the alarm).
           await _refreshHighFreqWakeWindow();
+          // Compute + arm the next weekly-schedule occurrence on every
+          // successful (re)connect — see _armNextAlarmOccurrence.
+          await _armNextAlarmOccurrence();
           // Live streams come up promptly; the FULL drain (no short timeout —
           // the ENTIRE offline backlog the band flashed while out of range)
           // runs concurrently, single-flight, exactly as in openSession.
-          // Background reconnect with no live consumer → HR-only live, so the
-          // raw flood can't starve the backlog drain we're about to run.
+          // Background reconnect with no live consumer: Android leaves live
+          // fully OFF (the FGS keeps the process alive; the 1 Hz stream has no
+          // consumer — see _maybeDowngradeLiveForBackground); iOS arms HR-only
+          // (the inbound notification keeps the suspended process schedulable).
+          await _settleBgLiveDowngrade();
           if (_background && !_hasLiveConsumer) {
-            await engine.enableHrOnlyLive();
+            if (!Platform.isAndroid) {
+              await engine.enableHrOnlyLive();
+            }
           } else {
             await engine.enableLiveStreams();
           }
@@ -3480,13 +4922,30 @@ class AppState extends ChangeNotifier {
           _log('Reconnected — live on; draining backlog in background.');
           unawaited(
             _kickSyncBurst(kickFirst: false).then((report) async {
-              dbCounts = await LocalDb.counts();
               _log('Reconnect backlog drained: ${report.records} records.');
               // Re-evaluate the high-frequency wake window now the backlog
               // landed.
               await _refreshHighFreqWakeWindow();
+              // Re-arm the weekly schedule now the sync completed (Feature 1:
+              // "on every successful connect AND after each sync").
+              await _armNextAlarmOccurrence();
               // Backlog (often an overnight gap) just landed → derive it.
-              _deriveScheduler.requestHeavy();
+              // Backgrounded, a flappy link (routine arm-swing dropouts)
+              // reconnects many times an hour; each heavy pass spawns an
+              // isolate and re-stages the pending days, so throttle heavy to
+              // one per 30 min while backgrounded — the interim reconnects
+              // still get a light pass, and the foreground return finalizes
+              // with a real heavy anyway.
+              final now = DateTime.now();
+              final lastHeavy = _lastBackgroundHeavyAt;
+              if (_background &&
+                  lastHeavy != null &&
+                  now.difference(lastHeavy) < const Duration(minutes: 30)) {
+                _deriveScheduler.markStoredData();
+              } else {
+                if (_background) _lastBackgroundHeavyAt = now;
+                _deriveScheduler.requestHeavy();
+              }
               notifyListeners();
             }).catchError((Object e) {
               _log('Reconnect sync burst failed: $e');
@@ -3543,7 +5002,6 @@ class AppState extends ChangeNotifier {
         await _syncBurst;
       }
       await _kickSyncBurst(kickFirst: true);
-      dbCounts = await LocalDb.counts();
       notifyListeners();
       // A just-finished workout window landed from flash → derive it (light).
       _deriveScheduler.markStoredData();
@@ -3573,7 +5031,10 @@ class AppState extends ChangeNotifier {
   /// tries to reconnect").
   Future<void> foregroundCatchUp() async {
     if (!engine.isConnected) return;
-    if (isLinkStale(engine.sinceLastRx)) {
+    if (isLinkStale(
+      engine.sinceLastRx,
+      liveStreamArmed: engine.liveEnabled,
+    )) {
       _log(
         'Foreground catch-up: no BLE data for ${engine.sinceLastRx.inSeconds}s '
         '— zombie link, forcing reconnect instead of a stale-link pull.',
@@ -3589,7 +5050,6 @@ class AppState extends ChangeNotifier {
       if (!await engine.requestForegroundSync()) return;
       final report = await _kickSyncBurst(kickFirst: false);
       if (report.records > 0) {
-        dbCounts = await LocalDb.counts();
         _deriveScheduler.markStoredData();
         notifyListeners();
       }
@@ -3609,7 +5069,8 @@ class AppState extends ChangeNotifier {
         enabled: plan.shouldEnable,
         targetWake: plan.targetWake,
         duration: HighFreqWakeWindow.lease,
-        intervalSeconds: 60,
+        intervalSeconds: 61, // gen5 rejects <= 60
+
         reason: plan.source,
       );
       _log(
@@ -3660,14 +5121,6 @@ class AppState extends ChangeNotifier {
   /// the first frame this connection.
   DateTime? get lastDataAt => engine.lastRxAt;
 
-  Map<String, dynamic> get pipelineStatus => {
-    'capture': engine.offloadSnapshot,
-    'derive': {..._deriveScheduler.snapshot(), 'engine': _derive.snapshot()},
-    'db_counts': dbCounts,
-    'reanalyzing': reanalyzing,
-    'reanalyze_progress': reanalyzeProgress,
-  };
-
   final SyncActivityWindow _syncActivity = SyncActivityWindow();
 
   /// Fires once when the activity window closes. `syncingNow` decays on
@@ -3684,6 +5137,19 @@ class AppState extends ChangeNotifier {
   /// From TestFlight: "don't get to know if syncing is happening or not".
   bool get syncingNow =>
       _syncActivity.isActive(DateTime.now().millisecondsSinceEpoch);
+
+  /// A derive job is running RIGHT NOW — the backlog just landed and the
+  /// pipeline is computing what it means. Surfaced so a screen sitting on
+  /// "nothing yet" can say it is being worked on rather than looking dead.
+  /// Thin reads of [_deriveScheduler]'s own state; `onChanged: notifyListeners`
+  /// already ticks on every transition, so nothing new to wire.
+  bool get deriving => _deriveScheduler.running;
+
+  /// A job is queued behind its settle window (the offload/workout just
+  /// ended) — about to run, not running yet. Kept distinct from [deriving]
+  /// only because a caller may want to say "about to" rather than "is".
+  bool get derivePending =>
+      _deriveScheduler.pendingLight || _deriveScheduler.pendingHeavy;
 
   /// Records reached durable storage. Called from the durable-write callback —
   /// NOT inferred from a sync burst finishing, because `_onDataStored` has
@@ -3710,18 +5176,6 @@ class AppState extends ChangeNotifier {
       ? null
       : DateTime.fromMillisecondsSinceEpoch(_lastRecTs! * 1000);
 
-  /// The quiet in-app half of the staleness-escalation meta-layer (see
-  /// sync_policy.dart's stalenessTierFor doc + checkSyncStaleness, which
-  /// drives the louder OS-notification half). A never-synced band reads as
-  /// [StalenessTier.fresh] — that's a distinct, already-visible onboarding
-  /// state, not silent staleness. Always computed fresh against wall-clock
-  /// now, so any screen can read it without needing its own refresh timer.
-  StalenessTier get syncStalenessTier {
-    final last = lastRecordAt;
-    if (last == null) return StalenessTier.fresh;
-    return stalenessTierFor(DateTime.now().difference(last).inSeconds);
-  }
-
   void _setBusy(bool b) {
     busy = b;
     notifyListeners();
@@ -3741,118 +5195,21 @@ class AppState extends ChangeNotifier {
     return state == BluetoothAdapterState.on;
   }
 
-  // ── live HRV spot-check ──────────────────────────────────────────────────────
-  // User taps "spot check": we enable wrist-gated optical + realtime records,
-  // collect live frames for [spotDuration]s, then hand them to the repo seam which
-  // (in the re-layer) decodes RR + computes HRV on-device. Ephemeral — nothing stored.
-  static const int spotDuration = 60;
-  bool spotActive = false;
-  int spotRemaining = 0; // seconds left in the current scan
-  Map<String, dynamic>?
-  spotResult; // last result {rmssd, sdnn, mean_hr, n_beats, ok}
-  String? spotError;
-  final List<String> _spotFrames = [];
-  Timer? _spotTimer;
-  bool _spotEnabledStreams =
-      false; // did WE turn streams on (so we turn them off)
-
-  /// Begin a 60s live HRV reading. Requires a connected band.
-  Future<void> startSpotCheck() async {
-    if (spotActive) return;
-    if (!isConnected) {
-      spotError = 'Connect your band first.';
-      notifyListeners();
-      return;
-    }
-    spotActive = true;
-    spotError = null;
-    spotResult = null;
-    spotRemaining = spotDuration;
-    _spotFrames.clear();
-    notifyListeners();
-    try {
-      // OWNERSHIP: only claim "we enabled it" when live was actually OFF. The
-      // open session keeps live streams armed for its whole lifetime — claiming
-      // ownership then would make _stopSpotStreams turn OFF streams the session
-      // still expects on (iOS then suspends the app → ingestion stalls).
-      if (!engine.liveEnabled) {
-        await engine.enableLiveStreams();
-        _spotEnabledStreams = true;
-      } else if (engine.liveHrOnly) {
-        // Background downgrade active — the spot check needs the RR-bearing
-        // R10 frames, so upgrade to full live WITHOUT taking ownership (the
-        // session owns the streams; it restores/apportions them itself).
-        await engine.enableLiveStreams();
-      }
-    } catch (_) {
-      /* best-effort; we still collect whatever arrives */
-    }
-    _spotTimer?.cancel();
-    _spotTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      spotRemaining -= 1;
-      if (spotRemaining <= 0) {
-        unawaited(_finishSpotCheck());
-      } else {
-        notifyListeners();
-      }
-    });
-  }
-
-  /// Abort an in-progress scan without computing.
-  void cancelSpotCheck() {
-    if (!spotActive) return;
-    _spotTimer?.cancel();
-    _spotTimer = null;
-    spotActive = false;
-    spotRemaining = 0;
-    _stopSpotStreams();
-    notifyListeners();
-  }
-
-  Future<void> _finishSpotCheck() async {
-    _spotTimer?.cancel();
-    _spotTimer = null;
-    spotRemaining = 0;
-    _stopSpotStreams();
-    final frames = List<String>.from(_spotFrames);
-    notifyListeners();
-    try {
-      final res = repo == null || frames.isEmpty
-          ? null
-          : await repo!.spotCheck(frames);
-      spotResult = res;
-      if (res == null) {
-        spotError = 'No reading captured — keep the band snug and still.';
-      } else if (res['ok'] != true) {
-        spotError = 'Not enough clean beats — try again, sitting still.';
-      }
-    } catch (e) {
-      spotError = 'Spot check failed: ${e is RepositoryException ? e.body : e}';
-    } finally {
-      spotActive = false;
-      notifyListeners();
-    }
-  }
-
-  void _stopSpotStreams() {
-    if (_spotEnabledStreams && activeWorkout == null) {
-      unawaited(engine.disableLiveStreams());
-    }
-    _spotEnabledStreams = false;
-  }
+  // The live HRV spot-check that used to live here is GONE. It was fully
+  // implemented — 60 s of RR-bearing frames handed to the repository seam —
+  // and no screen ever started one, so `spotActive` was a permanently-false
+  // term in [_hasLiveConsumer] and a dead branch on every live frame. The
+  // LocalRepository seam (`spotCheck`) is still there for whoever builds the
+  // screen; the half-wired state machine is not.
 
   // ── guided-breathing cardiac coherence ──────────────────────────────────────
   // User taps "begin breathing session": enable live RR-bearing streams,
-  // collect frames continuously in _breathingFrames (tapped from _onLiveFrame,
-  // same seam spot-check uses), and periodically recompute McCraty & Zayas
+  // collect frames continuously in _breathingFrames (tapped from _onLiveFrame),
+  // and periodically recompute McCraty & Zayas
   // 2014 coherence over the FULL accumulated series so far — not a sliding
   // window, so the score stabilizes as more clean data comes in rather than
   // jittering on a short recent slice. Replaces the screen's old
   // Random()-fabricated score. Ephemeral — nothing persisted.
-  //
-  // 5.5 breaths/min == CalmBreathingScreen's 5450ms inhale/exhale half-cycle
-  // (10900ms per full breath).
-  static const double breathingPacedHz = 1000.0 / 10900.0;
   static const Duration _breathingRecomputeInterval = Duration(seconds: 20);
   bool breathingActive = false;
 
@@ -3886,6 +5243,106 @@ class AppState extends ChangeNotifier {
   Timer? _breathingRecomputeTimer;
   bool _breathingEnabledStreams = false;
 
+  // ── MIND-06 · the quiet windows either side of the paced block ─────────────
+  //
+  // The lifecycle, not the statistics, is what blocked this. The live streams
+  // were enabled by [startBreathingSession] and torn down by
+  // [stopBreathingSession], and the frame buffer was cleared at start — so the
+  // two minutes BEFORE the pacing had no streams and the two minutes AFTER it
+  // had neither streams nor a buffer. A window therefore brackets the session
+  // rather than living inside it: it owns the stream enable, survives the
+  // paced block's start and stop, and hands the buffer over at each boundary.
+  //
+  // Only the two quiet windows are stored. The paced block's own RMSSD is not
+  // computed here and has nowhere to go — see `lib/stress/session_effect.dart`.
+
+  /// True while a quiet window is capturing outside the paced block.
+  bool breathingWindowOpen = false;
+
+  /// The frames of the PRE window, taken at the moment pacing began.
+  List<String>? _preWindowFrames;
+
+  /// The banked row the windows belong to, or null when the paced block was
+  /// too short to bank one (in which case the windows have nothing to attach
+  /// to and are dropped).
+  int? _windowRowStartedAt;
+
+  /// Open the quiet window: live streams on, frames buffering, no pacing yet.
+  ///
+  /// Takes stream ownership itself so [startBreathingSession] finds live
+  /// already enabled and claims nothing — otherwise the paced block's stop
+  /// would turn off streams the post window is still reading.
+  Future<void> openBreathingWindow() async {
+    if (breathingWindowOpen || breathingActive) return;
+    if (!isConnected) {
+      breathingError = 'Connect your band first.';
+      notifyListeners();
+      return;
+    }
+    breathingWindowOpen = true;
+    _preWindowFrames = null;
+    _windowRowStartedAt = null;
+    _breathingFrames.clear();
+    notifyListeners();
+    await _settleBgLiveDowngrade();
+    try {
+      if (!engine.liveEnabled) {
+        await engine.enableLiveStreams();
+        _breathingEnabledStreams = true;
+      } else if (engine.liveHrOnly) {
+        await engine.enableLiveStreams();
+      }
+    } catch (_) {
+      /* best-effort; we still collect whatever arrives */
+    }
+  }
+
+  /// Close the window, measure both quiet stretches and attach them to the
+  /// banked session. Safe to call when no window is open.
+  ///
+  /// RMSSD comes from the SAME seam the live spot-check uses, so the two
+  /// windows are cleaned and estimated identically — a pre window scored one
+  /// way and a post window another would produce a difference that is entirely
+  /// method.
+  Future<void> closeBreathingWindow() async {
+    if (!breathingWindowOpen) return;
+    breathingWindowOpen = false;
+    final post = List<String>.from(_breathingFrames);
+    final pre = _preWindowFrames;
+    final row = _windowRowStartedAt;
+    _preWindowFrames = null;
+    _windowRowStartedAt = null;
+    _breathingFrames.clear();
+    _stopBreathingStreams();
+    notifyListeners();
+    if (row == null || pre == null) return;
+    final before = await _windowRmssd(pre);
+    final after = await _windowRmssd(post);
+    // Nothing readable either side is not a measurement — leave both columns
+    // NULL rather than writing a row the paired test would then have to drop.
+    if (before == null && after == null) return;
+    try {
+      await LocalDb.updateBreathingWindows(
+        startedAt: row,
+        preRmssd: before,
+        postRmssd: after,
+      );
+    } catch (_) {
+      /* best-effort; a lost window is one dropped pair, not a broken session */
+    }
+  }
+
+  Future<double?> _windowRmssd(List<String> frames) async {
+    final r = repo;
+    if (r == null || frames.isEmpty) return null;
+    try {
+      final res = await r.spotCheck(frames);
+      return res['ok'] == true ? (res['rmssd'] as num?)?.toDouble() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Begin a guided-breathing session. Requires a connected band.
   Future<void> startBreathingSession({
     BreathPattern? pattern,
@@ -3902,12 +5359,22 @@ class AppState extends ChangeNotifier {
     breathingActive = true;
     breathingResult = null;
     breathingError = null;
+    // MIND-06 — hand the pre window over before the buffer is reused for the
+    // paced block. The clear is still right; what was missing is that the
+    // frames it throws away are the "before" measurement.
+    if (breathingWindowOpen) {
+      _preWindowFrames = List<String>.from(_breathingFrames);
+    }
     _breathingFrames.clear();
     _breathingStartedAt = DateTime.now();
     notifyListeners();
     unawaited(BreathingLiveActivity.start(startedAt: DateTime.now()));
     try {
-      // OWNERSHIP: same rule as spot-check — only claim "we enabled it" when
+      // A background downgrade may be mid-write (band double-tap start right
+      // after backgrounding is exactly this case): settle it first so its
+      // trailing OFF writes cannot kill the streams we arm here.
+      await _settleBgLiveDowngrade();
+      // OWNERSHIP: only claim "we enabled it" when
       // live was actually OFF, so ending the session can never turn off
       // streams the open session still expects on.
       if (!engine.liveEnabled) {
@@ -3958,18 +5425,30 @@ class AppState extends ChangeNotifier {
         // Null unless the pattern is one a coherence score means something
         // for AND the estimator actually produced one.
         final rated = breathingPattern.coherenceRated && scored;
-        unawaited(
-          LocalDb.putBreathingSession(
-            startedAt: started.millisecondsSinceEpoch,
-            endedAt: ended.millisecondsSinceEpoch,
-            pattern: breathingPattern.key,
-            seconds: seconds,
-            coherence: rated ? (res['score'] as num?)?.toDouble() : null,
-            confidence: rated ? (res['confidence'] as num?)?.toDouble() : null,
-          ),
+        final put = LocalDb.putBreathingSession(
+          startedAt: started.millisecondsSinceEpoch,
+          endedAt: ended.millisecondsSinceEpoch,
+          pattern: breathingPattern.key,
+          seconds: seconds,
+          coherence: rated ? (res['score'] as num?)?.toDouble() : null,
+          confidence: rated ? (res['confidence'] as num?)?.toDouble() : null,
         );
+        if (breathingWindowOpen) {
+          // AWAITED only here: the post window's UPDATE lands on this row, and
+          // an UPDATE that overtakes its own INSERT writes nothing and reports
+          // success. Everywhere else the insert stays off the stop path.
+          _windowRowStartedAt = started.millisecondsSinceEpoch;
+          await put;
+        } else {
+          unawaited(put);
+        }
       }
     }
+    // MIND-06 — the post window starts here and reads the same buffer, so the
+    // paced block's frames have to go. They are not part of either quiet
+    // window and RMSSD over them would be the RSA artefact this feature exists
+    // to avoid reporting.
+    if (breathingWindowOpen) _breathingFrames.clear();
     notifyListeners();
   }
 
@@ -4029,6 +5508,10 @@ class AppState extends ChangeNotifier {
   }
 
   void _stopBreathingStreams() {
+    // The post window is still reading them. [closeBreathingWindow] is the one
+    // caller that clears the flag first, so it is the only one that gets past
+    // here while a window exists.
+    if (breathingWindowOpen) return;
     if (_breathingEnabledStreams && activeWorkout == null) {
       unawaited(engine.disableLiveStreams());
     }
@@ -4058,20 +5541,18 @@ class AppState extends ChangeNotifier {
   // route screen's hero numbers are distance and pace, and pace down a
   // lift-served descent is not the same claim as pace on a walk — it would
   // read as a performance figure while measuring gravity.
-  static const Set<String> _routeTypes = {'run', 'cycle', 'walk', 'hike'};
 
   DateTime _lastLaPush = DateTime.fromMillisecondsSinceEpoch(0);
 
-  // Sourced from the LOCAL profile (no server). Fall back to representative
-  // defaults when a field isn't set yet. maxHr = 220 - age.
-  int get _maxHr {
-    final age = (user?['age'] as num?)?.toDouble() ?? 30.0;
-    return (220 - age).round();
-  }
-
-  /// Estimated max HR (220 − age) — used by the route map / splits to colour by
-  /// HR zone, matching the live zone bands.
-  int get maxHr => _maxHr;
+  // `_maxHr` (220 − age, silently substituting age 30 → a flat 190 for every
+  // user who skipped the field) and the public `maxHr` that wrapped it are
+  // GONE (TS-03a). The live session now carries its own ceiling, resolved once
+  // at start from the athlete's age AND the strap that is measuring it
+  // ([LiveWorkoutState.hrMax]) — the same `estimatedMaxHr` the day pipeline and
+  // the session re-score band on, so the live gauge, the persisted `zone_min`
+  // and the detail screen's recomputed `zone_bands` can no longer disagree.
+  // `maxHr` had no readers left at all; its doc still claimed the route map
+  // used it, and the route map takes its ceiling from the session.
 
   int get _restingHr => (user?['resting_hr'] as num?)?.round() ?? 60;
 
@@ -4090,8 +5571,17 @@ class AppState extends ChangeNotifier {
   double? get _liveRestingHr =>
       _nightlyRhr ?? (user?['resting_hr'] as num?)?.toDouble();
 
+  /// TS-03 — the highest heart rate the band has ever OBSERVED, and the last
+  /// 28 nightly resting values. The two anchors [trainingZones] bands on; both
+  /// are cross-day reads, so they are cached here rather than queried when a
+  /// user taps start. Absent is the ordinary case and yields the age estimate.
+  double? _observedCeilingBpm;
+  List<double> _rhr28 = const [];
+
   Future<void> _refreshNightlyRhr() async {
     try {
+      _observedCeilingBpm = (await LocalDb.observedHrCeiling())?.bpm;
+      _rhr28 = await LocalDb.trailingSeriesValues('rhr', 28);
       final vals = await LocalDb.trailingSeriesValues('rhr', 7);
       if (vals.isEmpty) return;
       _nightlyRhr = vals.last;
@@ -4108,17 +5598,39 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// HR → zone 0..5 (% of max HR), matching the app's zone bands.
+  /// HR → zone 0..5, through THE app's zone set ([trainingZones]).
+  ///
+  /// The set is the LIVE SESSION's, not the profile's: it is fixed at start
+  /// from the age, the strap actually measuring, the observed ceiling and the
+  /// measured resting HR. 0 is the honest answer when there is no set at all
+  /// (no age, or an uncalibrated/unstamped band) — which lands every second in
+  /// Z0 and persists an empty `zone_min`, rather than banding the whole workout
+  /// against a stranger's 190 bpm.
   int _zoneFor(int hr) {
-    if (hr <= 0 || _maxHr <= 0) return 0;
-    final pct = hr / _maxHr * 100;
-    if (pct >= 90) return 5;
-    if (pct >= 80) return 4;
-    if (pct >= 70) return 3;
-    if (pct >= 60) return 2;
-    if (pct >= 50) return 1;
-    return 0;
+    final set = activeWorkout?.zoneSet;
+    if (hr <= 0 || set == null) return 0;
+    return set.zoneNumber(hr.toDouble());
   }
+
+  /// The zone the live session is in right now, 1..5, or null at rest / with
+  /// no session. Exposed so the live screens read the ONE zone table instead
+  /// of keeping a second copy of the thresholds — which is how two screens
+  /// end up disagreeing about the same heartbeat.
+  int? get liveZone {
+    final z = _zoneFor(activeWorkout?.currentHr ?? 0);
+    return z == 0 ? null : z;
+  }
+
+  /// Distance the live route recorder has measured, km. Null when no route is
+  /// being recorded — which is not the same as zero.
+  double? get liveDistanceKm {
+    final rt = _routeTracker;
+    return rt == null ? null : rt.distanceMeters.value / 1000;
+  }
+
+  /// Whether a route recorder is actually running and taking fixes — as
+  /// opposed to the activity merely being one that deserves a route.
+  bool get routeTracking => _routeTracker?.isRunning ?? false;
 
   void startWorkout({
     double targetKcal = 300,
@@ -4130,20 +5642,27 @@ class AppState extends ChangeNotifier {
     final id = workoutId ?? 'w${start.millisecondsSinceEpoch}';
     // The workout screen's live step count rides the 100 Hz IMU stream, which
     // the sticky standard-HR fallback silently suppresses (same starvation as
-    // the calibration walk) — and which may simply be off (spot-check cleanup
-    // restores streams to OFF when they were off before) or still in the
+    // the calibration walk) — and which may simply be off (a breathing
+    // session restores streams to OFF when they were off before) or still in the
     // background HR-only downgrade. A deliberate workout start is an explicit
     // user action — retry the full live set; detectors re-trip if it can't
     // hold. No ownership flag: the background downgrade / session close
     // manage the stream lifecycle exactly as for openSession's arming.
-    if (isConnected &&
-        (!engine.liveEnabled ||
-            engine.liveHrOnly ||
-            device.standardHrFallback)) {
-      unawaited(engine.retryFullLiveStreams());
-    }
+    unawaited(() async {
+      // The band double-tap lands while backgrounded by definition — settle
+      // the background HR-only downgrade BEFORE retrying full live, or its
+      // trailing OFF writes (~300 ms of them) kill exactly what we arm.
+      await _settleBgLiveDowngrade();
+      if (isConnected &&
+          (!engine.liveEnabled ||
+              engine.liveHrOnly ||
+              device.standardHrFallback)) {
+        await engine.retryFullLiveStreams();
+      }
+    }());
     _workoutRawBase = _liveRaw;
     _workoutSawSamples = false;
+    _workoutMinuteSteps.clear();
     // A first night may have been derived since init. This read finishes
     // after the session below is constructed, so it back-fills the anchor on
     // `activeWorkout` when it lands rather than blocking the start.
@@ -4165,6 +5684,26 @@ class AppState extends ChangeNotifier {
       age: (user?['age'] as num?)?.round(),
       // Score against the profile the session is performed under.
       profile: Profile.fromMap(user),
+      // ...and against the strap performing it. Pinned at start for the same
+      // reason the profile is: the link can drop mid-session, and a workout
+      // that silently changed zone ceilings halfway through is worse than one
+      // scored end-to-end on the band it began on. Null when nothing is
+      // linked — unknown provenance, which refuses rather than assuming gen4.
+      hrMax: estimatedMaxHr(
+        (user?['age'] as num?),
+        engine.linkDeviceFamily,
+      ),
+      // TS-04 — zones are banded on the MEASURED pair when both exist. The
+      // anchors are read on the same refresh that loads the nightly resting HR
+      // (see [_refreshNightlyRhr]); an anchor that has not landed yet simply
+      // yields the age-estimate set, which is what this session would have got
+      // before TS-03 anyway.
+      zoneSet: trainingZones(
+        age: (user?['age'] as num?),
+        deviceFamily: engine.linkDeviceFamily,
+        observedCeilingBpm: _observedCeilingBpm,
+        restingHrHistory: _rhr28,
+      ),
       restingHr: _liveRestingHr,
     );
     // Persist the live session (INSERT OR REPLACE — idempotent if repo already
@@ -4177,6 +5716,9 @@ class AppState extends ChangeNotifier {
         'type': type,
         'status': 'live',
         'source': 'manual',
+        // Which strap is measuring this workout, if one is linked right now.
+        // Null when nothing is connected — unknown provenance, not gen4.
+        'device_family': engine.linkDeviceFamily,
         'created_at': start.millisecondsSinceEpoch,
       }),
     );
@@ -4192,12 +5734,18 @@ class AppState extends ChangeNotifier {
     LiveActivity.start(
       startedAt: start,
       targetKcal: targetKcal.round(),
-      maxHr: _maxHr,
+      // 0 = no ceiling, same convention `_zoneFor` uses. The widget declares
+      // the field and draws nothing with it (`zone` is computed here), so this
+      // is a passthrough, not a number anyone reads.
+      maxHr: activeWorkout?.hrMax?.round() ?? 0,
       rhr: _restingHr,
     );
     _lastLaPush = DateTime.fromMillisecondsSinceEpoch(0);
     // GPS route: only for run/ride/walk, and only if the user grants location.
     unawaited(_maybeStartRouteTracking(id, type));
+    // A paired heart-rate sensor is armed by a workout and only by a workout —
+    // the same rule GPS follows. No-op when nothing is paired.
+    unawaited(HrsLink.instance.arm());
   }
 
   /// Why route tracking is NOT running for the current route-eligible workout
@@ -4218,7 +5766,7 @@ class AppState extends ChangeNotifier {
   Future<void> _maybeStartRouteTracking(String id, String type) async {
     // Lowercased for the same reason every other type lookup is: the stored
     // `type` column is free-form text and older rows carry mixed case.
-    if (!_routeTypes.contains(type.toLowerCase())) return;
+    if (!typeRecordsRoute(type)) return;
     if (_routeTracker != null) return;
     routeLocationIssue = null;
     var perm = GpsPermissionStatus.error;
@@ -4272,9 +5820,12 @@ class AppState extends ChangeNotifier {
   /// If the Live Activity's Finish button was tapped (App Intent set the flag),
   /// stop the workout here too. Call on app resume.
   Future<void> maybeFinishFromLiveActivity() async {
-    if (activeWorkout != null && await WidgetService.consumeEndSessionFlag()) {
-      await stopWorkout();
-    }
+    // Consume FIRST. `&&` short-circuited the consume away whenever no session
+    // was live, so a Finish tapped on a Live Activity that outlived the app
+    // stayed latched on disk — and then ended the NEXT workout, days later, on
+    // the first resume that happened to have one running.
+    final asked = await WidgetService.consumeEndSessionFlag();
+    if (asked && activeWorkout != null) await stopWorkout();
   }
 
   /// Same idea as [maybeFinishFromLiveActivity] but for the breathing
@@ -4282,9 +5833,14 @@ class AppState extends ChangeNotifier {
   /// `end_breathing_session` — a separate flag so the two Live Activities'
   /// stop buttons never collide). Call on app resume.
   Future<void> maybeStopBreathingFromLiveActivity() async {
-    if (breathingActive && await WidgetService.consumeEndBreathingFlag()) {
-      await stopBreathingSession();
-    }
+    // Same latch, same fix as above.
+    final asked = await WidgetService.consumeEndBreathingFlag();
+    if (!asked) return;
+    if (breathingActive) await stopBreathingSession();
+    // Ending from the Live Activity ends the whole thing, quiet windows
+    // included — otherwise the streams stay on with no screen left to close
+    // them, which is the leak `PopScope` was added to the screen to fix.
+    await closeBreathingWindow();
   }
 
   /// Reconcile any session row still `status='live'` left over from a
@@ -4343,16 +5899,27 @@ class AppState extends ChangeNotifier {
             type: (row['type'] as String?) ?? 'other',
             age: (user?['age'] as num?)?.round(),
             profile: Profile.fromMap(user),
+            // The same ceiling startWorkout pins. Without it the resumed
+            // session's idle gate is null, and WorkoutIdleWatch then counts
+            // ANY positive reading as active — a forgotten session idling at
+            // resting heart rate would never be asked about after a restart,
+            // the exact case the watch exists for.
+            hrMax: estimatedMaxHr(
+              (user?['age'] as num?),
+              engine.linkDeviceFamily,
+            ),
             restingHr: _liveRestingHr,
           );
-          // Without this, `workoutSteps` (gated on _workoutRawBase != null)
-          // stays 0 for the rest of this resumed session, and stopWorkout()
+          // Without this, `workoutStepsMeasured` (gated on _workoutRawBase
+          // != null) stays null for the rest of this resumed session, and
+          // stopWorkout()
           // would persist 0 steps even once real pedometer data resumes
           // flowing — CodeRabbit caught this. Mirrors startWorkout()'s own
           // snapshot: steps count from zero going forward, same as
           // calories/strain/zone-minutes already (honestly) do here.
           _workoutRawBase = _liveRaw;
           _workoutSawSamples = false;
+          _workoutMinuteSteps.clear();
     // A first night may have been derived since init. This read finishes
     // after the session below is constructed, so it back-fills the anchor on
     // `activeWorkout` when it lands rather than blocking the start.
@@ -4372,10 +5939,28 @@ class AppState extends ChangeNotifier {
           // rows (`id` is unchanged), so the pre-restart part of the route is
           // kept and the gap shows honestly as a segment break.
           unawaited(_maybeStartRouteTracking(id, activeWorkout!.type));
+          unawaited(HrsLink.instance.arm());
           _deriveScheduler.setWorkoutActive(true);
           ScreenWake.enable();
         } else {
-          await LocalDb.putSession({...row, 'status': 'done'});
+          // A stale live row has no end_ts (it was never stopped). We don't
+          // know when the workout actually ended, so the honest stamp is
+          // reconcile-time (stated as such), not a guess at the real finish
+          // (edge#277) — and for the same reason this is NEVER exported to
+          // Health: [end_ts] here is fabricated, so a [start,end_ts] Health
+          // workout sample would report a bogus duration as real data.
+          // `end_ts_fabricated` records that so `_writeOneWorkout` can skip it
+          // on every later periodic export pass too, not just this call site —
+          // without the flag the row looks like any other finished workout and
+          // gets exported on the next drain/derive cycle regardless.
+          final reconciledEndTs = nowMs ~/ 1000;
+          final hadRealEnd = row['end_ts'] != null;
+          await LocalDb.putSession({
+            ...row,
+            'status': 'done',
+            'end_ts': row['end_ts'] ?? reconciledEndTs,
+            'end_ts_fabricated': hadRealEnd ? (row['end_ts_fabricated'] ?? 0) : 1,
+          });
           _log('[workout] finalized a stale live-session row from a previous run (id=${row['id']}).');
         }
       }
@@ -4406,6 +5991,9 @@ class AppState extends ChangeNotifier {
     // A session that never got a tracker (permission denied) still armed
     // nothing, but a session whose tracker was already cleared by another path
     // would otherwise leave the screen pinned awake until the app is killed.
+    // AWAITED, like the route tail: an unawaited disarm races the finish screen
+    // and the last buffered batch of sensor beats never reaches the database.
+    await HrsLink.instance.disarm();
     ScreenWake.release();
     _deriveScheduler.setWorkoutActive(false);
     final w = activeWorkout!;
@@ -4416,11 +6004,21 @@ class AppState extends ChangeNotifier {
     // Nullable: an unmeasured workout must leave the column unset rather than
     // bank a zero that reads as "you took no steps".
     final wSteps = workoutStepsMeasured;
+    // Measured walking cadence, or null when this session had too few gait-like
+    // minutes to have one — most indoor sessions. Never 0.
+    final wCadence =
+        _workoutSawSamples ? sessionCadenceSpm(_workoutMinuteSteps) : null;
     // Persist the finalized session before clearing the live state. zone_min =
     // the per-zone seconds the 1 Hz tick accumulated (Z1..Z5, minutes).
     final id = w.workoutId ?? 'w${w.startTime.millisecondsSinceEpoch}';
     final zoneMin = w.zoneMinutes();
     final endTs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    // Which strap measured this workout. `putSession` is INSERT OR REPLACE, so
+    // an omitted key would blank the stamp startWorkout banked — keep that one
+    // when the link has since dropped rather than downgrading a real answer to
+    // "unknown".
+    final bandFamily = engine.linkDeviceFamily ??
+        ((await LocalDb.session(id))?['device_family'] as String?);
     final sessionRow = {
       'id': id,
       'start_ts': w.startTime.millisecondsSinceEpoch ~/ 1000,
@@ -4435,10 +6033,30 @@ class AppState extends ChangeNotifier {
         zoneMin.any((v) => v > 0) ? zoneMin : const <num>[],
       ),
       if (wSteps != null && wSteps > 0) 'steps': wSteps,
+      'cadence_spm': ?wCadence,
       'source': 'manual',
+      'device_family': bandFamily,
       'created_at': w.startTime.millisecondsSinceEpoch,
     };
-    unawaited(LocalDb.putSession(sessionRow));
+    // AWAITED, and the live state is not cleared until it lands. This was
+    // fire-and-forget with `activeWorkout = null` on the next line: the
+    // in-memory session is the ONLY other copy, so a failed write silently
+    // destroyed the whole workout while the summary screen rendered it in full.
+    // On a throw the session stays live — every teardown above is idempotent,
+    // so calling stopWorkout() again is a clean retry — and the exception
+    // propagates instead of being reported as a finished, saved session.
+    try {
+      await LocalDb.putSession(sessionRow);
+      // The session is durable — tell the screens that read sessions. Without
+      // this the Workout tab, which loads once and caches, showed no trace of
+      // the workout you had just finished in History, "This week", "Tracked"
+      // or the weekly load until the app was restarted.
+      bumpInsights();
+    } catch (e) {
+      _log('[workout] could not save session $id: $e — keeping it live');
+      notifyListeners();
+      rethrow;
+    }
     // Session-triggered Health export (issue #130) — don't wait for the next
     // day_result/derive pass (which may not run at all if the band isn't
     // connected right now); write this workout to Apple Health/Health Connect
@@ -4449,6 +6067,7 @@ class AppState extends ChangeNotifier {
     activeWorkout = null;
     _workoutRawBase = null;
     _workoutSawSamples = false;
+    _workoutMinuteSteps.clear();
     notifyListeners();
     _log(
       finalKcal == null
@@ -4456,6 +6075,12 @@ class AppState extends ChangeNotifier {
           : 'Live session ended. Burned $finalKcal kcal.',
     );
     LiveActivity.end();
+    // A workout stopped while backgrounded (band double-tap gesture) was the
+    // one path that left FULL live armed with no consumer — the keep-alive
+    // then faithfully re-armed the 100 Hz flood every 30 s until the next
+    // lifecycle transition. Re-run the background downgrade now the consumer
+    // is gone (no-op when foregrounded or already downgraded).
+    if (_background) _maybeDowngradeLiveForBackground();
     // A workout often rides the live feed; if the connection blipped during it, the
     // band may hold that window in flash. Pull it now over the live connection so the
     // just-finished session isn't left with a gap.
@@ -4481,11 +6106,15 @@ class AppState extends ChangeNotifier {
       } catch (_) {}
       EdgeTracking.start(location: false);
     }
+    // AWAITED, like the route tail: an unawaited disarm races the finish screen
+    // and the last buffered batch of sensor beats never reaches the database.
+    await HrsLink.instance.disarm();
     ScreenWake.release();
     _deriveScheduler.setWorkoutActive(false);
     activeWorkout = null;
     _workoutRawBase = null;
     _workoutSawSamples = false;
+    _workoutMinuteSteps.clear();
     LiveActivity.end();
   }
 
@@ -4540,6 +6169,39 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// One water write at a time. `_logWaterFromGesture` reads the day, awaits, then
+  /// writes the whole map back, and `postJournalMetrics` REPLACES the day — so two
+  /// taps overlapping that await both read the same total and the second write eats
+  /// the first glass. Same guard the nutrition screen's `+` already uses. This is not
+  /// a second debounce (the dispatcher owns that); it is the read-modify-write lock.
+  bool _writingWaterFromGesture = false;
+
+  /// Double-tap → add one glass to today's water. Step and ceiling come from the
+  /// journal field spec, so a wrist tap and the on-screen `+` always agree.
+  Future<void> _logWaterFromGesture() async {
+    final r = repo;
+    if (r == null || _writingWaterFromGesture) return;
+    _writingWaterFromGesture = true;
+    try {
+      final spec = kJournalFieldsByKey['water_ml']!;
+      final date = todayLabel();
+      // Inside the try: the READ can throw too, and a guard set before it would
+      // stay set forever. Spread into a fresh map — postJournalMetrics rewrites
+      // the whole day from what it is handed.
+      final fields = {...await r.getJournalMetrics(date)};
+      final now = fields['water_ml']?.value ?? 0;
+      fields['water_ml'] =
+          JournalMetricValue((now + spec.step).clamp(0, spec.max).toDouble());
+      await r.postJournalMetrics(date, fields);
+      _log('[gesture] water logged (+${spec.step.round()} ${spec.unit})');
+      await HapticFeedback.mediumImpact();
+    } catch (e) {
+      _log('[gesture] log water failed: $e');
+    } finally {
+      _writingWaterFromGesture = false;
+    }
+  }
+
   /// Double-tap → stamp a timestamped tag onto today's journal (read-modify-write so
   /// existing tags/note survive). "Remember this" for a spike, a set, a feeling.
   Future<void> _markMomentFromGesture() async {
@@ -4577,66 +6239,105 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Ask about a session that has gone quiet — the [WorkoutIdleWatch] ask.
+  ///
+  /// Once per session EVER, belt and braces: the watch stops on
+  /// [WorkoutIdleWatch.confirmFired], and the dedupeKey is claimed
+  /// persistently by FiredKeyStore, so even a session resumed after a crash
+  /// (same id) cannot re-fire. `confirmFired` only on a real present — a drop
+  /// (quiet hours, muted reminders) releases the key and leaves the watch's
+  /// retry loop running, which is what turns an overnight ask into the
+  /// morning nudge instead of a loss.
+  Future<void> _nudgeIdleWorkout(LiveWorkoutState w) async {
+    try {
+      final id = w.workoutId ?? 'w${w.startTime.millisecondsSinceEpoch}';
+      final fired = await NotificationCenter.instance.emit(
+        NotificationEvent(
+          dedupeKey: '$id:workout_idle',
+          category: NotifCategory.reminders,
+          // NORMAL: the prompt sanction in classOf requires it, same as the
+          // movement and detected-workout prompts.
+          priority: NotifPriority.normal,
+          title: 'Still working out?',
+          body: 'Nothing above resting effort has been recorded for '
+              '${w.idleWatch.nudgeAfter.inMinutes} minutes. If the session '
+              'is over, finish it from the Workout tab.',
+          date: todayLabel(),
+          route: kRouteWorkoutIdle,
+        ),
+      );
+      if (fired) {
+        w.idleWatch.confirmFired();
+        _log('[workout] idle nudge fired for $id');
+      }
+    } catch (e) {
+      _log('[workout] idle nudge skipped: $e');
+    }
+  }
+
   void _tickWorkout() {
     final w = activeWorkout;
     if (w == null) return;
 
     w.elapsed = DateTime.now().difference(w.startTime);
-    w.currentHr = device.liveHr ?? 0;
-    // Smooth at accrual (issue #127): a raw `> maxHrSeen` would let a 1–2 s PPG
-    // spike define the session max. accrueHr feeds the rolling-median peak.
-    w.accrueHr(w.currentHr);
-    // Per-zone time: one tick ≈ one second in the current zone (persisted as
-    // zone_min at stop — this is what feeds the Time-in-Zones bar).
-    if (w.currentHr > 0) w.zoneSeconds[_zoneFor(w.currentHr)] += 1;
-
-    if (w.currentHr > 0 && w.profile.hasCalorieAnchors) {
-      // Keytel (2005) per second, from the profile this session is being
-      // performed under. No fallbacks: this used to substitute 30y / 70 kg /
-      // male for whatever the profile was missing, which is how an untouched
-      // profile still produced a confident calorie total — and why the number
-      // read high for anyone lighter than the stand-in. The re-score path has
-      // always refused to guess (`hasCalorieAnchors`); now so does this one,
-      // and an unanchored session reports no calories at all.
-      final age = w.profile.ageYears!.toDouble();
-      final weight = w.profile.weightKg!;
-      final female = w.profile.sex == 'f' || w.profile.sex == 'female';
-
-      double kcalMin;
-      if (female) {
-        kcalMin =
-            (-20.4022 +
-                (0.4472 * w.currentHr) -
-                (0.1263 * weight) +
-                (0.074 * age)) /
-            4.184;
-      } else {
-        kcalMin =
-            (-55.0969 +
-                (0.6309 * w.currentHr) +
-                (0.1988 * weight) +
-                (0.2017 * age)) /
-            4.184;
-      }
-      // Add per-second slice (kcal/min / 60). Clamp to 0 in case of low HR.
-      w.accrueCalories(kcalMin.clamp(0.0, 30.0) / 60.0);
-
-      // Strain is NOT accrued here. `accrueHr` (called above) recomputes it
-      // from the session's per-minute HR through the one shared Banister ->
-      // log-squash path, so the live gauge, a manually logged session and the
-      // day's own strain all mean the same thing on the same 0–21 scale.
+    // [liveHr], not `device.liveHr`: a reading that is stale or arriving from a
+    // band that has dropped is NOT a measurement of this second, and billing it
+    // into the peak, the per-zone seconds and (through accrueHr) strain and
+    // calories is how a session that ended at the trailhead came back reading
+    // like an hour of zone 3. Absent stays absent — the tick simply skips.
+    final hr = liveHr;
+    w.currentHr = hr;
+    if (hr != null) {
+      // Smooth at accrual (issue #127): a raw `> maxHrSeen` would let a 1–2 s
+      // PPG spike define the session max. accrueHr feeds the rolling-median peak.
+      w.accrueHr(hr);
+      // Per-zone time: one tick ≈ one second in the current zone (persisted as
+      // zone_min at stop — this is what feeds the Time-in-Zones bar).
+      if (hr > 0) w.zoneSeconds[_zoneFor(hr)] += 1;
     }
+
+    // Forgotten-session watch: judged against the SAME gate calories bill
+    // with, so "quiet" here means exactly "billed as rest there" (null when
+    // the anchors cannot define one — then only absence counts, see
+    // WorkoutIdleWatch). The ask is a notification, once per session; the
+    // session itself is never touched — there is deliberately no auto-stop.
+    final wRhr = w.restingHr;
+    final wMax = w.hrMax;
+    final idleGate = (wRhr != null && wMax != null)
+        ? ana.Calories.activeGateHr(wMax, wRhr)
+        : null;
+    if (w.idleWatch.onTick(DateTime.now(), hr: hr, gate: idleGate)) {
+      unawaited(_nudgeIdleWorkout(w));
+    }
+
+    // Neither strain NOR calories is accrued here. `accrueHr` (called above)
+    // recomputes both from the session's per-minute HR through the one shared
+    // path each has — Banister -> log-squash for strain, and the published
+    // Keytel/Harris-Benedict rates behind `Calories.estimateBoutCalories` for
+    // kcal. So the live gauge, a manually logged session and the day's own
+    // figures all mean the same thing.
+    //
+    // Calories used to be billed HERE, per second, from an inline copy of
+    // Keytel with no activity gate and no resting floor. That copy charged the
+    // full active rate at any heart rate the band reported, so the number on
+    // the gauge did not survive the re-score of its own stream.
     // Push to the Live Activity at most ~every 4s (ActivityKit throttles; saves battery).
-    if (DateTime.now().difference(_lastLaPush).inSeconds >= 4) {
+    // Skipped entirely while HR is absent: the widget's channel takes a
+    // non-null int, so the only way to push "no reading" today would be to send
+    // 0 bpm, which is a fabricated measurement on the lock screen. Holding the
+    // last frame is the lesser wrong until `LiveActivity.update` takes `int?`.
+    if (hr != null && DateTime.now().difference(_lastLaPush).inSeconds >= 4) {
       _lastLaPush = DateTime.now();
       LiveActivity.update(
-        hr: w.currentHr,
-        zone: _zoneFor(w.currentHr),
-        // The Live Activity widget has no absent state; the in-app gauge
-        // shows "—" when strain or calories are null, this pushes 0.
-        strain: w.strain ?? 0,
-        calories: w.caloriesOrNull ?? 0,
-        maxHr: _maxHr,
+        hr: hr,
+        zone: _zoneFor(hr),
+        // Absent stays absent. These used to be coerced to 0, so a new user
+        // with no profile anchors — the case where both correctly abstain and
+        // the in-app gauge shows "—" — got a confident "0 kcal" pushed to the
+        // lock screen for the whole session. Unmeasured is not zero.
+        strain: w.strain,
+        calories: w.caloriesOrNull,
+        maxHr: w.hrMax?.round() ?? 0, // 0 = no ceiling; the widget ignores it
         rhr: _restingHr,
       );
     }
@@ -4652,8 +6353,15 @@ class LiveWorkoutState {
   final String type; // exercise type label
   Duration elapsed = Duration.zero;
 
-  /// Accrued kcal. Zero here is ambiguous on its own — read [caloriesOrNull]
-  /// anywhere a user can see it.
+  /// Live kcal for the bout so far. Zero here is ambiguous on its own — read
+  /// [caloriesOrNull] anywhere a user can see it.
+  ///
+  /// RECOMPUTED from the retained per-minute series on every sample, not
+  /// accrued. Same reason [strain] is: [restingHr] is loaded asynchronously and
+  /// can land after the session starts, and it sets the gate that decides
+  /// whether a minute is billed at the active or the resting rate. An
+  /// incremental tally could only ever have corrected the seconds after the
+  /// anchor arrived, leaving the earlier ones scored against a guess.
   double calories = 0.0;
 
   /// Whether the calorie estimate has run even once this session.
@@ -4666,15 +6374,104 @@ class LiveWorkoutState {
   /// that case as absent; this makes calories agree.
   bool _caloriesScored = false;
 
-  /// Accrued kcal, or null when this session was never costed at all — either
-  /// the profile lacks the anchors Keytel needs, or no heart rate ever
-  /// arrived. Absent beats fabricated, and absent also beats a confident zero.
+  /// Live kcal, or null when this session cannot be costed at all — the
+  /// profile lacks the anchors Keytel needs, no resting HR has arrived to set
+  /// the bout gate, or no heart rate ever landed. Absent beats fabricated, and
+  /// absent also beats a confident zero.
   int? get caloriesOrNull => _caloriesScored ? calories.round() : null;
 
-  /// Record a per-second slice. The only writer of [calories].
-  void accrueCalories(double kcal) {
+  /// Re-cost the bout so far. The only writer of [calories].
+  ///
+  /// Uses the SAME published rates, coefficients and activity gate as
+  /// `Calories.estimateBoutCalories`, which is what the substrate re-score and
+  /// every manually logged session run on — so the figure on the live gauge
+  /// survives its own re-score. It used to bill the raw Keytel active rate for
+  /// every second the band reported a heart rate, with no gate and no resting
+  /// floor, which roughly doubled the cost of warm-up, rest between sets and
+  /// cool-down against what the re-score would later say about the same stream.
+  ///
+  /// PER SAMPLE, not per minute. [_secondsByBpm] holds how many seconds the
+  /// bout spent at each whole-bpm value, so this reproduces
+  /// `estimateBoutCalories`'s sample-by-sample billing exactly while staying
+  /// O(distinct bpm) in memory instead of retaining every raw sample.
+  ///
+  /// It scored per MINUTE, off the mean of each minute, and that lost the two
+  /// things the re-score gets right:
+  ///
+  ///   * The gate is per sample there and was per minute-mean here. A minute
+  ///     that straddles the gate — 30 s at 93 and 30 s at 94 against a 93.76
+  ///     gate — billed as a whole resting minute (1.19 kcal) where the
+  ///     re-score bills half of it active (3.63). About 146 kcal adrift over a
+  ///     zone-2 hour, in a stream that never looks unusual.
+  ///   * The seconds were wrong. A completed minute billed a flat 60 s no
+  ///     matter how few samples backed it, and the minute in progress billed
+  ///     `_minuteCount`, a SAMPLE count used as a second count — 12 s instead
+  ///     of 60 at a 5 s notify rate.
+  void _scoreCalories() {
+    final rhr = restingHr;
+    // Local copy: a public final field does not type-promote across the guard.
+    final maxHr = hrMax;
+    // The re-score refuses to invent a 220/60 anchor pair, so neither does
+    // this. A resting HR landing later re-scores the whole bout.
+    if (!profile.hasCalorieAnchors || rhr == null || maxHr == null) {
+      _caloriesScored = false;
+      calories = 0.0;
+      return;
+    }
+    // THE gate, from the one place that defines it. This used to be the
+    // arithmetic inlined below, which is the third copy of it — and
+    // `Calories`' own docstring says a second copy is how the day and the bout
+    // came to disagree in the first place. It also got none of the anchor
+    // validation: a non-finite resting HR makes the gate NaN, every
+    // `bpm < gate` is then false, and EVERY sample bills at the active rate.
+    // Null means the anchors cannot define a gate, and the live gauge abstains
+    // exactly as the re-score does.
+    final gate = ana.Calories.activeGateHr(maxHr, rhr);
+    if (gate == null) {
+      _caloriesScored = false;
+      calories = 0.0;
+      return;
+    }
+    if (_secondsByBpm.isEmpty && _lastSampleHr == null) {
+      _caloriesScored = false;
+      calories = 0.0;
+      return;
+    }
+
+    final age = profile.ageYears!.toDouble();
+    final weightKg = profile.weightKg!;
+    final coeffs = ana.Calories.resolveCoeffs(workoutSex(profile.sex));
+    // Height is not a Keytel term; it only moves the Harris-Benedict resting
+    // floor. Defaulted to match `computeManualSessionStats`, so the two paths
+    // cannot disagree for a profile that carries no height.
+    final heightCm = profile.heightCm ?? 170.0;
+    final restingRate =
+        ana.Calories.restingKcalPerS(coeffs, weightKg, heightCm, age);
+
+    var kcal = 0.0;
+    void bill(int bpm, double seconds) {
+      final rate = bpm < gate
+          ? restingRate
+          : ana.Calories.activeKcalPerS(
+              coeffs,
+              bpm.toDouble(),
+              maxHr,
+              weightKg,
+              age,
+            );
+      kcal += rate * seconds;
+    }
+
+    _secondsByBpm.forEach(bill);
+    // The newest sample has no successor yet, so its own duration is unknown.
+    // `estimateBoutCalories` gives the final sample one representative second;
+    // matching that is what keeps the gauge and the re-score equal at every
+    // instant rather than only at the end.
+    final trailing = _lastSampleHr;
+    if (trailing != null) bill(trailing, 1.0);
+
+    calories = kcal;
     _caloriesScored = true;
-    calories += kcal;
   }
 
   /// Headline 0–21 strain, or null when the profile lacks an anchor the
@@ -4684,17 +6481,13 @@ class LiveWorkoutState {
   /// method reads 11.62 for the same hour, and passed the top of its own 0–21
   /// scale after ~50 minutes of hard work, which the gauge silently clamped.
   double? strain;
-  int currentHr = 0;
-  int maxHrSeen = 0; // spike-suppressed peak live HR this session (issue #127)
 
-  /// Milestone keys already announced this SESSION ("t5", "k200", "mhr178"…).
-  ///
-  /// Lives here, not on the live-session screen's State, because the screen is
-  /// disposed and rebuilt every time the athlete navigates away and back — so
-  /// a screen-local set forgot everything and re-fired the same milestone
-  /// (banner, haptic and confetti) on every return. The workout is the thing
-  /// a milestone belongs to, so the workout remembers it.
-  final Set<String> firedMilestones = {};
+  /// The live heart rate this session is currently being scored against, or
+  /// null when the band is not delivering one (dropped, or stalled — see
+  /// [AppState.liveHr]). Null, not 0: a session with no reading is unmeasured,
+  /// not resting, and `_zoneFor(0)` is a real answer to a question nobody asked.
+  int? currentHr;
+  int maxHrSeen = 0; // spike-suppressed peak live HR this session (issue #127)
 
   /// Rolling-median accumulator behind [maxHrSeen] — smooths the live 1 Hz HR
   /// at accrual so a transient PPG motion spike can't set the session max (or
@@ -4717,6 +6510,28 @@ class LiveWorkoutState {
   /// the profile happens to say when the session ends.
   final Profile profile;
 
+  /// THE HR ceiling for this session — `estimatedMaxHr(age, family)`, resolved
+  /// once at start from the athlete's age and the strap measuring the window.
+  /// Null when either is missing, and then strain, calories and the zone split
+  /// all abstain: there is no ceiling to be a percentage of.
+  ///
+  /// This is the STRAIN/CALORIE anchor only. The zone split reads [zoneSet],
+  /// which may be banded on a MEASURED ceiling while this stays the age
+  /// estimate — see the comment there.
+  final double? hrMax;
+
+  /// THE zone set this session's per-second split is binned with (TS-04),
+  /// resolved once at start from `trainingZones` — the same function the day
+  /// pipeline and the detail screen's `zone_bands` use, so the live gauge, the
+  /// persisted `zone_min` and the recomputed bands cannot disagree about one
+  /// heartbeat.
+  ///
+  /// Deliberately NOT derived from [hrMax]. Once the band has observed a
+  /// ceiling, zones move onto it and onto the measured resting HR; strain does
+  /// not, because moving it would rewrite every strain score ever shown. Two
+  /// anchors, named, beats one anchor quietly used for both.
+  final ana.HeartRateZoneSet? zoneSet;
+
   /// Resting-HR anchor for the strain score. NOT final: the measured nightly
   /// value is loaded asynchronously, so a session can begin before it lands.
   /// [AppState._refreshNightlyRhr] back-fills it here when it arrives, and the
@@ -4728,17 +6543,66 @@ class LiveWorkoutState {
   /// Per-minute mean HR, the unit Banister TRIMP weights. Live HR arrives at
   /// 1 Hz, so it is folded into the current minute here rather than kept as
   /// thousands of raw samples.
-  final List<double> _perMinuteHr = [];
+  /// DENSE — index IS the session minute, `null` where no sample arrived.
+  ///
+  /// This used to be a plain `List<double>` that only grew when a minute had
+  /// samples, so a band dropout from minute 10 to 20 produced a 30-entry list
+  /// for a 40-minute session. The summary drawn the moment you press stop maps
+  /// index to x, so it joined minute 9 straight to minute 21 and drew every
+  /// later reading ten minutes early — while the SAME session reopened from
+  /// History was dense (`_denseMinutes`) and showed the gap correctly.
+  final List<double?> _perMinute = [];
   int _minuteBucket = -1;
   double _minuteSum = 0;
   int _minuteCount = 0;
 
   /// Per-minute means INCLUDING the minute still in progress, so the live
   /// gauge moves within the first minute instead of sitting at zero for 60 s.
-  List<double> perMinuteHr() => [
-        ..._perMinuteHr,
-        if (_minuteCount > 0) _minuteSum / _minuteCount,
-      ];
+  /// Dense: one slot per session minute, `null` for a minute nothing reached.
+  List<double?> perMinuteHrDense() {
+    final out = <double?>[..._perMinute];
+    if (_minuteCount > 0 && _minuteBucket >= 0) {
+      while (out.length <= _minuteBucket) {
+        out.add(null);
+      }
+      out[_minuteBucket] = _minuteSum / _minuteCount;
+    }
+    return out;
+  }
+
+  /// The same series with the holes removed — for statistics (strain, mean),
+  /// which want the readings and not the time axis.
+  List<double> perMinuteHr() => [for (final v in perMinuteHrDense()) ?v];
+
+  /// Seconds the bout has spent at each whole-bpm value — the calorie series.
+  ///
+  /// Deliberately NOT the per-minute means above. `estimateBoutCalories`, which
+  /// the substrate re-score and every manually logged session run on, decides
+  /// active-vs-resting per SAMPLE and weights each sample by the elapsed time to
+  /// the next one. A per-minute mean cannot express either: it collapses a
+  /// minute that straddles the activity gate onto one side of it, and it has no
+  /// idea how many seconds actually backed the samples in it.
+  ///
+  /// A histogram rather than a sample list because heart rate is a small
+  /// integer — this is bounded at a couple of hundred entries for a bout of any
+  /// length, while retaining raw 1 Hz samples is not.
+  final Map<int, double> _secondsByBpm = {};
+
+  /// The most recent accepted sample, still unbilled: its duration is the time
+  /// until the NEXT sample, which has not arrived. Also what makes a gap in the
+  /// stream bill correctly — the sample before a contact-loss gap is charged
+  /// for the gap, capped, exactly as the re-score charges it.
+  int? _lastSampleHr;
+  double? _lastSampleSec;
+
+  /// A stream that stops for longer than this stopped being one bout; billing
+  /// the pre-gap heart rate across an hour of no data would invent the hour.
+  ///
+  /// Taken from the analytics constant rather than restated, because the whole
+  /// point of this scoring path is that it gives up at the same instant the
+  /// re-score of the same stream does. A second literal 150.0 here would agree
+  /// today and diverge silently the day the published cap moved.
+  static const double _gapCapS = ana.Calories.defaultMergeGapCapS;
 
   LiveWorkoutState({
     required this.startTime,
@@ -4747,21 +6611,58 @@ class LiveWorkoutState {
     this.type = 'other',
     int? age,
     this.profile = const Profile(),
+    this.hrMax,
+    this.zoneSet,
     this.restingHr,
-  }) : _hrPeak = RollingMaxHr(age: age);
+  })  : _hrPeak = RollingMaxHr(age: age),
+        idleWatch = WorkoutIdleWatch(startedAt: startTime);
 
-  /// Feed a live 1 Hz HR sample; updates the spike-suppressed [maxHrSeen], the
-  /// per-minute accumulator, and the Banister strain derived from it.
+  /// The forgotten-session watch — see [WorkoutIdleWatch]. Anchored on
+  /// [startTime], which for a session the reconcile path rehydrated is the
+  /// ORIGINAL start hours ago: the most forgotten a workout can be is exactly
+  /// when the first tick should already be allowed to ask.
+  final WorkoutIdleWatch idleWatch;
+
+  /// Feed a live HR sample; updates the spike-suppressed [maxHrSeen], the
+  /// per-minute accumulator behind strain, the per-bpm second counts behind
+  /// calories, and both derived figures.
+  ///
+  /// A non-positive reading is off-skin, not a heart rate, so it is dropped —
+  /// but the time it covers is NOT thrown away. It is billed to the last real
+  /// sample when the next one arrives, capped at [_gapCapS], which is what
+  /// `estimateBoutCalories` does with the same gap once the zeros have been
+  /// filtered out of the stream it re-scores.
   void accrueHr(int hr) {
     if (hr <= 0) return;
     _hrPeak.add(hr);
     if (_hrPeak.max > maxHrSeen) maxHrSeen = _hrPeak.max;
 
+    // Close out the previous sample: its duration is the time until this one.
+    // Sub-second and out-of-order arrivals fall back to one second, matching
+    // `estimateBoutCalories`'s handling of a non-positive gap.
+    final nowSec = elapsed.inMicroseconds / Duration.microsecondsPerSecond;
+    final prevHr = _lastSampleHr;
+    final prevSec = _lastSampleSec;
+    if (prevHr != null && prevSec != null) {
+      final gap = nowSec - prevSec;
+      final dur = gap > 0 ? math.min(gap, _gapCapS) : 1.0;
+      _secondsByBpm[prevHr] = (_secondsByBpm[prevHr] ?? 0) + dur;
+    }
+    _lastSampleHr = hr;
+    _lastSampleSec = nowSec;
+
     // Fold into the current minute, measured from the session start so the
     // buckets are the session's own minutes rather than wall-clock ones.
     final minute = elapsed.inMinutes;
     if (minute != _minuteBucket) {
-      if (_minuteCount > 0) _perMinuteHr.add(_minuteSum / _minuteCount);
+      // Close the finished bucket AT ITS OWN INDEX, padding the minutes that
+      // produced nothing with null rather than skipping them.
+      if (_minuteCount > 0 && _minuteBucket >= 0) {
+        while (_perMinute.length <= _minuteBucket) {
+          _perMinute.add(null);
+        }
+        _perMinute[_minuteBucket] = _minuteSum / _minuteCount;
+      }
       _minuteBucket = minute;
       _minuteSum = 0;
       _minuteCount = 0;
@@ -4776,6 +6677,12 @@ class LiveWorkoutState {
       perMinuteHr(),
       profile: profile,
       restingHr: restingHr,
+      hrMax: hrMax,
     );
+
+    // Calories re-score off the same series, through the same estimator the
+    // substrate re-score uses, so both live figures on the gauge mean the same
+    // thing the finished session will.
+    _scoreCalories();
   }
 }

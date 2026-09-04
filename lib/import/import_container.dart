@@ -26,7 +26,9 @@
 // imported for real; anything we cannot use gets a message naming the file we
 // DO want, instead of a byte offset.
 
+import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
@@ -109,6 +111,111 @@ Future<ImportContainer> sniffFile(String path) async {
   }
 }
 
+/// The header row every NOOP raw-sensor CSV starts with. Same signature the
+/// reader itself matches on (noop_import.dart), so the router and the parser
+/// cannot disagree about what a NOOP CSV is.
+const String kNoopCsvHeader = 'unix_s,';
+
+/// How much of a text file the router reads to find its first record.
+const int _headBytes = 4096;
+
+/// True when the first RECORD of [text] is one the NOOP reader accepts.
+///
+/// The router used to ask whether byte zero began the header. The reader does
+/// not: it skips blank and `#` lines first, and it falls back to the
+/// documented positional layout when a file carries no header at all. So a
+/// NOOP export with a preamble, or a legacy headerless one, was handed to the
+/// vendor importer and refused with a confident wrong message — the same class
+/// of misroute (#160, #199) this function exists to end.
+///
+/// [truncated] says the buffer stopped mid-file, in which case the trailing
+/// fragment is not a whole line and is not judged.
+bool noopCsvFirstRecordMatches(String text, {bool truncated = false}) {
+  final lines = text.split('\n');
+  if (truncated && !text.endsWith('\n')) lines.removeLast();
+  for (var line in lines) {
+    line = line.trimRight(); // a CRLF export's \r
+    if (line.isEmpty || line.startsWith('#')) continue;
+    if (line.startsWith(kNoopCsvHeader)) return true;
+    // Headerless, i.e. [NoopImporter._defaultCols]: unix seconds in column 0
+    // and the full documented column count behind it. Deliberately structural
+    // — a vendor CSV's first field is a formatted date, never an epoch.
+    final f = line.split(',');
+    final ts = f.isEmpty ? null : int.tryParse(f.first.trim());
+    return f.length >= 15 && ts != null && ts > 1000000000 && ts < 4100000000;
+  }
+  return false;
+}
+
+/// True when [path] is a NOOP export — judged by CONTENT, not by name.
+///
+/// The onboarding router used to switch on the extension: `.noopbak`/`.zip`
+/// meant NOOP, anything else meant the vendor importer. Both halves were wrong
+/// in opposite directions (#160, #199). NOOP's Android "raw sensor CSV" export
+/// is a plain `.csv`, so it went to the vendor importer and the user was told
+/// to re-download it with WHOOP set to English. A WHOOP "My Data" export is a
+/// ZIP of CSVs — the shape WHOOP actually hands you — so it went to the NOOP
+/// importer and was refused for holding too many files. Two confident, wrong
+/// messages for two correct files.
+///
+/// The signatures: a raw-sensor CSV's FIRST RECORD is [kNoopCsvHeader] or the
+/// documented positional layout ([noopCsvFirstRecordMatches]); a `.noopbak`
+/// (or a backup someone unpacked by hand) is a SQLite database; a WHOOP export
+/// is an archive of several named CSVs and matches neither.
+Future<bool> isNoopExport(String path) async {
+  final List<int> head;
+  final raf = await File(path).open();
+  try {
+    // Enough to reach the first RECORD, not just the first byte — see
+    // [noopCsvFirstRecordMatches]. The container sniff still only reads the
+    // magic at the front.
+    //
+    // One byte PAST the window, because "the buffer filled" and "the file
+    // stopped" are the same length otherwise: a file of exactly [_headBytes]
+    // read as truncated loses its last record, and a one-record export with no
+    // trailing newline loses the only record it has.
+    head = await raf.read(_headBytes + 1);
+  } finally {
+    await raf.close();
+  }
+  switch (sniffImportContainer(head.take(64).toList())) {
+    case ImportContainer.text:
+      return noopCsvFirstRecordMatches(String.fromCharCodes(head),
+          truncated: head.length > _headBytes);
+    case ImportContainer.sqlite:
+      return true;
+    case ImportContainer.zip:
+      return _zipHoldsNoopExport(path);
+    default:
+      // gzip, UTF-16, binary: not something the NOOP path claims. Whatever
+      // picks them up owns the message.
+      return false;
+  }
+}
+
+Future<bool> _zipHoldsNoopExport(String path) async {
+  final input = InputFileStream(path);
+  try {
+    final files =
+        ZipDecoder().decodeStream(input).files.where((f) => f.isFile);
+    // A `.noopbak` is a ZIP around NOOP's SQLite database.
+    if (files.any((f) => _isDbMember(f.name))) return true;
+    // ponytail: member COUNT, not member content. A ZIP member is deflated and
+    // this package can only inflate it whole, so reading one header line off a
+    // hundreds-of-megabyte raw export would materialise the entire thing just
+    // to classify it. A WHOOP export always ships several named CSVs; the only
+    // NOOP CSV-in-a-ZIP is one a user zipped by hand. If a single-file vendor
+    // export ever turns up, this needs a bounded member read instead.
+    return files.where((f) => _isCsvMember(f.name)).length == 1;
+  } catch (_) {
+    // Unreadable as an archive. Not a NOOP export as far as routing goes; the
+    // importer that takes it produces the message.
+    return false;
+  } finally {
+    await input.close();
+  }
+}
+
 /// True for a ZIP member we can actually parse as an export.
 bool _isCsvMember(String name) {
   final base = p.basename(name).toLowerCase();
@@ -125,6 +232,18 @@ bool _isCsvMember(String name) {
 /// export really is hundreds of megabytes.
 const int _kMaxArchiveMembers = 5000;
 const int _kMaxUncompressedBytes = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+/// Ceiling for a STREAMED gzip inflate, which is a different problem from the
+/// ZIP one above: there the size is declared in the member header and can be
+/// refused before a byte is written, whereas gzip declares nothing, so the only
+/// way to refuse one is to count bytes that are already landing on disk. A
+/// ceiling in the multi-gigabyte range is therefore no protection at all on a
+/// phone — the storage is gone long before the guard trips. 2 GiB is more than
+/// an order of magnitude above the largest real database this app produces and
+/// still leaves a device with room to notice. Dart has no portable free-space
+/// API, so this is the bound available; the partial file is deleted on the way
+/// out either way.
+const int _kMaxInflatedBytes = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// CSV files on disk for an import, plus the temp directory (if any) that has
 /// to be cleaned up once they have been read.
@@ -177,6 +296,134 @@ class ResolvedNoopDatabase {
   }
 }
 
+/// Inflate a gzip file into [dir] and return the path, or null if [path] is not
+/// gzip.
+///
+/// STREAMED with a running ceiling rather than decoded in memory. A gzip
+/// declares nothing about its output size, so the only way to refuse a
+/// pathological one is to count bytes as they land and stop — and the file this
+/// most often is (a full database backup) is exactly the size that must never
+/// be buffered twice.
+///
+/// VERIFIED against the gzip trailer, which the decoder alone does not get to.
+/// A gzip ends with a CRC32 and an ISIZE over the uncompressed bytes, and zlib
+/// does check them — but only on reaching the end of the stream. A stream that
+/// simply STOPS never gets there, and Dart's decoder returns whatever it
+/// managed to inflate without raising. So a backup truncated to 99.9% inflated
+/// cleanly, sniffed as SQLite, merged, and reported success one row short of
+/// what the user was restoring; a half-synced iCloud or Nextcloud copy is
+/// exactly the case restore exists for. Cuts between 50% and 99% were caught
+/// only incidentally, by sqlite, and surfaced as a raw ffi exception rather
+/// than something a user could act on. Reading the trailer off the file instead
+/// of waiting for the decoder to reach it catches every cut at the container,
+/// where the message can name what is wrong.
+///
+/// Single-member gzip only, which is what every writer in this app produces.
+/// Concatenated members would carry a trailer per member and be rejected here.
+///
+/// The caller owns [dir] and the file inside it.
+Future<String?> inflateGzip(String path, Directory dir) async {
+  if (await sniffFile(path) != ImportContainer.gzip) return null;
+
+  var base = p.basename(path);
+  if (base.toLowerCase().endsWith('.gz')) {
+    base = base.substring(0, base.length - 3);
+  }
+  if (base.isEmpty) base = 'inflated';
+  final destPath = p.join(dir.path, base);
+  final sink = File(destPath).openWrite();
+  var written = 0;
+  var crc = 0;
+  // COUNT INSIDE A TRANSFORMER, then `pipe`. The obvious `await for (…)
+  // sink.add(chunk)` reads as streaming but is not: `IOSink.add` queues without
+  // back-pressure, so an inflate that outruns the disk buffers the ENTIRE
+  // inflated database in memory — the 256 MB-heap OOM this file's header is
+  // about, reintroduced by the code meant to avoid it. `pipe` goes through
+  // `addStream`, which pauses the source while a write is in flight, and the
+  // transformer propagates that pause upstream to the decoder.
+  final counted = StreamTransformer<List<int>, List<int>>.fromHandlers(
+    handleData: (chunk, out) {
+      written += chunk.length;
+      if (written > _kMaxInflatedBytes) {
+        out.addError(
+          ImportFormatException(
+            '“${p.basename(path)}” unpacks to more than '
+            '${_kMaxInflatedBytes ~/ (1024 * 1024 * 1024)} GB, which is not '
+            'something we can import.',
+          ),
+        );
+        out.close();
+        return;
+      }
+      // Folded into the same pass as the ceiling: the inflated bytes are only
+      // in memory here, and re-reading the restored file to checksum it would
+      // double the I/O on a multi-hundred-MB backup.
+      crc = getCrc32(chunk, crc);
+      out.add(chunk);
+    },
+  );
+  try {
+    await File(path).openRead().transform(gzip.decoder).transform(counted).pipe(sink);
+    await _checkGzipTrailer(path, written: written, crc: crc);
+  } catch (e) {
+    try {
+      await sink.close();
+    } catch (_) {}
+    try {
+      final partial = File(destPath);
+      if (await partial.exists()) await partial.delete();
+    } catch (_) {}
+    if (e is ImportFormatException) rethrow;
+    throw ImportFormatException(
+      'Could not read “${p.basename(path)}” as a gzip archive: $e',
+    );
+  }
+  return destPath;
+}
+
+/// Compare the gzip trailer of [path] against what actually came out of the
+/// decoder, and throw [ImportFormatException] when they disagree.
+///
+/// The last eight bytes of a gzip member are CRC32 then ISIZE, both
+/// little-endian over the UNCOMPRESSED data, ISIZE modulo 2^32. Either one
+/// mismatching means the file we read is not the file that was written — the
+/// usual cause being a copy that was still syncing.
+Future<void> _checkGzipTrailer(
+  String path, {
+  required int written,
+  required int crc,
+}) async {
+  final file = File(path);
+  final length = await file.length();
+  // 10-byte header + 2-byte empty deflate block + 8-byte trailer is the
+  // smallest possible gzip; anything shorter lost its trailer outright.
+  if (length < 18) throw _gzipTruncated(path);
+
+  final raf = await file.open();
+  final Uint8List trailer;
+  try {
+    await raf.setPosition(length - 8);
+    trailer = await raf.read(8);
+  } finally {
+    await raf.close();
+  }
+  if (trailer.length != 8) throw _gzipTruncated(path);
+
+  final expectedCrc =
+      trailer[0] | trailer[1] << 8 | trailer[2] << 16 | trailer[3] << 24;
+  final expectedSize =
+      trailer[4] | trailer[5] << 8 | trailer[6] << 16 | trailer[7] << 24;
+  if (written % 0x100000000 != expectedSize || crc != expectedCrc) {
+    throw _gzipTruncated(path);
+  }
+}
+
+ImportFormatException _gzipTruncated(String path) => ImportFormatException(
+  '“${p.basename(path)}” is incomplete or damaged — the compressed data does '
+  'not match the checksum stored in the file. If it came from a cloud folder, '
+  'wait for it to finish downloading, or export it again.',
+);
+
 /// If [path] is a NOOP full backup, return its database ready to open.
 ///
 /// Handles both shapes users arrive with: the `.noopbak` itself (a ZIP whose
@@ -192,6 +439,26 @@ Future<ResolvedNoopDatabase?> resolveNoopDatabase(String path) async {
       return ResolvedNoopDatabase(path, null);
     case ImportContainer.zip:
       break;
+    case ImportContainer.gzip:
+      // A gzipped database — the shape this app's own auto-backups take, and
+      // what `gzip -k` leaves behind for anyone compressing an export by hand.
+      // Inflate, then re-sniff: only a real SQLite file is claimed here, so a
+      // gzipped CSV still falls through to the CSV path.
+      final tempDir = await Directory.systemTemp.createTemp('openstrap_gz_');
+      try {
+        final inflated = await inflateGzip(path, tempDir);
+        if (inflated != null &&
+            await sniffFile(inflated) == ImportContainer.sqlite) {
+          return ResolvedNoopDatabase(inflated, tempDir);
+        }
+      } catch (_) {
+        // Not readable as gzip — let the CSV path produce the user-facing
+        // message rather than throwing a database-flavoured one here.
+      }
+      try {
+        if (tempDir.existsSync()) await tempDir.delete(recursive: true);
+      } catch (_) {}
+      return null;
     default:
       return null;
   }
@@ -262,10 +529,24 @@ Future<ResolvedNoopDatabase?> resolveNoopDatabase(String path) async {
           'of space. Free some up and try again.',
         );
       }
-      if (db.size > 0 && written > db.size) {
+      // CRC is checked whenever the archive gives us one — not only on an
+      // over-run. A REAL NOOP export (10.5.0, measured 2026-08) has been seen
+      // shaped exactly like the over-run case below: the zip's own
+      // uncompressed-size field for `noop-backup.sqlite` undercounts the true
+      // content by a few thousand pages, while the archive's CRC-32 —
+      // computed over the FULL decompressed stream, not the declared length —
+      // matches what actually came out. That is a bug in whatever wrote the
+      // zip (its size field went stale before the deflate stream did), not a
+      // truncated or tampered file, and `unzip -t` reports the very same file
+      // as OK because it validates by CRC. Trust the CRC the same way — but
+      // an exact-size extraction can ALSO be silently wrong (same length,
+      // different bytes), which checking only `written > db.size` would miss
+      // entirely, so this runs for `written >= db.size`, not just the overrun.
+      final crc = db.crc32;
+      if (db.size > 0 && crc != null && await _fileCrc32(destPath) != crc) {
         throw ImportFormatException(
           '“${p.basename(path)}” does not hold what it says it does — its '
-          'database unpacked to more than the archive declared. It is likely '
+          'database does not match the archive checksum. It is likely '
           'damaged; export it again.',
         );
       }
@@ -284,6 +565,17 @@ Future<ResolvedNoopDatabase?> resolveNoopDatabase(String path) async {
   } finally {
     await input.close();
   }
+}
+
+/// CRC-32 of a file's whole content, read in chunks — this runs on the
+/// unpacked database (hundreds of MB to a couple of GB), and loading it whole
+/// just to checksum it would double the memory an import already costs.
+Future<int> _fileCrc32(String path) async {
+  var crc = 0;
+  await for (final chunk in File(path).openRead()) {
+    crc = getCrc32(chunk, crc);
+  }
+  return crc;
 }
 
 /// Resolve the picked paths into CSV files on disk, unwrapping ZIP archives.
@@ -328,10 +620,27 @@ Future<ResolvedImportFiles> resolveImportCsvPaths(
             'export.',
           );
         case ImportContainer.gzip:
-          throw ImportFormatException(
-            '“${p.basename(path)}” is a gzip archive. Unzip it first and pick '
-            'the CSV inside.',
-          );
+          // Used to be a flat refusal ("unzip it first"). It is inflated now:
+          // gzip is what every command-line tool and most file managers produce
+          // when someone compresses a CSV, and it is the shape this app's own
+          // auto-backups take.
+          tempDir ??=
+              await Directory.systemTemp.createTemp('openstrap_import_');
+          final gzInto = Directory(p.join(tempDir.path, 'a${archiveIndex++}'));
+          await gzInto.create(recursive: true);
+          final inflated = await inflateGzip(path, gzInto);
+          // Re-sniff rather than assume: a gzipped ZIP or database is still not
+          // a CSV, and the message for those should say so.
+          final inner = inflated == null
+              ? ImportContainer.binary
+              : await sniffFile(inflated);
+          if (inner != ImportContainer.text) {
+            throw ImportFormatException(
+              '“${p.basename(path)}” unpacks to something that is not a '
+              '$flavor CSV export.',
+            );
+          }
+          out.add(inflated!);
         case ImportContainer.utf16:
           throw ImportFormatException(
             '“${p.basename(path)}” is saved as UTF-16 text. Re-save it as '

@@ -12,9 +12,173 @@
 // offset), with a noon-to-noon fallback so a day always exists when there's data.
 
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:openstrap_analytics/onehz.dart' as ana;
 import 'package:openstrap_protocol/openstrap_protocol.dart' as proto;
+
+import '../data/day_label.dart';
+
+/// Minimum fraction of a nocturnal search window that must carry a REAL
+/// gravity vector before accel-led (van Hees) sleep detection is trusted.
+///
+/// Below this we do not run it at all and fall through to the HR-led window,
+/// which is already the honest low-confidence degraded mode. Set at a half
+/// rather than something tiny on purpose: van Hees picks the LONGEST immobile
+/// block, and absent seconds are maximally "immobile", so a window that is
+/// mostly absent would reliably hand the answer to the missing data.
+const double kMinAccelCoverageForVanHees = 0.5;
+
+/// Physiological bound on a 1 Hz heart rate (bpm), inclusive.
+///
+/// HUMAN PHYSIOLOGY, NOT A SENSOR PROPERTY, so it is the same number on every
+/// band: no heart beats 24 times a minute or 231 times a minute for a whole
+/// second. Nothing about the strap moves it, which is why it does not go
+/// through `calibrationFor` and why an unstamped record still gets it.
+///
+/// It exists because the gen4 TRUSTED decode path (v24 / v12) returns the HR
+/// byte verbatim with no bound — the protocol's `_physiologicallyPlausible`
+/// gate runs only on the best-effort versions, and gen5 v18 bounds it
+/// independently — so one corrupt-but-CRC-valid byte of 250 used to pass the
+/// `hr > 0` filter and land straight in the day's max HR. Applying it in the
+/// protocol would cost the WHOLE record (accel and RR with it); applied here it
+/// costs only the second.
+const int kMinPlausibleHr = 25;
+const int kMaxPlausibleHr = 230;
+
+/// [raw] when it is a heart rate a human can have, else NULL — the reading is
+/// refused, never clamped to the bound (a corrupt byte must not become a
+/// plausible reading) and never reported as a measurement of anything else.
+///
+/// Callers that must land it in the dense [Substrate.hr] array write
+/// `plausibleHrOrNull(raw) ?? 0`, 0 being that array's ONE "no usable HR this
+/// second" value — see [Substrate.hr] for why that is not a claim about wear.
+int? plausibleHrOrNull(int raw) =>
+    (raw >= kMinPlausibleHr && raw <= kMaxPlausibleHr) ? raw : null;
+
+/// Physiological bound on one R-R interval (ms), inclusive — the [kMinPlausibleHr]
+/// / [kMaxPlausibleHr] window expressed as the gap between two beats, widened
+/// at the long end because a single interval is not a rate: one dropped beat
+/// doubles the gap without the heart doing anything unusual, and 2,400 ms still
+/// sits inside the range an ordinary Malik/Lipponen ectopic filter is built to
+/// see and correct. Below 250 ms (240 bpm sustained across one beat) it is not
+/// a beat detection.
+const int kMinPlausibleRrMs = 250;
+const int kMaxPlausibleRrMs = 2400;
+
+/// [rrMs] when it is an interval a human heart can produce, else NULL.
+double? plausibleRrOrNull(num rrMs) =>
+    (rrMs >= kMinPlausibleRrMs && rrMs <= kMaxPlausibleRrMs)
+        ? rrMs.toDouble()
+        : null;
+
+/// The largest acceleration MAGNITUDE (g) a wrist can hold for a WHOLE SECOND.
+///
+/// These samples are one-second gravity vectors, not raw 100 Hz: an impact, a
+/// swing and a free-fall are all sub-second transients that average away before
+/// they get here, so this bounds a SUSTAINED magnitude, not a peak. Holding 4 g
+/// for a full second is ~3 g of net force for a second — aerobatics and
+/// centrifuges, not anything a band is worn through.
+///
+/// It is deliberately NOT the part's full-scale range: an FSR is an encoding
+/// choice, and a part configured to +/-2 g with a scale-error decoder sails
+/// through a +/-16 g test. It is also deliberately far above protocol's
+/// `_physiologicallyPlausible` gravity window (magSq 0.25..3.24, i.e. 0.5..1.8 g),
+/// which assumes a low-pass-filtered gravity vector and had to be dropped from
+/// the gen5 decoder in 539a97b because it rejected real workout seconds. There
+/// is no lower bound here for the same reason: sustained low-g seconds are real
+/// and only EXACT zero is evidence of a fill.
+const double kMaxSustainedAccelG = 4.0;
+
+/// Whether a 1 Hz gravity triplet is a MEASUREMENT.
+///
+/// Two rejections, both physical:
+///   * exact `(0, 0, 0)` — no accelerometer reads zero on all three axes at
+///     rest or in motion, so it is an all-zero payload (see
+///     [Substrate.accelPresentAt] for what that costs if it is trusted).
+///   * a magnitude above [kMaxSustainedAccelG] — see there.
+bool accelPlausible(double ax, double ay, double az) {
+  final magSq = ax * ax + ay * ay + az * az;
+  return magSq > 0 && magSq <= kMaxSustainedAccelG * kMaxSustainedAccelG;
+}
+
+/// Where each beat in one record actually sits, in absolute epoch ms — or
+/// null for a beat that cannot be placed. One entry per entry in [rrMs].
+///
+/// TWO PARTS, AND THEY ARE NOT EQUALLY SOLID. Read them separately.
+///
+/// THE ANCHOR IS MEASURED. `rec_ts + tsSubsec/32768` is the record's own
+/// timestamp, whole seconds and sub-second, exactly as the strap sent it.
+/// This app has dropped the second half of that since forever, pinning every
+/// record to a whole second. With no sub-second there is no anchor and every
+/// beat here is null; a whole second is NOT substituted for one, because the
+/// whole point of this column is to say something the old one could not.
+///
+/// THE PLACEMENT IS A MODEL, and it is one assumption wide: an R-R interval
+/// is the gap ENDING at its beat (that part is the definition), and the LAST
+/// beat a record reports sits at the record's timestamp. Everything else
+/// follows — beat i is the anchor minus the intervals after it. The direction
+/// is chosen because backwards is the only one that cannot place a beat in
+/// the future, i.e. after the moment we were told about it; a forward walk
+/// would also run every multi-beat record past its own second (the intervals
+/// sum to 1,426 ms on a 2-beat record and 2,594 ms on a 4-beat one, measured)
+/// and straight through the next record's.
+///
+/// WHAT THE INTERVALS DO NOT DO IS TILE THE SECOND. Over 81 uninterrupted
+/// runs of 300+ consecutive records in a real export, the intervals sum to
+/// 0.967 of the `rec_ts` span (0.960-0.990 across runs) — so the beat train is
+/// a CHAIN that runs a few percent short, which is what a handful of rejected
+/// beats looks like, and not a set of per-second buckets. Several of a
+/// record's intervals reach back out of its own second. Per-record placement
+/// is nevertheless what THIS path can do — records arrive batched, out of
+/// order and with gaps, so no cross-record chain is available at the write —
+/// and a consumer that wants the chain can walk `rr_ms` itself.
+///
+/// WHAT MOVES AND WHAT DOES NOT, now that `Substrate.rrTsMs` is fed from here
+/// rather than from the `rec_ts * 1000` staircase. The INTERVAL SERIES does
+/// not move at all — same values, same order — so `hrvTime(nn)` with no time
+/// axis is bit-identical, and so is SDNN, which never pairs. Everything that
+/// takes the axis does move: a Lomb-Scargle periodogram handed beats where
+/// they happened, a beat put on the same axis as a motion sample, a real
+/// inter-record gap. That includes RMSSD and pNNx as production calls them
+/// (`hrvTime(nn, nnTimesMs: …)`), because the axis decides which successive
+/// pairs count as CONTIGUOUS — measured at +0.03% RMSSD / +0.6% pNN50 over a
+/// real 6 h block of 27,114 beats.
+///
+/// A non-positive interval BREAKS THE CHAIN: the gap before that beat is
+/// unknown, so every EARLIER beat in the record becomes unplaceable and gets
+/// null rather than a position computed as if the missing gap were zero.
+List<int?> beatTimesMs(int recTs, int? tsSubsec, List<int> rrMs) {
+  final out = List<int?>.filled(rrMs.length, null);
+  if (tsSubsec == null || rrMs.isEmpty) return out;
+  // THE TICK COUNT IS BOUNDED, for the same reason [kMaxPlausibleHr] is: this
+  // is a u16 read straight off the wire, and a corrupt-but-CRC-valid one is
+  // still a number. Ticks are 1/32768 s, so only 0..32767 is a SUB-second;
+  // 40000 would put the anchor 1.22 s past the record it came from and walk
+  // every beat in it into the wrong second. `beat_ts_ms` is read now, and the
+  // axis is what decides which successive pairs count as contiguous for RMSSD
+  // and pNNx — so an out-of-range tick is refused, not clamped: null is this
+  // function's own word for "cannot be placed".
+  if (tsSubsec < 0 || tsSubsec >= 32768) return out;
+  final anchor = recTs * 1000 + (tsSubsec * 1000) ~/ 32768;
+  var back = 0;
+  for (var i = rrMs.length - 1; i >= 0; i--) {
+    // Beat i's OWN placement never depends on rrMs[i] — that interval is the
+    // gap BEFORE beat i, which only matters for placing beat i-1. Set first,
+    // using whatever `back` the beats after i already earned.
+    out[i] = anchor - back;
+    // Only a PLAUSIBLE interval may extend the chain past this beat. The
+    // caller drops an implausible-but-positive interval (`plausibleRrOrNull`
+    // in `decodeSubstrate`) exactly as it drops a non-positive one, so an
+    // interval outside kMinPlausibleRrMs..kMaxPlausibleRrMs must not still
+    // walk every EARLIER beat back by it — that would let a rejected reading
+    // silently displace a beat that is kept.
+    final rr = plausibleRrOrNull(rrMs[i]);
+    if (rr == null) break;
+    back += rr.toInt();
+  }
+  return out;
+}
 
 /// The decoded 1 Hz substrate — the only decoded form (ARCHITECTURE_V2).
 ///
@@ -25,7 +189,23 @@ class Substrate {
   /// Epoch seconds, 1 Hz, sorted ascending. One entry per R24 record.
   final List<int> tsSec;
 
-  /// 1 Hz HR (bpm). 0 = off-skin (never bradycardia). Parallel to [tsSec].
+  /// 1 Hz HR (bpm). Parallel to [tsSec]. **`0` means NO USABLE HEART RATE this
+  /// second — it is not a claim that the band was off your wrist.**
+  ///
+  /// The doc here used to say "0 = off-skin", and that was a second assertion
+  /// smuggled in beside the first. Three different facts land on this 0: the
+  /// record carried no HR field, the sensor found no beat, and the byte was
+  /// outside [kMinPlausibleHr]..[kMaxPlausibleHr]. Read as "off-skin" the last
+  /// of those censors a reading AND replaces it with a wear verdict, which
+  /// biases anything that counts on-skin seconds — nocturnal RHR most of all,
+  /// on exactly the calm nights that push HR toward the low bound.
+  ///
+  /// It is one value rather than two because the ledger has already collapsed
+  /// them: `decoded_onehz.hr` stores NULL for every record with no heart rate
+  /// (db.dart `_queueDecodedOneHz`, `decoded.hr > 0 ? decoded.hr : null`), so
+  /// "the band said zero" cannot reach this array as anything else. Every
+  /// reader gates `> 0`. Wear truth lives in the HELLO body, the wrist on/off
+  /// events and the record-presence runs (`_wearBlock`) — never here.
   final List<int> hr;
 
   /// Beat-to-beat RR: interval end time (epoch ms) + interval (ms). Sparse.
@@ -38,12 +218,128 @@ class Substrate {
   final List<double> az;
 
   /// Relative-ADC channels (raw counts; NO absolute units). Parallel to [tsSec].
+  ///
+  /// [spo2Red] / [spo2Ir] are named after the LED, not after a metric. NO
+  /// oxygen number may be derived from them, at any tier: `ir − red` is a fixed
+  /// integer within a capture session while both channels drift together, so
+  /// every ratio built from the pair measures one channel's baseline drift.
+  /// they are carried because they ARE the bytes at those offsets and the
+  /// substrate round-trips the record; they are not carried because something
+  /// downstream is meant to consume them. gen5's `spo2CandidateRaw` is
+  /// deliberately not in this struct either — see `Spo2Data` in
+  /// models/payloads.dart for the whole refusal, including why the gen5 field
+  /// is the tempting one.
   final List<int> spo2Red;
   final List<int> spo2Ir;
   final List<int> skinTemp;
   final List<int> skinContact;
 
-  const Substrate({
+  /// Gen5 on-chip CUMULATIVE step counter (u16, wraps at 65536, no midnight
+  /// reset). Parallel to [tsSec]. **`-1` means the record carried no counter at
+  /// all** — gen4 R24 has no pedometer field, so every gen4 second reads -1.
+  ///
+  /// The sentinel is load-bearing: `0` is a real reading (a band that has not
+  /// moved since its last wrap/reset) and must not be confused with "this
+  /// generation cannot count steps". Same absent-marker discipline as
+  /// [accelPresentAt].
+  final List<int> stepCount;
+
+  /// The band's own "heart rate and RR are valid this second" flag. Parallel to
+  /// [tsSec]. **`-1` means the record carried no flag at all** — gen4's R24 has
+  /// no such field, so every gen4 second reads -1, and reading that as `false`
+  /// would turn "this band cannot say" into "the band said no".
+  ///
+  /// GATED ON THE SENTINEL ALONE — see [hrValidAt] for why the band-id check
+  /// that used to sit beside it is gone. A strap that reports this flag and a
+  /// strap that cannot will tier DIFFERENTLY on identical physiology because of
+  /// exactly this kind of extra evidence, so a reader that weights by it has to
+  /// say so somewhere the user can see.
+  /// Same absent-marker discipline as [stepCount] and [accelPresentAt].
+  final List<int> hrValid;
+
+  /// WHICH STRAP MEASURED THIS SUBSTRATE — `'gen4'`, `'gen5'`, or null.
+  ///
+  /// Stamped at ingest into `decoded_onehz.device_family` and carried here so
+  /// the pure pipeline can dispatch on it (analytics: `calibrationFor`, whose
+  /// map of families is open — a stamp is a key or it is not). It is ONE value for the whole substrate, not a
+  /// per-second array, because the question a metric asks is "which sensor
+  /// package produced this window", and a window that mixes two answers has no
+  /// single answer.
+  ///
+  /// NULL means UNKNOWN — no stamp (every row predating schema v41, anything
+  /// imported, anything replayed from raw hex), OR the rows disagree. Both are
+  /// the same instruction to a reader: REFUSE, do not assume gen4. A gen4 skin
+  /// temp is an ADC count and a gen5 one is centi-°C in the same column, so
+  /// guessing here is how a fabricated number gets published.
+  final String? deviceFamily;
+
+  /// The distinct `device_id`s whose rows survive in this substrate — "which
+  /// devices actually became numbers", for `metric_series_version
+  /// .coverage_devices` (M5). Unlike [deviceFamily] this is NOT collapsed to
+  /// a singleton-or-null: a day with two contributing devices legitimately
+  /// has two entries, because the question this answers ("who contributed")
+  /// is different from "whose calibration applies" (which DOES need a
+  /// singleton, hence [deviceFamily]'s different collapse rule).
+  ///
+  /// Empty (never null) when nothing stamped a `device_id` — every row
+  /// predating the resolver, or a substrate built by a path that never reads
+  /// the column (e.g. the raw-hex replay path, imports).
+  final Set<String> deviceIds;
+
+  /// Pack a `List<double>` into a `Float64List` (an already-packed list passes
+  /// straight through).
+  ///
+  /// A growable `List<double>` in Dart AOT is a list of POINTERS to boxed
+  /// doubles — an 8-byte slot plus a 16-byte heap object per element, 24 B in
+  /// all. `Float64List` stores the bits inline at 8. These five arrays are the
+  /// substrate's whole memory story: ~6.9 MB/day of pure boxing at 1 Hz, held
+  /// across three overlapping windows per day and three concurrent derive
+  /// lanes. It also turns the isolate hand-off into a memcpy of a typed buffer
+  /// instead of an object-graph walk over ~400 000 boxes.
+  ///
+  /// Bit-exact: a `Float64List` holds the same IEEE-754 doubles, so nothing
+  /// derived from them moves. (The int arrays are deliberately left alone —
+  /// Dart already stores small ints inline as Smis, so an `Int32List` would buy
+  /// 4 B/element in exchange for a silent-truncation edge.)
+  static List<double> _packed(List<double> l) =>
+      l is Float64List ? l : Float64List.fromList(l);
+
+  factory Substrate({
+    required List<int> tsSec,
+    required List<int> hr,
+    required List<double> rrTsMs,
+    required List<double> rrMs,
+    required List<double> ax,
+    required List<double> ay,
+    required List<double> az,
+    required List<int> spo2Red,
+    required List<int> spo2Ir,
+    required List<int> skinTemp,
+    required List<int> skinContact,
+    List<int> stepCount = const [],
+    List<int> hrValid = const [],
+    String? deviceFamily,
+    Set<String> deviceIds = const {},
+  }) =>
+      Substrate._(
+        deviceFamily: deviceFamily,
+        deviceIds: deviceIds,
+        tsSec: tsSec,
+        hr: hr,
+        rrTsMs: _packed(rrTsMs),
+        rrMs: _packed(rrMs),
+        ax: _packed(ax),
+        ay: _packed(ay),
+        az: _packed(az),
+        spo2Red: spo2Red,
+        spo2Ir: spo2Ir,
+        skinTemp: skinTemp,
+        skinContact: skinContact,
+        stepCount: stepCount,
+        hrValid: hrValid,
+      );
+
+  const Substrate._({
     required this.tsSec,
     required this.hr,
     required this.rrTsMs,
@@ -55,9 +351,13 @@ class Substrate {
     required this.spo2Ir,
     required this.skinTemp,
     required this.skinContact,
+    this.stepCount = const [],
+    this.hrValid = const [],
+    this.deviceFamily,
+    this.deviceIds = const {},
   });
 
-  static const Substrate empty = Substrate(
+  static const Substrate empty = Substrate._(
     tsSec: [],
     hr: [],
     rrTsMs: [],
@@ -77,13 +377,104 @@ class Substrate {
   int? get lastTs => isEmpty ? null : tsSec.last;
 
   /// 1 Hz accel samples (one gravity vector per second) for the analytics family.
+  ///
+  /// Seconds with no gravity vector are carried with `valid: false` rather than
+  /// dropped, so the stream stays 1:1 with [tsSec] while `enmoSeries`,
+  /// `positionSeries` and the zone readers — all of which filter on `valid` —
+  /// see them as ABSENT instead of as a perfectly still wrist. See
+  /// [accelPresentAt].
   List<ana.AccelSample> accelSamples() => <ana.AccelSample>[
         for (var i = 0; i < tsSec.length; i++)
-          ana.AccelSample(tsSec[i] * 1000.0, ax[i], ay[i], az[i])
+          ana.AccelSample(tsSec[i] * 1000.0, ax[i], ay[i], az[i],
+              valid: accelPresentAt(i))
       ];
+
+  /// Whether second [i] carries a REAL gravity vector.
+  ///
+  /// `decoded_onehz.ax/ay/az` are nullable as of schema v39, but the 1 Hz
+  /// arrays here are POSITIONAL, so a record decoded without a usable gravity
+  /// vector — gen5 v18 keeps HR/RR and reports the accel as absent rather than
+  /// discarding the second, and the gen4 R10-historical path decodes HR only —
+  /// still occupies its slot, as exact `(0, 0, 0)`.
+  /// That is not a reading a real device can produce: an accelerometer at rest
+  /// reads ~1 g and one in motion reads more, so all three axes landing on
+  /// EXACTLY 0.0 is an all-zero payload, i.e. no measurement. Exact zero is
+  /// therefore the ABSENT marker.
+  ///
+  /// The upper end is [kMaxSustainedAccelG] — a second-long mean no wrist
+  /// holds — so a decoder whose scale factor is wrong by an order of magnitude
+  /// stops reading as violent movement and starts reading as absent. There is
+  /// no lower bound beyond exact zero; see [accelPlausible].
+  ///
+  /// This used to rest on "every decoder gates on `magSq >= 0.25`", which is no
+  /// longer true — protocol 539a97b dropped that gate from the gen5 v18 decoder
+  /// (it is a bound on a NORMALISED gravity vector and gen5 emits per-axis raw
+  /// means, so it rejected real workout seconds). A gen5 all-zero accel payload
+  /// now decodes as `gravityG: [0,0,0]` and lands here, where it reads as
+  /// absent — the right answer, but reached by physics rather than by a gate
+  /// upstream. Restoring an all-zero ⇒ absent check in the gen5 decoder would
+  /// make it explicit again.
+  ///
+  /// This matters because absent accel does not merely go unused: a run of
+  /// `(0, 0, 0)` has a constant z-angle of exactly 0.0°, which the van Hees
+  /// rule reads as PERFECT IMMOBILITY. Eight hours of missing accel scores
+  /// 28 501 immobile seconds and yields a fabricated ~7.9 h sleep window,
+  /// fully staged. Absent input must produce no claim, never a confident one.
+  bool accelPresentAt(int i) => accelPlausible(ax[i], ay[i], az[i]);
+
+  /// Fraction of [lo, hi) seconds carrying a real gravity vector (0..1).
+  /// Returns 0 for an empty range — no evidence, not "all present".
+  double accelPresentFraction(int lo, int hi) {
+    final a = lo < 0 ? 0 : lo;
+    final b = hi > tsSec.length ? tsSec.length : hi;
+    if (b <= a) return 0;
+    var present = 0;
+    for (var i = a; i < b; i++) {
+      if (accelPresentAt(i)) present++;
+    }
+    return present / (b - a);
+  }
 
   /// 1 Hz HR as doubles (0 = off-skin). Parallel to [tsSec] / [accelSamples].
   List<double> hr1hz() => [for (final h in hr) h.toDouble()];
+
+  /// The on-chip step counter at second [i], or `null` when this record carried
+  /// none (gen4, or a gen5 record whose counter field was absent).
+  int? stepCounterAt(int i) {
+    if (i < 0 || i >= stepCount.length) return null;
+    final v = stepCount[i];
+    return v < 0 ? null : v;
+  }
+
+  /// The band's own HR-validity verdict for second [i], or `null` when this
+  /// record carried none — which is EVERY gen4 second, and every second of a
+  /// substrate whose provenance is unknown.
+  ///
+  /// ABSENT, NEVER FALSE. A gen4 strap has no such field and a NULL read as
+  /// `false` would silently mark a whole generation's beats untrustworthy.
+  bool? hrValidAt(int i) {
+    // THE ROW ANSWERS FOR ITSELF. This used to also require
+    // `deviceFamily == 'gen5'` — a band id hardcoded inside the class whose
+    // whole job is to be neutral, which meant a second band that reports the
+    // same flag would have been silently ignored while its data sat right here.
+    // The sentinel is the evidence: only a decoder that read the flag off the
+    // wire writes a non-negative value into this column (db.dart writes NULL
+    // otherwise, and derive_prepare lands NULL on -1), so a value >= 0 IS a
+    // declaration by the source that produced the row. An unstamped substrate
+    // carrying real flags is a source that told us the flag and not the badge —
+    // refusing it discards a measurement to punish missing metadata.
+    if (i < 0 || i >= hrValid.length) return null;
+    final v = hrValid[i];
+    return v < 0 ? null : v != 0;
+  }
+
+  /// A per-second companion array sliced to [lo, hi), tolerating the legacy
+  /// empty list (an older payload that predates the array entirely).
+  List<int> _perSecSlice(List<int> src, int lo, int hi) =>
+      src.length == tsSec.length ? src.sublist(lo, hi) : const [];
+
+  /// [stepCount] sliced to [lo, hi), tolerating the legacy empty list.
+  List<int> _stepSlice(int lo, int hi) => _perSecSlice(stepCount, lo, hi);
 
   /// Slice to the half-open window [startSec, endSec) by record time. Returns a
   /// new Substrate with the 1 Hz arrays sliced and the sparse RR arrays filtered
@@ -107,6 +498,10 @@ class Substrate {
       spo2Ir: spo2Ir.sublist(lo, hi),
       skinTemp: skinTemp.sublist(lo, hi),
       skinContact: skinContact.sublist(lo, hi),
+      stepCount: _stepSlice(lo, hi),
+      hrValid: _perSecSlice(hrValid, lo, hi),
+      deviceFamily: deviceFamily,
+      deviceIds: deviceIds,
       rrTsMs: rr.$1,
       rrMs: rr.$2,
     );
@@ -132,6 +527,10 @@ class Substrate {
       spo2Ir: spo2Ir.sublist(lo, hi),
       skinTemp: skinTemp.sublist(lo, hi),
       skinContact: skinContact.sublist(lo, hi),
+      stepCount: _stepSlice(lo, hi),
+      hrValid: _perSecSlice(hrValid, lo, hi),
+      deviceFamily: deviceFamily,
+      deviceIds: deviceIds,
       rrTsMs: rr.$1,
       rrMs: rr.$2,
     );
@@ -149,6 +548,8 @@ class Substrate {
       spo2Ir: const [],
       skinTemp: const [],
       skinContact: const [],
+      deviceFamily: deviceFamily,
+      deviceIds: deviceIds,
       rrTsMs: rr.$1,
       rrMs: rr.$2,
     );
@@ -156,14 +557,25 @@ class Substrate {
 
   /// Filter THIS substrate's sparse RR to beats whose end time (epoch ms) falls
   /// in [startSec, endSec). Returns (rrTsMs, rrMs).
+  /// Counted first, then filled, so the beats land straight in a `Float64List`.
+  /// A growable `<double>[]` here would box every beat only for the constructor
+  /// to pack it back — and this runs on every slice, of which there are three
+  /// per day.
   (List<double>, List<double>) _filterRr(int startSec, int endSec) {
     final loMs = startSec * 1000.0, hiMs = endSec * 1000.0;
-    final ts = <double>[], rr = <double>[];
+    var n = 0;
+    for (var i = 0; i < rrMs.length; i++) {
+      final t = rrTsMs[i];
+      if (t >= loMs && t < hiMs) n++;
+    }
+    final ts = Float64List(n), rr = Float64List(n);
+    var j = 0;
     for (var i = 0; i < rrMs.length; i++) {
       final t = rrTsMs[i];
       if (t >= loMs && t < hiMs) {
-        ts.add(t);
-        rr.add(rrMs[i]);
+        ts[j] = t;
+        rr[j] = rrMs[i];
+        j++;
       }
     }
     return (ts, rr);
@@ -181,14 +593,30 @@ class Substrate {
         'spo2_ir': spo2Ir,
         'skin_temp': skinTemp,
         'skin_contact': skinContact,
+        'step_count': stepCount,
+        'hr_valid': hrValid,
+        // Null (unknown provenance) is a real answer — emit the key regardless.
+        'device_family': deviceFamily,
+        'device_ids': deviceIds.toList(),
       };
 
   static Substrate fromJson(Map<String, dynamic> m) {
     List<int> ints(Map<String, dynamic> m, String k) =>
         ((m[k] as List?) ?? const []).map((e) => (e as num).toInt()).toList();
-    List<double> dbls(String k) =>
-        ((m[k] as List?) ?? const []).map((e) => (e as num).toDouble()).toList();
-        
+    // Straight into a Float64List — see [_packed]. This runs on the RECEIVING
+    // (main) isolate for every substrate handed back from a worker, so the
+    // growable intermediate was ~400 000 boxes allocated and immediately
+    // thrown away, on the UI thread.
+    Float64List dbls(String k) {
+      final src = (m[k] as List?) ?? const [];
+      final out = Float64List(src.length);
+      for (var i = 0; i < src.length; i++) {
+        out[i] = (src[i] as num).toDouble();
+      }
+      return out;
+    }
+
+
     final tsSec = ints(m, 'ts_sec');
     final n = tsSec.length;
     
@@ -198,7 +626,7 @@ class Substrate {
     }
     List<double> safeD(String k) {
       final l = dbls(k);
-      return (l.isEmpty && n > 0) ? List<double>.filled(n, 0.0) : l;
+      return (l.isEmpty && n > 0) ? Float64List(n) : l;
     }
 
     return Substrate(
@@ -213,6 +641,22 @@ class Substrate {
       spo2Ir: safeI('spo2_ir'),
       skinTemp: safeI('skin_temp'),
       skinContact: safeI('skin_contact'),
+      // NOT `safeI`: a missing/short list means the counter was ABSENT, and the
+      // absent marker is -1, not 0 (0 is a real, unmoved counter reading).
+      stepCount: () {
+        final l = ints(m, 'step_count');
+        return l.length == n ? l : List<int>.filled(n, -1);
+      }(),
+      // Same reason as `step_count`: the absent marker is -1. 0 is a real
+      // reading — the band saying THIS second's beat is not trustworthy.
+      hrValid: () {
+        final l = ints(m, 'hr_valid');
+        return l.length == n ? l : List<int>.filled(n, -1);
+      }(),
+      deviceFamily: m['device_family'] as String?,
+      deviceIds: ((m['device_ids'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .toSet(),
     );
   }
 }
@@ -240,6 +684,16 @@ Substrate decodeSubstrate(List<String> hexes) {
     } catch (_) {
       r = null;
     }
+    // v25 is DROPPED, not decoded. `FirmwareAwareR24Decoder` routes it to
+    // `_parseV25`, whose `accelG` is not an accelerometer reading: measured
+    // across all 28,395 v25 records in `whoop-4.db`, the "z" axis takes three
+    // distinct values, the "y" seventeen (68% of them one value), the "x" is
+    // the upper half of an f32 starting two bytes earlier — and the median
+    // angle to the REAL gravity vector from the v24 record for the same
+    // second is 83°. Near-constant, so it reads as a perfectly still wrist to
+    // van Hees. The record carries no HR either, so dropping it costs
+    // nothing this path can use. Same refusal as `LocalDb._decodeOneHzSample`.
+    if (r != null && r.histVersion == 25) continue;
     if (r != null && r.tsEpoch > 0) {
       recs.add(_Rec(r));
       continue;
@@ -247,7 +701,8 @@ Substrate decodeSubstrate(List<String> hexes) {
     final live = proto.realtimeRr(hex);
     if (live != null && live.ts > 0) {
       for (final v in live.rrMs) {
-        if (v > 0) looseRr.add(_Beat(live.ts * 1000.0, v.toDouble()));
+        final rr = plausibleRrOrNull(v);
+        if (rr != null) looseRr.add(_Beat(live.ts * 1000.0, rr));
       }
     }
   }
@@ -268,7 +723,7 @@ Substrate decodeSubstrate(List<String> hexes) {
   for (var i = 0; i < n; i++) {
     final r = recs[i].r;
     tsSec[i] = r.tsEpoch;
-    hr[i] = r.hr;
+    hr[i] = plausibleHrOrNull(r.hr) ?? 0;
     if (r.accelG.length == 3) {
       ax[i] = r.accelG[0];
       ay[i] = r.accelG[1];
@@ -276,15 +731,32 @@ Substrate decodeSubstrate(List<String> hexes) {
     }
     spo2Red[i] = r.spo2RedRaw;
     spo2Ir[i] = r.spo2IrRaw;
+    // both deprecated: neither field is what its name says. still filled here so
+    // the substrate keeps round-tripping, but _daySkinTempCurve and the
+    // fit_quality diagnostic both derive from them and shouldn't — separate fix,
+    // it moves user-facing output and needs an algo version bump.
+    // ignore: deprecated_member_use
     skinTemp[i] = r.skinTempRaw;
+    // ignore: deprecated_member_use
     skinContact[i] = r.skinContact;
-    // RR beats: anchored at the record second (epoch ms). Beats within a record
-    // share its second; time order is preserved by the record sort above.
+    // RR beats: placed at their MEASURED instant (`beatTimesMs` — the record's
+    // own sub-second anchor, intervals walked backwards from it), falling back
+    // to the record second only when the record carries no sub-second. Beats
+    // used to all share the record's whole second here, which says two beats
+    // 800 ms apart happened at the same millisecond. Emission ORDER is
+    // unchanged (record order, then beat order) so no interval series moves —
+    // only where the beats sit on the clock.
     final t = r.tsEpoch * 1000.0;
-    for (final rr in r.rrIntervalsMs) {
-      if (rr > 0) {
-        rrMs.add(rr.toDouble());
-        rrTsMs.add(t);
+    final beatTs = beatTimesMs(r.tsEpoch, r.tsSubsec, r.rrIntervalsMs);
+    for (var b = 0; b < r.rrIntervalsMs.length; b++) {
+      // A non-positive interval was already dropped here; the bound only widens
+      // that to intervals no heart produces. It drops the BEAT, not the record:
+      // `beatTimesMs` has already placed the survivors, and an interval this
+      // far out is a missed or doubled detection, not a rhythm.
+      final rr = plausibleRrOrNull(r.rrIntervalsMs[b]);
+      if (rr != null) {
+        rrMs.add(rr);
+        rrTsMs.add(beatTs[b]?.toDouble() ?? t);
       }
     }
   }
@@ -318,7 +790,91 @@ Substrate decodeSubstrate(List<String> hexes) {
     spo2Ir: spo2Ir,
     skinTemp: skinTemp,
     skinContact: skinContact,
+    // Gen4 R24 carries no pedometer field: every second is ABSENT (-1), never
+    // a confident zero. Gen5 counters reach the substrate through the
+    // decoded_onehz loader (derive_prepare.addDecodedPage), not this path.
+    stepCount: List<int>.filled(n, -1),
+    // Same story for the band's HR-validity flag, and this path is raw-hex
+    // replay, which carries no device stamp either — so it would refuse at
+    // `hrValidAt` regardless.
+    hrValid: List<int>.filled(n, -1),
   );
+}
+
+/// Steps MEASURED by the band's own pedometer over [sub], or `null` when this
+/// substrate carries no counter at all — which is every gen4 (WHOOP 4.0) day,
+/// since R24 has no pedometer field. Null means "this hardware cannot count
+/// steps", never "you took no steps".
+///
+/// [cumulativeCounterModulus] IS A DECLARATION AND IT IS NOT OPTIONAL —
+/// null abstains. It says two things about the source's counter, and this
+/// function is only correct if both hold: it wraps at that modulus, and it is
+/// CUMULATIVE, i.e. it does not reset inside the window being summed. Both used
+/// to be assumed (`wrap = 65536`, hardcoded), and the second one is the
+/// expensive assumption: this reads DELTAS, so a counter that resets at
+/// midnight silently loses every step taken before the day's first synced
+/// record — 12,500 walked, 8,300 published, at tier HIGH and confidence 0.9,
+/// with nothing in the output saying so. Nothing on a record distinguishes a
+/// reset from a wrap after the fact, so an undeclared counter gets no number
+/// rather than a guessed one. The caller declares it because the caller knows
+/// which band stamped the rows; see `DerivationEngine._stepCounterModulus`.
+///
+/// The counter is also reset by a strap reboot/re-pair, so the total is the sum
+/// of positive per-record deltas, not `last - first`. Two hazards, both handled
+/// here (`wrap` below is [cumulativeCounterModulus]):
+///
+///   * **wrap** (65500 → 100): the raw delta is negative. Re-reading it modulo
+///     65536 gives the true small delta, which passes the plausibility budget.
+///   * **reset** (40000 → 0): the raw delta is also negative, and modulo 65536
+///     gives an absurd 25536. It FAILS the budget and contributes nothing —
+///     the boundary delta is dropped rather than invented. Losing at most one
+///     inter-record delta is the honest cost of an ambiguity the counter
+///     genuinely cannot resolve.
+///
+/// The plausibility budget is `clamp(gap, 60 s, 3600 s) × [maxStepsPerSecond]`,
+/// and both ends of that clamp are load-bearing:
+///
+///   * the FLOOR (300 steps) exists because the counter's on-band update cadence
+///     is not verified on hardware. If the strap advances it in bursts rather
+///     than every second, a literal `gap × 5` budget would reject almost every
+///     real delta and silently report near-zero steps — a far worse failure than
+///     the one this guard is for. 300 steps between two records still cannot be
+///     confused with a 25 000-step reset artefact.
+///   * the CEILING keeps a reset after a long unsynced stretch from buying
+///     enough budget to pass as a wrap.
+///
+/// A delta is either credited in full or dropped in full, so this function can
+/// never return a negative or an absurd total, whatever the counter does.
+int? hardwareStepsFromCounter(
+  Substrate sub, {
+  required int? cumulativeCounterModulus,
+  int maxStepsPerSecond = 5,
+}) {
+  final wrap = cumulativeCounterModulus;
+  if (wrap == null || wrap <= 0) return null;
+  const minGapSecForBudget = 60;
+  const maxGapSecForBudget = 3600;
+  int? prev;
+  int? prevTs;
+  var total = 0;
+  var seen = false;
+  for (var i = 0; i < sub.length; i++) {
+    final c = sub.stepCounterAt(i);
+    if (c == null) continue;
+    seen = true;
+    final ts = sub.tsSec[i];
+    if (prev != null && prevTs != null && ts > prevTs) {
+      final gap = ts - prevTs;
+      final budget =
+          gap.clamp(minGapSecForBudget, maxGapSecForBudget) * maxStepsPerSecond;
+      var delta = c - prev;
+      if (delta < 0) delta += wrap; // wrap candidate; a reset overshoots below
+      if (delta > 0 && delta <= budget) total += delta;
+    }
+    prev = c;
+    prevTs = ts;
+  }
+  return seen ? total : null;
 }
 
 class _Rec {
@@ -352,9 +908,13 @@ class PhysioDay {
   /// `present == false` when no qualifying sleep (fallback container day).
   final ana.SleepSegmentation sleep;
 
-  /// Index range [sleepLoIdx, sleepHiIdx) of the sleep window INTO the day-sliced
-  /// substrate arrays (so the coordinator can slice the substrate to the sleep
-  /// window for HRV/RHR/recovery). Both 0 when no sleep.
+  /// Index range [sleepLoIdx, sleepHiIdx) of the sleep window INTO THE FULL
+  /// substrate — the same one passed to [calendarDays], NOT the day slice.
+  /// (`calendarDays` builds them as `loS + onsetIdx`, where `loS` is a lower
+  /// bound into the full arrays, and both live callers slice the full substrate
+  /// with them; this doc used to say "day-sliced", contradicting `calendarDays`'
+  /// own doc and pointing a future caller at a window offset by up to the
+  /// nocturnal lookback.) Both 0 when no sleep.
   final int sleepLoIdx;
   final int sleepHiIdx;
 
@@ -406,7 +966,11 @@ class SleepWindowOverride {
   final String dayId;
   final int onsetSec;
   final int offsetSec;
-  final String source; // 'manual' | 'confirmed'
+  final String source; // 'manual' | 'confirmed' | 'rejected'
+  // 'rejected': onsetSec/offsetSec still carry the window being rejected (the
+  // auto-detected window at the time of rejection, same convention the
+  // already-shipped rejected-nap rows use), but the window is never staged —
+  // see calendarDays' `ov.source == 'rejected'` branch.
 
   const SleepWindowOverride({
     required this.dayId,
@@ -417,11 +981,8 @@ class SleepWindowOverride {
 }
 
 /// Local YYYY-MM-DD label for an epoch-second instant.
-String localDateLabel(int epochSec) {
-  final d = DateTime.fromMillisecondsSinceEpoch(epochSec * 1000, isUtc: false);
-  String two(int x) => x.toString().padLeft(2, '0');
-  return '${d.year.toString().padLeft(4, '0')}-${two(d.month)}-${two(d.day)}';
-}
+String localDateLabel(int epochSec) =>
+    dayLabelOf(DateTime.fromMillisecondsSinceEpoch(epochSec * 1000));
 
 /// Split the substrate into CALENDAR days (local midnight → next local midnight).
 ///
@@ -443,10 +1004,20 @@ String localDateLabel(int epochSec) {
 /// habitual-midsleep prior is resolved AT THE DAY BEING SEGMENTED rather than
 /// at "now" (a zone-independent way to test the DST/travel fix, since the
 /// machine running the test may sit in a zone that never changes offset).
+///
+/// [priorSleep] seeds the habitual-midsleep prior with sleep windows ALREADY
+/// STORED for earlier days. Without it the prior is unreachable in production:
+/// the history is accumulated as this function walks days, every live call
+/// spans at most ~36 h (one target day + its nocturnal lookback), and
+/// `habitualMidsleepSecFromHistory` needs 14 distinct days — so the selector
+/// always fell back to the fixed 03:30 cold-start anchor, and a night-shift
+/// sleeper's 4 h main block lost the alignment bonus to a shorter block nearer
+/// 03:30. Days found in THIS call still win (a full restage sees them all).
 List<PhysioDay> calendarDays(
   Substrate sub, {
   SleepWindowOverride? override,
   int Function(int epochSec)? tzOffsetAt,
+  List<({int startSec, int endSec, String dayKey})> priorSleep = const [],
 }) {
   final tzOffset = tzOffsetAt ?? tzOffsetSecondsAt;
   if (sub.isEmpty) return const [];
@@ -456,7 +1027,9 @@ List<PhysioDay> calendarDays(
   final dataEnd = sub.tsSec.last + 1;
 
   final days = <PhysioDay>[];
-  final sleepHistory = <({int startSec, int endSec, String dayKey})>[];
+  final sleepHistory = <({int startSec, int endSec, String dayKey})>[
+    ...priorSleep,
+  ];
   var dayStart = _localMidnight(dataStart);
   var guard = 0;
   while (dayStart < dataEnd && guard++ < 400) {
@@ -492,12 +1065,16 @@ List<PhysioDay> calendarDays(
       // the CURRENT UTC offset to those historical instants, so re-deriving days
       // from the other side of a DST transition (or a trip) shifted every
       // historical midsleep by an hour — which can change which candidate sleep
-      // the selector's alignment bonus picks. Resolve the offset AT THE DAY
-      // BEING SEGMENTED instead of "whenever this code happens to run", so a
+      // the selector's alignment bonus picks. Resolve the offset AT EACH BLOCK'S
+      // OWN INSTANT instead of "whenever this code happens to run", so a
       // re-derive of an old day is reproducible regardless of today's zone.
+      // One offset frozen for the whole history is the DST bypass analytics
+      // warns about — with a real ≥14-day history (see [priorSleep]) it will
+      // regularly straddle a transition — and `tzOffset` is already a pure
+      // ts → offset function, so pass it as the resolver.
       final habitualMidsleepSec = ana.habitualMidsleepSecFromHistory(
         sleepHistory,
-        tzOffsetSeconds: tzOffset(dayStart),
+        tzOffsetResolver: tzOffset,
       );
       // Daytime HR baseline = valid HR before the nocturnal search window.
       final base = <double>[for (var i = 0; i < loS; i++) if (hr[i] > 0) hr[i]];
@@ -519,7 +1096,14 @@ List<PhysioDay> calendarDays(
 
       ana.SleepSegmentation s;
       String src;
-      if (ov != null) {
+      if (ov != null && ov.source == 'rejected') {
+        // The user's word again, the other direction: this was NOT sleep at
+        // all. Skip detection/staging entirely rather than force a window —
+        // the day derives with no main sleep, same as the already-shipped
+        // rejected-nap path (`sleep_nap` source='rejected').
+        s = ana.SleepSegmentation.absent;
+        src = 'rejected';
+      } else if (ov != null) {
         // The user's word — force the window, skip detection entirely.
         s = ana.segmentSleep(
           accelSlice,
@@ -531,14 +1115,33 @@ List<PhysioDay> calendarDays(
         );
         src = ov.source; // 'manual' | 'confirmed'
       } else {
-        s = ana.segmentSleep(
-          accelSlice,
-          hrSlice,
-          hrBaseline: hrBaseline,
-          rrMs: rrMsSeg,
-          rrTsMs: rrTsSeg,
-          habitualMidsleepSec: habitualMidsleepSec,
-        );
+        // Accel-led detection is only meaningful if we actually HAVE accel.
+        // Absent gravity is stored as exact (0,0,0) (see `accelPresentAt`) and
+        // van Hees scores a run of it as perfect immobility, so a night whose
+        // records all decoded without a gravity vector would otherwise produce
+        // a confident, fully-staged sleep window built entirely out of missing
+        // data. `immobilityMask` has no validity input to tell it otherwise —
+        // it is a pure index-wise angle rule, so neither a NaN sentinel (NaN
+        // comparisons are false, so the "angle changed" test never trips and
+        // it reads as immobile) nor omitting the seconds (no gap awareness)
+        // reaches it. The only honest move at this layer is not to let it
+        // anchor the window in the first place.
+        final accelCoverage = sub.accelPresentFraction(loS, hiS);
+        if (accelCoverage >= kMinAccelCoverageForVanHees) {
+          s = ana.segmentSleep(
+            accelSlice,
+            hrSlice,
+            hrBaseline: hrBaseline,
+            rrMs: rrMsSeg,
+            rrTsMs: rrTsSeg,
+            habitualMidsleepSec: habitualMidsleepSec,
+          );
+        } else {
+          // Not an error and not "no sleep" — just no accel evidence. Fall
+          // through to the HR-led path below, which is exactly the degraded
+          // mode for this and is already marked low-confidence.
+          s = ana.SleepSegmentation.absent;
+        }
         src = 'auto';
         if (!s.present) {
           // Approach 2: accel-led detection found nothing → HR-led fallback.
@@ -586,6 +1189,11 @@ List<PhysioDay> calendarDays(
             ));
           }
         }
+      } else if (src == 'rejected') {
+        // No window to stage (deliberately), but the day still needs to know
+        // it was a rejection rather than an ordinary absence — sleep_detail
+        // reads this to keep the "not sleep" state from re-prompting.
+        sleepSource = 'rejected';
       }
     }
 
@@ -604,7 +1212,9 @@ List<PhysioDay> calendarDays(
               : (sleepSource == 'manual' || sleepSource == 'confirmed'
                   ? const <String>['SLEEP_MANUAL']
                   : const <String>[]))
-          : const <String>['NO_SLEEP_DETECTED'],
+          : (sleepSource == 'rejected'
+              ? const <String>['SLEEP_REJECTED']
+              : const <String>['NO_SLEEP_DETECTED']),
     ));
     dayStart = dayEnd;
   }

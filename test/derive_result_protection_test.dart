@@ -346,4 +346,113 @@ void main() {
     expect(outcome.partial, isTrue);
     expect(outcome.finalized, isFalse);
   });
+
+  // 3. A re-stage over LESS substrate than the last one had (#242). A day
+  //    re-stages on every pass for its first 48 h, and pruning can take the
+  //    substrate away between passes — so the same night comes back shorter and
+  //    replaced the good one. "It got fixed, then a few syncs later it went
+  //    back."
+  group('a night never re-stages shorter', () {
+    SleepSessionCandidate night(num? tstSec) => SleepSessionCandidate(
+          dayId: '2026-08-19',
+          confidence: 0.8,
+          flags: const [],
+          sleepJson: {'tst_sec': ?tstSec},
+          hypnoStages: const [],
+          sleepOnsetSec: 1000,
+          sleepOffsetSec: 2000,
+        );
+
+    test('a shorter re-stage loses to the banked night', () {
+      expect(DerivationEngine.isRicherSleep(night(27000), night(9000)), isTrue);
+    });
+
+    test('a longer re-stage wins — the band handed over more of it', () {
+      expect(DerivationEngine.isRicherSleep(night(9000), night(27000)), isFalse);
+    });
+
+    test('an identical re-stage writes, so equal is not richer', () {
+      expect(DerivationEngine.isRicherSleep(night(27000), night(27000)), isFalse);
+    });
+
+    test('a night beats no night, and no night never beats one', () {
+      expect(DerivationEngine.isRicherSleep(night(27000), night(null)), isTrue);
+      expect(DerivationEngine.isRicherSleep(night(null), night(27000)), isFalse);
+      expect(DerivationEngine.isRicherSleep(night(null), night(null)), isFalse);
+    });
+  });
+
+  // 4. A re-derive at the retention-cutoff edge (edge#305): daytime HR
+  //    survives (so `producedNothing` is false) while the sleep window's own
+  //    RR/HR substrate has aged out from under it — sleep STAGING survives
+  //    regardless (it replays the durable `sleep_session_candidates` row, not
+  //    raw), so every night-physiology scalar comes back null and, because
+  //    `metric_series` is UNVERSIONED, silently clobbers a good historical
+  //    baseline point and collapses the readiness baseline out from under
+  //    every later night.
+  group('nightSubstrateRegressed (edge#305)', () {
+    test('a known sleep window with no surviving substrate and null night '
+        'scalars is a regression', () {
+      expect(
+        DerivationEngine.nightSubstrateRegressed(
+          sleepSubEmpty: true,
+          nightScalarsNull: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('the v83 counterexample: a re-stage that finds NO window at all '
+        '(NO_SLEEP_DETECTED) with null night scalars is STILL a regression '
+        '— the shape test does not require this pass to have found a '
+        'window; the caller\'s existing-result check is what protects an '
+        'honest no-sleep day', () {
+      expect(
+        DerivationEngine.nightSubstrateRegressed(
+          sleepSubEmpty: true,
+          nightScalarsNull: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('sleep substrate still present is not a regression, even with null '
+        'scalars (a genuine can\'t-compute night)', () {
+      expect(
+        DerivationEngine.nightSubstrateRegressed(
+          sleepSubEmpty: false,
+          nightScalarsNull: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('real night scalars computed is not a regression', () {
+      expect(
+        DerivationEngine.nightSubstrateRegressed(
+          sleepSubEmpty: true,
+          nightScalarsNull: false,
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  // The full guard also requires an EXISTING result with real night scalars
+  // before it declines to write — a fresh day with nothing on disk yet must
+  // still get its (all-null) first result, same principle as producedNothing.
+  test('a night-substrate regression with NO existing result still writes',
+      () async {
+    const day = '2026-08-23';
+    expect(await LocalDb.dayResult(day), isNull, reason: 'precondition');
+    expect(
+      DerivationEngine.nightSubstrateRegressed(
+        sleepSubEmpty: true,
+        nightScalarsNull: true,
+      ),
+      isTrue,
+      reason: 'the shape alone says regression; the caller still checks for '
+          'an existing real result before declining to persist',
+    );
+  });
 }

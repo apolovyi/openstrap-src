@@ -1,11 +1,15 @@
-# AGENTS.md — OpenStrap `edge`
+# AGENTS.md, OpenStrap `edge`
 
-Reviewer context, verified against code at `kAlgoVersion 47`, schema `v25`,
-`0.9.19+50`. Where a source comment disagrees with an implementation, **the
-implementation wins** — header comments here go stale (e.g.
-`lib/compute/substrate.dart:10-12` still describes a wake-to-wake day model that
-`calendarDays()` at `:429` no longer implements; it walks local midnight to
-local midnight).
+Reviewer context. This doc drifts from code between edits, check
+`kAlgoVersion` (`lib/compute/derivation_engine.dart`), `schemaVersion`
+(`lib/data/db.dart`), and the `version:` line in `pubspec.yaml` directly
+rather than trusting a number written here. Where a source comment disagrees
+with an implementation, **the implementation wins** — header comments here go
+stale (e.g. `lib/compute/substrate.dart`'s file header still describes a
+wake-to-wake day model that `calendarDays()` no longer implements; it walks
+local midnight to local midnight). The same drift applies to §2's table and
+every line-number citation in §3 below, line numbers move on every edit,
+symbol names don't; verify against the source, not this doc.
 
 ## 1. What this is
 
@@ -14,7 +18,7 @@ local-first**: BLE offload → SQLite → on-device analytics → UI. No backend
 user data. Network use is limited to OTA update pointers, opt-in
 telemetry/Crashlytics, and BYOK LLM calls.
 
-Three sibling repos, strict separation — push work to the right one:
+Three sibling repos, strict separation, push work to the right one:
 - `OpenStrap/protocol` — bytes: GATT, framing, CRC, opcodes, record decode.
 - `OpenStrap/analytics` — metrics: HRV, sleep staging, readiness, strain.
 - `OpenStrap/edge` (**this repo**) — flows, BLE link management, storage, UI.
@@ -23,15 +27,17 @@ New opcode/record → protocol. New metric → analytics. New screen/flow/table 
 edge. A PR implementing a metric inside `edge/lib/compute` is in the wrong repo
 unless it is pure orchestration.
 
-## 2. Architecture map (`lib/`, 164 files, ~67k lines)
+## 2. Architecture map (`lib/`, well over 200 files, these five are the biggest by far)
 
-| file | lines | owns |
-|---|---|---|
-| `data/db.dart` | 3966 | `LocalDb`: schema v25, `onUpgrade` ladder, all CRUD, coach views |
-| `compute/derivation_engine.dart` | 3553 | `DerivationEngine`, `kAlgoVersion` (:267), day scheduling, isolate offload |
-| `state/app_state.dart` | 3456 | `AppState` ChangeNotifier — BLE↔DB↔UI orchestration |
-| `ble/ble_engine.dart` | 3267 | GATT connect/drain/history-sync state machine |
-| `data/local_repository_impl.dart` | 2518 | read seam: `day_result`/`metric_series` → screen shapes; zero compute on read |
+Line counts drift constantly; don't trust a number here, `wc -l` the file.
+
+| file | owns |
+|---|---|
+| `data/db.dart` | `LocalDb`: schema ladder (`onUpgrade`), all CRUD, coach views |
+| `compute/derivation_engine.dart` | `DerivationEngine`, `kAlgoVersion`, day scheduling, isolate offload |
+| `state/app_state.dart` | `AppState` ChangeNotifier — BLE↔DB↔UI orchestration |
+| `ble/ble_engine.dart` | GATT connect/drain/history-sync state machine |
+| `data/local_repository_impl.dart` | read seam: `day_result`/`metric_series` → screen shapes; zero compute on read |
 
 - `ble/` — engine + `ble_state.dart` **pure policies**: `ReconnectPolicy`,
   `SeqAllocator`, `DrainStopEvaluator`, `RecordGate`, `CounterRegressionDetector`,
@@ -48,8 +54,10 @@ unless it is pure orchestration.
 - `notify/` — `notification_center.dart` is the **single emitter**;
   `fired_keys.dart` is the persistent fire-once guard.
 - `coach/` — read-only SQL over allow-listed `v_*` views behind a deny-list guard.
-- `ui/` — ~120 files: `ui/design` (design system), `ui/kit/charts.dart`,
-  `ui/screens/` (shared metric/trend IA).
+- `ui2/` — 66 files (`lib/ui` was deleted in the UI rebuild): `ui2/theme.dart`
+  and `ui2/grammar.dart` (design system), `ui2/charts.dart`, `ui2/screens/`
+  (shared metric/trend IA), plus `ui2/onboarding/`, `ui2/activity/`,
+  `ui2/profile/`.
 - Also `ai/` (BYOK), `gps/`, `health/` (HealthKit/Health Connect export),
   `telemetry/` (opt-in), `widget/` (App-Group snapshot for WidgetKit/watch).
 
@@ -64,12 +72,12 @@ output: versioned **immutable** `day_result` (PK `day_id, algo_version`) and
 `state/app_state.dart` 30 · `data/db.dart` 25 · `compute/derivation_engine.dart`
 24 · `data/local_repository_impl.dart` 17 · `ble/ble_engine.dart` 12 ·
 `main.dart`+`app.dart` 19. Treat diffs in these with extra scrutiny.
-`pubspec.yaml` has high raw churn but most of it is release version bumps — not
+`pubspec.yaml` has high raw churn but most of it is release version bumps, not
 a hotspot.
 
-## 3. Hard invariants — violating these is a P0 regression
+## 3. Hard invariants, violating these is a P0 regression
 
-1. **Commit before ACK.** In the history-sync drain (`ble/ble_engine.dart:~2116`)
+1. **Commit before ACK.** In the history-sync drain (`ble/ble_engine.dart`)
    decoded rows + cursor commit in one transaction *before*
    `buildHistoryResultOk` echoes the verbatim 8-byte HISTORY_END token. The band
    trims flash on ACK. Reordering, or echoing a regenerated/mangled token, causes
@@ -80,7 +88,7 @@ a hotspot.
 3. **Never fabricate a metric.** Absent input ⇒ null / `Metric.absent` / "—". No
    imputation, no substituted defaults, no deriving one metric from another as a
    fallback. Most-violated rule in the repo (§4.1).
-4. **Bump `kAlgoVersion`** (`compute/derivation_engine.dart:267`) whenever any
+4. **Bump `kAlgoVersion`** (`compute/derivation_engine.dart`) whenever any
    analytics *output* changes, including via a sibling re-pin. Rows are immutable
    per version; without a bump nothing recomputes. Add a changelog entry above
    the constant.
@@ -92,14 +100,14 @@ a hotspot.
    analytics shipped main-thread ANRs into 0.9.13/0.9.14.
 7. **Day labels are LOCAL.** Always `todayLabel()` / `dayLabelOf()` from
    `data/day_label.dart`; never `DateTime.now().toUtc()...substring(0,10)`. Epoch
-   timestamps (rec_ts, session bounds, prune cutoffs) are absolute — do not
+   timestamps (rec_ts, session bounds, prune cutoffs) are absolute, do not
    "fix" those to local. Day-length arithmetic must not assume 86400 s (DST).
 8. **One source per concern.** One raw decode point (`substrate.dart`), one sleep
    segmentation, one readiness, one frame-ingest path (`RecordGate`), one
    notification emitter (`NotificationCenter.emit`). A second path is the bug.
 9. **Never prune raw/decoded for a day that is not fully derived.** `day_result`
    has a `partial` column because days with good headline scalars but a failed
-   second-half compute were finalized and pruned — unrecoverable. `raw_archive`
+   second-half compute were finalized and pruned, unrecoverable. `raw_archive`
    is never pruned.
 10. **Heavy compute never on the UI isolate.** Staging/derivation goes through
     `Isolate.run`; analytics ambient globals do not cross the boundary and must
@@ -107,17 +115,18 @@ a hotspot.
 11. **Migrations additive and idempotent.** `onUpgrade` is a sequential
     `if (oldV < N)` ladder; `onOpen`'s `_repairOpenSchema` re-runs creators so
     same-version merged builds self-heal. Migrations run inside `openDatabase`
-    under iOS's CPU watchdog — keep them cheap. `PRAGMA journal_mode=WAL` must go
+    under iOS's CPU watchdog, keep them cheap. `PRAGMA journal_mode=WAL` must go
     through `rawQuery` (it returns a row; `execute` bricks iOS Darwin sqflite).
 12. **Headless/background sync serializes through `HeadlessSyncGate.tryRun`** —
     skip, don't queue.
 13. **The coach reads only allow-listed `v_*` views** — never `decoded_*`,
     `raw_*`, or base tables.
 14. **Live high-rate streams (0x28/0x2B/0x33) are never persisted** — RAM-only.
-15. **Dangerous opcodes are never auto-sent** (`dangerousCmds`, gated at
-    `ble/ble_engine.dart:1471`): force-trim, reboot, power-cycle, firmware load.
+15. **Dangerous opcodes are never auto-sent** (`dangerousCmds`, gated in
+    `ble/ble_engine.dart` wherever a write checks it): force-trim, reboot,
+    power-cycle, firmware load.
 
-## 4. Recurring bug patterns — what actually ships broken here
+## 4. Recurring bug patterns, what actually ships broken here
 
 ### 4.1 Fabricated / non-abstaining metrics ("honesty" violations)
 The project has an explicit never-impute rule and keeps breaking it. Instances:
@@ -131,7 +140,7 @@ data.
 **Ask on any metric diff:** what does this return when the input is missing or
 thin? Anything other than null/"—"/an honest low-confidence envelope is a bug.
 
-### 4.2 Readiness / recompute-idempotence — the largest single cluster
+### 4.2 Readiness / recompute-idempotence, the largest single cluster
 Eight distinct fixes and four sequential attempts at one user-visible symptom.
 Readiness recomputes on *every* BLE drain against a moving 28-day baseline, so
 any non-idempotent step corrupts it: duplicate-day appends into the baseline
@@ -179,7 +188,7 @@ prefs gate and the new dedupe guard. Then a TOCTOU race let two overlapping
 ### 4.7 Capability wired into one call path but not all N
 The most damaging instance: `FirmwareAwareR24Decoder` existed but was not wired
 into all three decode paths (`ble_engine.dart`, `db.dart`, `substrate.dart`), so
-a real user's 88-byte v12 records were 100% silently archived — total sync
+a real user's 88-byte v12 records were 100% silently archived, total sync
 outage. Also: HealthKit export gated on `day_result` and never session-triggered
 (a workout finished offline never exported); auto-detected workouts never
 reaching the `sessions` table, invisible to both AI Coach and Health export.
@@ -201,8 +210,8 @@ rode analytics v42 into 0.9.13; a PR bumped `kAlgoVersion` while the lock still
 pinned the pre-fix analytics commit, requiring a manual merge-order gate; and
 `0.9.17+1` shipped versionCode 1 → `INSTALL_FAILED_VERSION_DOWNGRADE`, making
 the release uninstallable.
-`pubspec_overrides.yaml` redirects siblings to `../analytics` / `../protocol` and
-is gitignored — committing a path override fails CI `flutter pub get` (exit 66).
+`pubspec_overrides.yaml` redirects both sibling packages to local checkouts and
+is gitignored; committing a path override fails CI `flutter pub get` (exit 66).
 Note the tracked `pubspec.lock` currently records `source: path` for both
 siblings, so it provides **no** pin guarantee; `pubspec.yaml` is the source of
 truth. `version:` must always keep its `+BUILD` suffix, and the iOS widget/watch
@@ -219,16 +228,19 @@ labeled "baseline" on one screen.
 three rewrites before being restored. Also recap scrub-marker misalignment,
 `GanttPainter` needing restoration, and `RangeError` from unpadded substrate
 fields. Rendering regressions here surface as test failures rather than obvious
-visual bugs — check whether removed wrapper widgets were load-bearing.
+visual bugs, check whether removed wrapper widgets were load-bearing.
 
 ## 5. How to review this repo
 
-**No CI gate runs on PRs.** `.github/workflows/build.yml` triggers only on
-`push: tags: ['v*']`. Nothing runs `flutter analyze` or `flutter test` on a pull
-request; `test/` (62 files, flat) is run manually. Several regression tests are
-named for the bug they pin (`readiness_flash_test`, `readiness_freeze_test`,
-`readiness_saturation_test`, `readiness_baseline_pollution_test`). A behavior
-change with no accompanying test is a real finding.
+**CI does run on PRs.** `.github/workflows/test.yml` runs `flutter analyze` +
+`flutter test` on every pull request and on push to `main`.
+`.github/workflows/build.yml` (the APK/IPA release) is the one gated to
+`push: tags: ['v*']` — it doesn't touch PRs. `test/` is large and not flat
+(it has `adapters/`, `support/`, and other subdirectories alongside the
+top-level test files). Several regression tests are named for the bug they pin
+(`readiness_flash_test`, `readiness_freeze_test`, `readiness_saturation_test`,
+`readiness_baseline_pollution_test`). A behavior change with no accompanying
+test is a real finding, CI passing doesn't mean the right test exists.
 
 `analysis_options.yaml` is stock `flutter_lints`: no custom rules, no excludes,
 no strict language modes.

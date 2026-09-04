@@ -3,6 +3,7 @@
 // engine — the backoff schedule, the seq allocator, the drain stop conditions,
 // and the phase→legacy-string projection — none of which need a real band.
 
+import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -215,6 +216,32 @@ void main() {
         isFalse,
       );
       expect(g.dropped, 1);
+    });
+
+    test('a below-floor time base is tellable from a wandering clock', () {
+      // Uptime-since-boot: every stamp is under kMinPlausibleUnix, forever.
+      final uptime = RecordGate();
+      expect(uptime.admit(3600, wallNow: wall), isFalse);
+      expect(uptime.admit(7200, wallNow: wall), isFalse);
+      expect(uptime.droppedBelowFloor, 2);
+      expect(uptime.timeBaseNotWallClock, isTrue);
+
+      // A wandering/future RTC drops too, but NOT below the floor — the case
+      // a reconnect or SET_CLOCK can still resolve.
+      final wandering = RecordGate();
+      expect(wandering.admit(wall + 10 * 86400, wallNow: wall), isFalse);
+      expect(wandering.dropped, 1);
+      expect(wandering.droppedBelowFloor, 0);
+      expect(wandering.timeBaseNotWallClock, isFalse);
+
+      // One below-floor drop among others is not a verdict about the source.
+      final mixed = RecordGate();
+      expect(mixed.admit(1000000000, wallNow: wall), isFalse);
+      expect(mixed.admit(wall + 10 * 86400, wallNow: wall), isFalse);
+      expect(mixed.timeBaseNotWallClock, isFalse);
+
+      // Never a verdict on a gate that has rejected nothing.
+      expect(RecordGate().timeBaseNotWallClock, isFalse);
     });
 
     test('frontier seed from the durable cursor is honoured', () {
@@ -537,6 +564,284 @@ void main() {
         ),
         isFalse, // fresh mode, unchanged
       );
+    });
+  });
+
+  group('classifyBleBlocker separates the phone from the band', () {
+    test('a revoked permission is not "nothing answered"', () {
+      expect(classifyBleBlocker(adapterState: 'unauthorized'),
+          BleBlocker.permissionDenied);
+      expect(
+        classifyBleBlocker(
+            error: Exception('PlatformException: Need '
+                'android.permission.BLUETOOTH_SCAN')),
+        BleBlocker.permissionDenied,
+      );
+    });
+
+    test('adapter off and no-BLE-radio are their own states', () {
+      expect(classifyBleBlocker(adapterState: 'off'), BleBlocker.adapterOff);
+      expect(classifyBleBlocker(adapterState: 'turningOff'),
+          BleBlocker.adapterOff);
+      expect(classifyBleBlocker(adapterState: 'unavailable'),
+          BleBlocker.unsupported);
+    });
+
+    test('a usable stack and an ordinary band failure classify as null', () {
+      expect(classifyBleBlocker(adapterState: 'on'), isNull);
+      expect(classifyBleBlocker(adapterState: 'unknown'), isNull);
+      expect(classifyBleBlocker(adapterState: 'turningOn'), isNull);
+      expect(classifyBleBlocker(), isNull);
+      // The band-side failures must NOT be swallowed as phone blockers.
+      expect(classifyBleBlocker(error: Exception('connection timeout')), isNull);
+      expect(classifyBleBlocker(error: Exception('bond failed')), isNull);
+      expect(classifyBleBlocker(error: Exception('GATT error 133')), isNull);
+    });
+  });
+
+  group('bandStatusFor is one renderable state, not six booleans', () {
+    test('every fault names itself, says why, and offers a way out', () {
+      final faults = [
+        bandStatusFor(
+            connection: 'disconnected', blocker: BleBlocker.permissionDenied),
+        bandStatusFor(connection: 'disconnected', blocker: BleBlocker.adapterOff),
+        bandStatusFor(
+            connection: 'disconnected',
+            autoReconnectPaused: true,
+            bondRefusals: 5),
+        bandStatusFor(connection: 'disconnected', needsRepairGuide: true),
+        bandStatusFor(connection: 'connected', syncChunkQuarantined: true),
+        bandStatusFor(connection: 'connected', strapNeedsReboot: true),
+        bandStatusFor(connection: 'connected', syncClockLost: true),
+      ];
+      for (final s in faults) {
+        expect(s.isFault, isTrue, reason: '${s.condition}');
+        expect(s.title.isNotEmpty, isTrue, reason: '${s.condition}');
+        expect(s.reason.length > 20, isTrue, reason: '${s.condition}');
+        expect(s.fix, isNotNull, reason: '${s.condition}');
+        // "Something went wrong" is not a name.
+        expect(s.title.toLowerCase().contains('something went wrong'), isFalse);
+      }
+    });
+
+    test('a phone-level blocker outranks every band flag', () {
+      final s = bandStatusFor(
+        connection: 'connected',
+        blocker: BleBlocker.permissionDenied,
+        autoReconnectPaused: true,
+        needsRepairGuide: true,
+        syncClockLost: true,
+      );
+      expect(s.condition, BandCondition.bluetoothDenied);
+      // The one wrong answer this whole seam exists to prevent.
+      expect(s.title.toLowerCase().contains('range'), isFalse);
+      expect(s.fix, contains('Settings'));
+    });
+
+    test('the pause outranks the repair guide it set', () {
+      expect(
+        bandStatusFor(
+          connection: 'disconnected',
+          autoReconnectPaused: true,
+          needsRepairGuide: true,
+          bondRefusals: 5,
+        ).condition,
+        BandCondition.reconnectPaused,
+      );
+      // The count is in the copy — "5 times in a row" is the whole point.
+      expect(
+        bandStatusFor(
+                connection: 'disconnected',
+                autoReconnectPaused: true,
+                bondRefusals: 5)
+            .reason,
+        contains('5'),
+      );
+    });
+
+    test('a data-flow flag outranks the plain link state', () {
+      // "Not connected" is true and useless next to "the clock is lost".
+      expect(
+        bandStatusFor(connection: 'disconnected', syncClockLost: true)
+            .condition,
+        BandCondition.clockLost,
+      );
+      expect(
+        bandStatusFor(connection: 'connected', syncChunkQuarantined: true)
+            .condition,
+        BandCondition.syncStuck,
+      );
+    });
+
+    test('the ordinary link states are not faults', () {
+      for (final c in ['connected', 'connecting', 'scanning', 'disconnected']) {
+        expect(bandStatusFor(connection: c).isFault, isFalse, reason: c);
+      }
+      expect(bandStatusFor(connection: 'connected').condition,
+          BandCondition.connected);
+      expect(bandStatusFor(connection: 'nonsense').condition,
+          BandCondition.disconnected);
+    });
+
+    test('nothing to do is expressed as a null fix, not a fake one', () {
+      final s = bandStatusFor(
+          connection: 'disconnected', blocker: BleBlocker.unsupported);
+      expect(s.condition, BandCondition.bluetoothUnsupported);
+      expect(s.fix, isNull);
+    });
+  });
+
+  group('isTimeoutDisconnect', () {
+    test('the platforms both say it in words', () {
+      // Android reports HCI/GATT names; iOS the CBError localizedDescription.
+      expect(isTimeoutDisconnect('LINK_SUPERVISION_TIMEOUT'), isTrue);
+      expect(isTimeoutDisconnect('GATT_CONNECTION_TIMEOUT'), isTrue);
+      expect(
+          isTimeoutDisconnect('The connection has timed out unexpectedly.'),
+          isTrue);
+    });
+
+    test('an ordinary termination is not a timeout', () {
+      expect(isTimeoutDisconnect('REMOTE_USER_TERMINATED_CONNECTION'), isFalse);
+      expect(isTimeoutDisconnect('connection canceled'), isFalse);
+    });
+
+    test('no reason reported is not a timeout — we never assume one', () {
+      // The old caller hardcoded `timedOut: true`, which is exactly this
+      // assumption: it made two ordinary drops inside 8 s of setup latch the
+      // re-pair guide on a band that was working.
+      expect(isTimeoutDisconnect(null), isFalse);
+    });
+  });
+
+  group('withScanLock (process-wide scan mutex)', () {
+    test('a queued scan does not start until the running one finishes', () async {
+      // The bug this exists for: two overlapping scan bodies share ONE radio
+      // scanner, so the second one's `stopScan` ends the first scan early and
+      // the first reports "found nothing" with no error anywhere.
+      final order = <String>[];
+      final holdA = Completer<void>();
+      final a = withScanLock(() async {
+        order.add('a-start');
+        await holdA.future;
+        order.add('a-end');
+        return 'a';
+      });
+      final b = withScanLock(() async {
+        order.add('b-start');
+        return 'b';
+      });
+      await Future<void>.delayed(Duration.zero);
+      expect(order, ['a-start']); // b is queued, NOT running alongside a
+      holdA.complete();
+      expect(await a, 'a');
+      expect(await b, 'b');
+      expect(order, ['a-start', 'a-end', 'b-start']);
+    });
+
+    test('a scan that throws releases the lock', () async {
+      // A blocker (revoked permission, adapter off) throws out of the band
+      // scan; the next scan must still run rather than wait on a dead chain.
+      await expectLater(
+        withScanLock<void>(() async => throw StateError('adapter off')),
+        throwsStateError,
+      );
+      expect(await withScanLock(() async => 7), 7);
+    });
+  });
+
+  group('withSecondaryLinkSlot', () {
+    test('grants up to kMaxConcurrentSecondaryLinks concurrently', () async {
+      final order = <String>[];
+      final holds = List.generate(
+          kMaxConcurrentSecondaryLinks, (_) => Completer<void>());
+      final futures = <Future<void>>[];
+      for (var i = 0; i < kMaxConcurrentSecondaryLinks; i++) {
+        futures.add(withSecondaryLinkSlot(() async {
+          order.add('start$i');
+          await holds[i].future;
+          order.add('end$i');
+        }));
+      }
+      await Future<void>.delayed(Duration.zero);
+      // Every slot up to the cap started immediately — none queued.
+      expect(order.length, kMaxConcurrentSecondaryLinks);
+      for (final h in holds) {
+        h.complete();
+      }
+      await Future.wait(futures);
+    });
+
+    test('a caller past the cap queues until a slot frees', () async {
+      final order = <String>[];
+      final holds = List.generate(
+          kMaxConcurrentSecondaryLinks, (_) => Completer<void>());
+      final futures = <Future<void>>[];
+      for (var i = 0; i < kMaxConcurrentSecondaryLinks; i++) {
+        futures.add(withSecondaryLinkSlot(() async {
+          order.add('start$i');
+          await holds[i].future;
+        }));
+      }
+      await Future<void>.delayed(Duration.zero);
+      final extra = withSecondaryLinkSlot(() async {
+        order.add('extra-start');
+      });
+      await Future<void>.delayed(Duration.zero);
+      // The cap is full — the extra caller has not started yet.
+      expect(order.contains('extra-start'), isFalse);
+      holds[0].complete();
+      await extra;
+      expect(order.contains('extra-start'), isTrue);
+      for (final h in holds) {
+        if (!h.isCompleted) h.complete();
+      }
+      await Future.wait(futures);
+    });
+
+    test('a bounded wait gives up without eating a slot', () async {
+      final holds = List.generate(
+          kMaxConcurrentSecondaryLinks, (_) => Completer<void>());
+      final futures = <Future<void>>[
+        for (var i = 0; i < kMaxConcurrentSecondaryLinks; i++)
+          withSecondaryLinkSlot(() async => holds[i].future),
+      ];
+      await Future<void>.delayed(Duration.zero);
+      var ran = false;
+      final refused = await withSecondaryLinkSlot<String?>(
+        timeout: const Duration(milliseconds: 20),
+        onTimeout: () => 'busy',
+        () async {
+          ran = true;
+          return null;
+        },
+      );
+      expect(refused, 'busy');
+      expect(ran, isFalse, reason: 'the body never ran, so it took no slot');
+      for (final h in holds) {
+        h.complete();
+      }
+      await Future.wait(futures);
+      // The timed-out waiter must have left the queue: the cap's worth of
+      // slots are all grantable again, with nothing queued in front of them.
+      await Future.wait([
+        for (var i = 0; i < kMaxConcurrentSecondaryLinks; i++)
+          withSecondaryLinkSlot(() async => null),
+      ]).timeout(const Duration(seconds: 2));
+    });
+
+    test('a held body that throws releases its slot', () async {
+      await expectLater(
+        withSecondaryLinkSlot<void>(() async => throw StateError('link dropped')),
+        throwsStateError,
+      );
+      // Cap's worth of slots must all be free again — grantable without
+      // queuing behind the failed one.
+      final futures = List.generate(
+        kMaxConcurrentSecondaryLinks,
+        (_) => withSecondaryLinkSlot(() async => null),
+      );
+      await Future.wait(futures);
     });
   });
 }

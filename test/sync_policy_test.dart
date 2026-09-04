@@ -77,6 +77,53 @@ void main() {
       expect(ClockPolicy.shouldSetClock(wall + 86400 + 1, wall), isTrue);
       expect(ClockPolicy.shouldSetClock(1000, wall), isTrue); // frozen/unset
     });
+
+    test('stops deferring once the disagreement outlives the grace window', () {
+      // MONOTONIC seconds — an arbitrary stopwatch origin, not an epoch.
+      const t0 = 1234.0;
+      const hour = 3600.0;
+      expect(ClockPolicy.suspectGraceExpired(null, t0), isFalse);
+      expect(ClockPolicy.suspectGraceExpired(t0, t0), isFalse);
+      // a slow phone re-syncs over NTP well inside this
+      expect(ClockPolicy.suspectGraceExpired(t0, t0 + hour), isFalse);
+      // still disagreeing after the window => the strap rtc is the fast one,
+      // so history must stop deferring instead of stalling forever
+      expect(ClockPolicy.suspectGraceExpired(t0, t0 + 13 * hour), isTrue);
+    });
+
+    test('a forward wall-clock jump cannot expire the grace window early', () {
+      // The regression: the window used to be measured with DateTime.now(), so
+      // the phone stepping its clock forward — the very event this state is
+      // waiting on, and one that can leave it STILL more than a day behind the
+      // strap — aged the suspicion instantly and re-authorised the
+      // drain-and-trim. Read monotonically, a wall jump is simply invisible:
+      // only real elapsed time moves this forward.
+      const startedAt = 500.0;
+      const aMinuteOfRealTimeLater = 560.0; // wall may have jumped days
+      expect(
+        ClockPolicy.suspectGraceExpired(startedAt, aMinuteOfRealTimeLater),
+        isFalse,
+        reason: 'a minute of real time is a minute, whatever the wall says',
+      );
+    });
+
+    test('flags a slow PHONE clock: a plausible strap RTC > 1d in the future', () {
+      // Clocks agree → not suspect.
+      expect(ClockPolicy.phoneClockSuspect(wall, wall), isFalse);
+      // Strap up to +1 day ahead is within margin → not suspect.
+      expect(ClockPolicy.phoneClockSuspect(wall + kFutureMargin, wall), isFalse);
+      // Plausible strap RTC > 1 day ahead → the phone is likely slow → DEFER
+      // offload (the P1: draining would drop-then-trim real records).
+      expect(
+          ClockPolicy.phoneClockSuspect(wall + kFutureMargin + 1, wall), isTrue);
+      expect(ClockPolicy.phoneClockSuspect(wall + 2 * 86400, wall), isTrue);
+      // Strap BEHIND the phone is a plausible-past time — not dropped as future,
+      // and corrected forward by shouldSetClock — so NOT a phone problem.
+      expect(ClockPolicy.phoneClockSuspect(wall - 2 * 86400, wall), isFalse);
+      // An unset/garbage-low RTC is a STRAP problem (shouldSetClock), not the
+      // phone — must not trip the phone-suspect defer.
+      expect(ClockPolicy.phoneClockSuspect(1000, wall), isFalse);
+    });
   });
 
   group('BackfillPolicy', () {
@@ -516,75 +563,6 @@ void main() {
       // A fresh run of refusals can trip again.
       d.bondRefused();
       expect(d.bondRefused(), isTrue);
-    });
-  });
-
-  group('snapToGrid + correctRecordTs (RTC salvage)', () {
-    test('snapToGrid rounds DOWN to the 5-minute boundary', () {
-      expect(snapToGrid(0), 0);
-      expect(snapToGrid(299), 0);
-      expect(snapToGrid(300), 300);
-      expect(snapToGrid(301), 300);
-      expect(snapToGrid(1234567), (1234567 ~/ 300) * 300);
-    });
-
-    test('sub-day drift is left alone (returns null — trust embedded time)', () {
-      // offset = clockWall - deviceClock = 3600 (1h) ≤ 1 day → no correction.
-      expect(
-        ClockPolicy.correctRecordTs(
-          wall - 100000,
-          wallNow: wall,
-          deviceClock: wall - 3600,
-          clockWall: wall,
-        ),
-        isNull,
-      );
-    });
-
-    test('a >1-day offset is applied AND snapped to the 5-min grid', () {
-      const daysOff = 40 * 86400; // unset RTC parked ~40 days in the past
-      final deviceClock = wall - daysOff;
-      // A record stamped at the device clock's own "now" salvages to ~wall,
-      // snapped down to the 5-min grid.
-      final corrected = ClockPolicy.correctRecordTs(
-        deviceClock, // recTs sits on the device clock
-        wallNow: wall,
-        deviceClock: deviceClock,
-        clockWall: wall,
-      );
-      expect(corrected, isNotNull);
-      expect(corrected, snapToGrid(wall));
-      expect(corrected! % kRecTsGridSeconds, 0);
-    });
-
-    test('never pushes a corrected record into the future', () {
-      const daysOff = 40 * 86400;
-      final deviceClock = wall - daysOff;
-      // A record stamped AHEAD of the device clock would land past wall-now
-      // after the offset is applied → rejected.
-      final corrected = ClockPolicy.correctRecordTs(
-        deviceClock + daysOff + 10 * 86400,
-        wallNow: wall,
-        deviceClock: deviceClock,
-        clockWall: wall,
-      );
-      expect(corrected, isNull);
-    });
-
-    test('the corrected result must still pass the session-relative band', () {
-      const daysOff = 40 * 86400;
-      final deviceClock = wall - daysOff;
-      // Session window sits far from where the correction lands → rejected even
-      // though the arithmetic is plausible against the absolute gate.
-      final corrected = ClockPolicy.correctRecordTs(
-        deviceClock,
-        wallNow: wall,
-        deviceClock: deviceClock,
-        clockWall: wall,
-        sessionOldestUnix: wall - 100 * 86400,
-        sessionNewestUnix: wall - 90 * 86400,
-      );
-      expect(corrected, isNull);
     });
   });
 

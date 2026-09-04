@@ -5,12 +5,14 @@
 // directly. Each group names the bug it guards.
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:openstrap_edge/data/db.dart';
+import 'package:openstrap_edge/health/health_export.dart';
 import 'package:openstrap_edge/notify/notification_center.dart';
 import 'package:openstrap_edge/notify/notification_event.dart';
 import 'package:openstrap_edge/state/app_state.dart';
@@ -161,6 +163,80 @@ void main() {
       await app.debugReconcileOrphanedLiveWorkout();
       expect(app.activeWorkout?.workoutId, 'resumable');
     });
+
+    test('a resumed session keeps its ceiling, so the idle gate exists',
+        () async {
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      await LocalDb.putSession({
+        'id': 'resumable-gated',
+        'start_ts': nowSec - 300,
+        'end_ts': null,
+        'type': 'run',
+        'status': 'live',
+        'source': 'manual',
+        'created_at': (nowSec - 300) * 1000,
+      });
+
+      final app = AppState.forTesting();
+      addTearDown(app.dispose);
+      app.user = {'age': 30};
+      await app.debugReconcileOrphanedLiveWorkout();
+
+      expect(app.activeWorkout?.hrMax, closeTo(208.0 - 0.7 * 30, 1e-9),
+          reason: 'without the ceiling the idle gate is null and '
+              'WorkoutIdleWatch counts any positive reading as active — a '
+              'forgotten session sitting at resting HR would never be asked '
+              'about after an app restart, the exact case the watch is for');
+    });
+
+    test('a stale (past-ceiling) orphan is finalized locally but NEVER '
+        'exported to Health', () async {
+      // Its real end time is unknown — the reconcile stamps end_ts to
+      // reconcile-time as an honest "we closed this out", not a fact. Writing
+      // that fabricated span to Apple Health / Health Connect as a real
+      // workout would be a lie in the user's own health records.
+      const channel = MethodChannel('flutter_health');
+      final calls = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            calls.add(call.method);
+            return call.method == 'hasPermissions' ? false : true;
+          });
+      addTearDown(() => TestDefaultBinaryMessengerBinding
+          .instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null));
+      SharedPreferences.setMockInitialValues({kHealthSyncPref: true});
+
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      const staleId = 'stale-past-ceiling';
+      await LocalDb.putSession({
+        'id': staleId,
+        'start_ts': nowSec - 7 * 60 * 60, // 7h old, past the 6h ceiling
+        'end_ts': null,
+        'type': 'run',
+        'status': 'live',
+        'source': 'manual',
+        'created_at': (nowSec - 7 * 60 * 60) * 1000,
+      });
+
+      final app = AppState.forTesting();
+      addTearDown(app.dispose);
+      await app.debugReconcileOrphanedLiveWorkout();
+      // exportWorkoutId is fired unawaited from the reconcile; give it a
+      // chance to run before asserting nothing came through.
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(calls, isEmpty,
+          reason: 'a stale orphan has a fabricated end_ts and must never '
+              'reach the platform health store');
+      final row = await LocalDb.session(staleId);
+      expect(row?['status'], 'done');
+      expect(row?['end_ts'], isNotNull);
+      expect(row?['end_ts_fabricated'], 1,
+          reason: 'without this flag the row looks like any other finished '
+              'workout and _writeOneWorkout would export it on the very next '
+              'periodic exportAll pass, minutes later');
+    });
   });
 
   // ── 9. a fired alarm must be cleared from state AND prefs ──────────────────
@@ -193,7 +269,9 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       await prefs.reload();
       expect(prefs.getInt('alarm_epoch'), isNull);
-      expect(app.alarmFiredAt, isNotNull, reason: 'firedAt must survive');
+      // `alarmFiredAt` had no reader in lib (alarm.dart derives its own arm
+      // state from alarmConfirmed/alarmPending), so the getter is gone and
+      // with it the only thing this line could assert on.
     });
 
     test('the app-side EXECUTED id (58) clears it too', () async {
@@ -267,10 +345,106 @@ void main() {
       addTo(app.screenRequest.addListener);
       addTo(app.insightsRevision.addListener);
       addTo(app.gestureSettings.addListener);
-      // NotificationRelay holds a WidgetsBindingObserver, a 120 s
+      // NotificationRelay holds a WidgetsBindingObserver, a 15-min heal
       // Timer.periodic and a StreamSubscription — its observer accumulated on
       // the binding across every hot restart.
       addTo(app.notificationRelay.addListener);
+    });
+  });
+
+  // ── live HR must be a reading of NOW, not the last one the engine saw ───────
+  group('AppState.liveHr freshness', () {
+    int now() => DateTime.now().millisecondsSinceEpoch;
+
+    AppState connected(int? hr, {int ageMs = 0}) {
+      final app = AppState.forTesting();
+      app.device.connection = 'connected';
+      app.device.liveHr = hr;
+      app.device.liveHrAt = hr == null ? null : now() - ageMs;
+      return app;
+    }
+
+    test('a fresh reading from a connected band is the reading', () {
+      final app = connected(142);
+      addTearDown(app.dispose);
+      expect(app.liveHr, 142);
+    });
+
+    test('a reading older than the window is absent, not stale', () {
+      // Nothing clears DeviceState.liveHr on an unintentional drop —
+      // _teardownSession never calls disableLiveStreams — so the raw field
+      // reads like a measurement forever. 30 s is well past liveHrMaxAge (10 s).
+      final app = connected(142, ageMs: 30 * 1000);
+      addTearDown(app.dispose);
+      expect(app.liveHr, isNull);
+    });
+
+    test('a disconnected band has no live HR however fresh the value looks',
+        () {
+      final app = connected(142);
+      addTearDown(app.dispose);
+      app.device.connection = 'disconnected';
+      expect(app.liveHr, isNull);
+    });
+
+    test('the tick bills a fresh reading and skips an absent one', () {
+      final app = connected(150);
+      addTearDown(app.dispose);
+      final w = LiveWorkoutState(
+        startTime: DateTime.now().subtract(const Duration(minutes: 5)),
+        targetKcal: 300,
+        workoutId: 'w1',
+        type: 'run',
+      );
+      app.activeWorkout = w;
+
+      app.debugTickWorkout();
+      expect(w.currentHr, 150);
+      final billed = w.zoneSeconds.reduce((x, y) => x + y);
+      final peak = w.maxHrSeen; // rolling-median, so not 150 off one sample
+      expect(billed, 1, reason: 'one tick, one second in a zone');
+
+      // The band drops mid-workout: the engine keeps its last value, the tick
+      // must not keep billing it. Pre-fix this read `device.liveHr ?? 0` and
+      // charged the stale 150 into zone-seconds, calories and strain for the
+      // rest of the session, then persisted it on stop.
+      app.device.liveHrAt = now() - 60 * 1000;
+      app.debugTickWorkout();
+      expect(w.currentHr, isNull, reason: 'absent is not zero');
+      expect(w.zoneSeconds.reduce((x, y) => x + y), billed,
+          reason: 'no zone-second for a second with no measurement');
+      expect(w.maxHrSeen, peak, reason: 'the peak is untouched by an absence');
+    });
+
+    test('the tick consults the idle watch — a quiet session asks', () {
+      // The wiring, not the policy (workout_idle_test.dart owns the policy):
+      // a session 30 minutes old with no live HR must have produced an ask by
+      // the end of one tick, and a session with real HR must not have.
+      final app = connected(null);
+      addTearDown(app.dispose);
+      final w = LiveWorkoutState(
+        startTime: DateTime.now().subtract(const Duration(minutes: 30)),
+        targetKcal: 300,
+        workoutId: 'w1',
+        type: 'run',
+      );
+      app.activeWorkout = w;
+      app.debugTickWorkout();
+      expect(w.idleWatch.lastAskAt, isNotNull,
+          reason: '30 quiet minutes into an open session, the watch asks');
+
+      final active = connected(150);
+      addTearDown(active.dispose);
+      final w2 = LiveWorkoutState(
+        startTime: DateTime.now().subtract(const Duration(minutes: 30)),
+        targetKcal: 300,
+        workoutId: 'w2',
+        type: 'run',
+      );
+      active.activeWorkout = w2;
+      active.debugTickWorkout();
+      expect(w2.idleWatch.lastAskAt, isNull,
+          reason: 'a real reading (no gate → any reading) is activity');
     });
   });
 }

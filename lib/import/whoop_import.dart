@@ -11,15 +11,17 @@
 // labelled by the WAKE-onset local date (a night's recovery attributes to the day
 // you wake into — our day model). Marked BETA; values are WHOOP's own numbers.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 
 import '../compute/derivation_engine.dart' show kAlgoVersion, DerivationEngine;
 import '../compute/profile.dart';
 import '../compute/substrate.dart' show localDateLabel;
 import '../data/db.dart';
+import '../health/health_export.dart';
 import 'import_container.dart';
+import 'journal_csv_import.dart' show parseCsv;
 
 class WhoopImportResult {
   final int days;
@@ -185,29 +187,6 @@ class WhoopImporter {
 
   // ── per-row writers ──────────────────────────────────────────────────────────
 
-  /// True when [row] is a day the device DERIVED itself (from real 1 Hz), as
-  /// opposed to absent, a skip marker, or a previous vendor import. Such a day
-  /// is never overwritten: `putDayResult` is INSERT OR REPLACE on both
-  /// `day_result` and `metric_series`, so writing over it would permanently
-  /// destroy measured data that a returning user cannot get back.
-  static bool _isRealDerivedDay(Map<String, dynamic>? row) {
-    if (row == null) return false;
-    if (((row['skipped'] as num?) ?? 0).toInt() == 1) return false;
-    try {
-      final p = jsonDecode((row['payload_json'] as String?) ?? '{}');
-      if (p is Map) {
-        if (p['skipped'] == true) return false;
-        // A prior import (this importer, or the cloud one) is replaceable —
-        // both are vendor snapshots, neither is measured on-device data.
-        if (p['imported'] == true) return false;
-      }
-    } catch (_) {
-      // Present but unreadable — treat as real and refuse to clobber it.
-      return true;
-    }
-    return true;
-  }
-
   static Future<_DayWrite> _writeDay(_Row row, Set<String> rawDays) async {
     String get(List<String> names) => row.get(names);
     final wakeTs = _parseTs(get(['wake onset', 'sleep onset', 'cycle start time']));
@@ -216,22 +195,18 @@ class WhoopImporter {
     if (anchor == null) return _DayWrite.unusable;
     final date = localDateLabel(anchor);
 
-    // NEVER clobber a real derived day. The import is reachable from onboarding
-    // AND from Profile, so a returning user with months of band data importing
-    // their WHOOP export used to have every overlapping day's payload and
-    // scalars replaced by the vendor's numbers — and `finalized: true` then
-    // locked the day so DerivationEngine could never rebuild it from raw.
-    if (_isRealDerivedDay(await LocalDb.dayResult(date))) {
-      return _DayWrite.keptExisting;
-    }
+    // NEVER clobber a real derived day: a returning user with months of band
+    // data importing their WHOOP export used to have every overlapping day's
+    // payload and scalars replaced by the vendor's numbers — and
+    // `finalized: true` then locked the day so DerivationEngine could never
+    // rebuild it from raw. The guard now lives in LocalDb so the other three
+    // import paths share it rather than each forgetting it.
+    if (await LocalDb.isMeasuredDay(date)) return _DayWrite.keptExisting;
 
     num? n(List<String> names) => double.tryParse(get(names));
     final recovery = n(['recovery score %', 'recovery score']);
     final rhr = n(['resting heart rate (bpm)', 'resting heart rate']);
     final rmssd = n(['heart rate variability (ms)', 'heart rate variability (rmssd) (ms)']);
-    final lnRmssd = rmssd != null && rmssd > 0
-        ? math.log(rmssd.toDouble())
-        : null;
     final strain = n(['day strain', 'strain']);
     final calories = _kcal(get(_energyCols), row.header(_energyCols));
     final resp = n(['respiratory rate (rpm)', 'respiratory rate']);
@@ -299,7 +274,6 @@ class WhoopImporter {
       'scalars': {
         'rhr': rhr,
         'rmssd': rmssd,
-        'ln_rmssd': lnRmssd,
         'readiness': recovery,
         'strain': strain,
         'resp_rate': resp,
@@ -325,13 +299,18 @@ class WhoopImporter {
       // when there is no raw substrate left to re-derive from; a day that still
       // has 1 Hz raw stays open so the real signal supersedes WHOOP's numbers.
       finalized: !rawDays.contains(date),
+      // export-provenance — WHOSE maths these scalars are. Every number in this
+      // bundle is WHOOP's own derived score read out of their CSV, not one this
+      // app computed from 1 Hz records, and unlabelled in an export the two are
+      // byte-identical. Same tag the payload already carries, so the side table
+      // and the bundle cannot drift apart.
+      source: 'whoop_export',
       rhr: d(rhr),
       rmssd: d(rmssd),
       readiness: d(recovery),
       series: {
         'rhr': d(rhr),
         'rmssd': d(rmssd),
-        'ln_rmssd': lnRmssd,
         'readiness': d(recovery),
         'strain': d(strain),
         'resp_rate': d(resp),
@@ -353,8 +332,9 @@ class WhoopImporter {
     final end = _parseTs(get(['workout end time', 'end time']));
     if (start == null) return false;
     num? n(List<String> names) => double.tryParse(get(names));
+    final id = 'whoop_$start';
     await LocalDb.putSession({
-      'id': 'whoop_$start',
+      'id': id,
       'start_ts': start,
       'end_ts': end,
       'type': _slug(get(['activity name', 'activity'])),
@@ -366,6 +346,11 @@ class WhoopImporter {
       'duration_min': (end != null) ? ((end - start) / 60).round() : null,
       'created_at': DateTime.now().millisecondsSinceEpoch,
     });
+    // exportAll only scans dates already present in day_result, so an
+    // imported workout on a date this import brought no day_result row for
+    // would otherwise never reach Health export — trigger it directly off
+    // the completed session row instead (edge#277).
+    unawaited(HealthExporter.exportWorkoutId(id));
     return true;
   }
 
@@ -428,52 +413,21 @@ class WhoopImporter {
     return t.isEmpty ? 'other' : t;
   }
 
-  /// Minimal quote-aware CSV reader (handles fields wrapped in double-quotes with
-  /// embedded commas / escaped ""). Streams lines so a large export isn't all in
-  /// memory at once for the split step.
+  /// Read a CSV via the repo's one RFC 4180 parser ([parseCsv],
+  /// journal_csv_import). The line-based reader that lived here split records
+  /// on newlines BEFORE quote-parsing, so a quoted WHOOP field containing an
+  /// embedded newline (free-text activity names/notes) was torn into two
+  /// malformed records — quote state cannot survive a LineSplitter. Lenient
+  /// decode preserved: a WHOOP export saved under a non-UTF-8 locale should
+  /// lose a character, not the whole import. Blank lines are dropped, as the
+  /// old reader did.
   static Future<List<List<String>>> _readCsv(String path) async {
-    final lines = File(path)
-        .openRead()
-        // Lenient: a WHOOP export saved under a non-UTF-8 locale should lose a
-        // character, not the whole import.
-        .transform(const Utf8Decoder(allowMalformed: true))
-        .transform(const LineSplitter());
-    final out = <List<String>>[];
-    await for (final line in lines) {
-      if (line.isEmpty) continue;
-      out.add(_splitCsvLine(line));
-    }
-    return out;
-  }
-
-  static List<String> _splitCsvLine(String line) {
-    final out = <String>[];
-    final sb = StringBuffer();
-    var inQ = false;
-    for (var i = 0; i < line.length; i++) {
-      final c = line[i];
-      if (inQ) {
-        if (c == '"') {
-          if (i + 1 < line.length && line[i + 1] == '"') {
-            sb.write('"');
-            i++;
-          } else {
-            inQ = false;
-          }
-        } else {
-          sb.write(c);
-        }
-      } else if (c == '"') {
-        inQ = true;
-      } else if (c == ',') {
-        out.add(sb.toString());
-        sb.clear();
-      } else {
-        sb.write(c);
-      }
-    }
-    out.add(sb.toString());
-    return out;
+    final bytes = await File(path).readAsBytes();
+    final text = const Utf8Decoder(allowMalformed: true).convert(bytes);
+    return [
+      for (final r in parseCsv(text))
+        if (r.length != 1 || r.single.isNotEmpty) r,
+    ];
   }
 }
 

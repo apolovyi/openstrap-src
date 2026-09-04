@@ -8,9 +8,14 @@
 // Keeping this layer pure makes the race-prone transitions unit-testable
 // without a real WHOOP band.
 
+import 'dart:async';
 import 'dart:math';
 
-import '../sync/sync_policy.dart' show isPlausibleUnix;
+// Pure byte-layer package (zero deps, no I/O) — purity of this file holds.
+import 'package:openstrap_protocol/openstrap_protocol.dart'
+    show alarmRev1Payload;
+
+import '../sync/sync_policy.dart' show isPlausibleUnix, kMinPlausibleUnix;
 
 /// The explicit connection state machine. The flutter_blue_plus connection-state
 /// stream is the SOURCE OF TRUTH for connected/disconnected; this enum layers the
@@ -57,6 +62,294 @@ String connStringFor(BleConnState s) {
       return 'connecting';
     case BleConnState.listening:
       return 'connected';
+  }
+}
+
+// ── what the user is told ────────────────────────────────────────────────────
+// The engine already knows, precisely, why a link is not working — six flags on
+// DeviceState plus the phone-level blockers below. It used to keep that to
+// itself and hand the UI a four-value connection string, so every distinct
+// failure rendered as "Not connected" (or, worse, as "No band in range", which
+// sends a user who revoked a permission on a walk around the house). This is
+// the single projection a screen renders instead: one condition, a name, a
+// reason, and a way forward.
+
+/// The phone's own Bluetooth stack refusing us, as opposed to a band that is
+/// simply not answering. Deliberately separate from every band-side flag: the
+/// fixes point in opposite directions (Settings vs. walk closer), so conflating
+/// them guarantees the user follows the wrong one.
+enum BleBlocker {
+  /// The OS is withholding Bluetooth from THIS app (iOS `unauthorized`, Android
+  /// BLUETOOTH_SCAN/CONNECT denied). Only Settings clears it.
+  permissionDenied,
+
+  /// The radio itself is off. Every app is equally stuck.
+  adapterOff,
+
+  /// No BLE radio on this device at all. Nothing to fix.
+  unsupported,
+}
+
+/// Thrown by transport calls that never reached the radio. Distinct from
+/// "returned nothing", which means the scan genuinely ran and heard nothing.
+class BleUnavailableException implements Exception {
+  final BleBlocker blocker;
+  const BleUnavailableException(this.blocker);
+
+  @override
+  String toString() => 'BleUnavailableException(${blocker.name})';
+}
+
+/// Map an adapter-state name and/or a thrown transport error onto a blocker.
+/// Returns null when neither says the stack is unusable — i.e. the failure is
+/// about the band, not the phone.
+///
+/// String matching is unavoidable: flutter_blue_plus surfaces the Android
+/// permission refusal as a platform exception whose text is the only signal.
+/// The adapter state is checked first because it is the reliable one.
+BleBlocker? classifyBleBlocker({String? adapterState, Object? error}) {
+  switch (adapterState) {
+    case 'unauthorized':
+      return BleBlocker.permissionDenied;
+    case 'unavailable':
+      return BleBlocker.unsupported;
+    case 'off':
+    case 'turningOff':
+      return BleBlocker.adapterOff;
+  }
+  if (error == null) return null;
+  final s = error.toString().toLowerCase();
+  if (s.contains('unauthorized') ||
+      s.contains('permission') ||
+      s.contains('not authorized') ||
+      s.contains('denied')) {
+    return BleBlocker.permissionDenied;
+  }
+  if (s.contains('adapter is off') ||
+      s.contains('bluetooth must be turned on') ||
+      s.contains('poweredoff') ||
+      s.contains('powered off')) {
+    return BleBlocker.adapterOff;
+  }
+  if (s.contains('unsupported') || s.contains('not supported')) {
+    return BleBlocker.unsupported;
+  }
+  return null;
+}
+
+/// Whether an unintentional disconnect looks like the link TIMING OUT — the
+/// band stopped answering / went out of range — rather than an ordinary
+/// termination (peer closed the link, local close, adapter off).
+///
+/// [MarginalRadioDetector] and [PostBondTimeoutLoopDetector] both key on
+/// "armed/bonded, then a QUICK TIMEOUT", and both used to be handed a
+/// hardcoded `true`, which made every ordinary drop a timeout: two unremarkable
+/// disconnects inside 8 s of setup were enough to latch the re-pair guide, on
+/// iOS as well as Android.
+///
+/// The platform's own reason string is the only timeout evidence we have, and
+/// it says so in words on both: Android reports HCI/GATT names
+/// (`LINK_SUPERVISION_TIMEOUT`, `GATT_CONNECTION_TIMEOUT`, …), iOS the CBError
+/// `localizedDescription` ("The connection has timed out unexpectedly."). Same
+/// string-matching trade as [classifyBleBlocker], for the same reason. No
+/// reason reported ⇒ NOT a timeout: we never assume one we cannot see.
+bool isTimeoutDisconnect(String? reasonDescription) {
+  final s = reasonDescription?.toLowerCase();
+  if (s == null) return false;
+  return s.contains('timeout') || s.contains('timed out');
+}
+
+/// The one connection state a screen renders. Ordered by priority in
+/// [bandStatusFor], most-blocking first.
+enum BandCondition {
+  bluetoothDenied,
+  bluetoothOff,
+  bluetoothUnsupported,
+
+  /// Bond refused repeatedly ⇒ auto-reconnect is PAUSED. Nothing is retrying.
+  reconnectPaused,
+
+  /// The link comes up but the band rejects the encryption key.
+  repairNeeded,
+
+  /// A batch is stuck un-confirmed and the band keeps re-sending it.
+  syncStuck,
+
+  /// The band holds newer data than it will hand over.
+  strapUnresponsive,
+
+  /// Syncs complete carrying no sensor data — the band's clock has lost sync.
+  clockLost,
+
+  connected,
+  connecting,
+  scanning,
+  disconnected,
+}
+
+/// A named connection state with the copy that goes with it. The copy lives
+/// here, not in the UI, so the mapping is unit-testable and every surface that
+/// shows the link (home, devices, pairing, a background notification) says the
+/// same thing about the same state.
+class BandStatus {
+  final BandCondition condition;
+
+  /// Names the state. Never "Something went wrong".
+  final String title;
+
+  /// Why it is in that state, and what it means for the user's data.
+  final String reason;
+
+  /// The way forward, or null when there is genuinely nothing to do.
+  final String? fix;
+
+  /// Set only for [BandCondition.reconnectPaused] — the count already baked
+  /// into [reason]'s English text, carried separately so a UI layer can
+  /// re-render the reason in another language without re-parsing it.
+  final int? bondRefusals;
+
+  const BandStatus(this.condition, this.title, this.reason,
+      {this.fix, this.bondRefusals});
+
+  /// True for the states that need to be shown. The four ordinary link states
+  /// (connected/connecting/scanning/disconnected) are the app's normal
+  /// vocabulary and do not need a failure card.
+  bool get isFault =>
+      condition != BandCondition.connected &&
+      condition != BandCondition.connecting &&
+      condition != BandCondition.scanning &&
+      condition != BandCondition.disconnected;
+}
+
+/// Fold the phone-level blocker and the band's own diagnostic flags into one
+/// state. Pure; [connection] is `DeviceState.connection`.
+///
+/// Priority is linear and deliberate: a blocker defeats everything (nothing can
+/// run), a paused reconnect outranks the flags it caused, and the data-flow
+/// flags outrank the plain link state because "not connected" is the less
+/// useful of the two true statements.
+BandStatus bandStatusFor({
+  required String connection,
+  BleBlocker? blocker,
+  bool autoReconnectPaused = false,
+  bool needsRepairGuide = false,
+  bool syncChunkQuarantined = false,
+  bool strapNeedsReboot = false,
+  bool syncClockLost = false,
+  int bondRefusals = 0,
+}) {
+  const repairFix = 'Forget the band in the phone’s Bluetooth settings, '
+      'then pair it again here';
+  switch (blocker) {
+    case BleBlocker.permissionDenied:
+      return const BandStatus(
+        BandCondition.bluetoothDenied,
+        'Bluetooth is switched off for this app',
+        'The phone is withholding the Bluetooth radio from OpenStrap, so '
+            'nothing can be scanned or connected. This is not the band — '
+            'walking closer to it will not help.',
+        fix: 'Open Settings → OpenStrap and allow Bluetooth',
+      );
+    case BleBlocker.adapterOff:
+      return const BandStatus(
+        BandCondition.bluetoothOff,
+        'Bluetooth is turned off',
+        'The phone’s radio is off, so the band cannot be reached by any app. '
+            'The band keeps recording meanwhile; nothing is lost.',
+        fix: 'Turn Bluetooth on',
+      );
+    case BleBlocker.unsupported:
+      return const BandStatus(
+        BandCondition.bluetoothUnsupported,
+        'This phone has no Bluetooth Low Energy radio',
+        'The band can only be reached over Bluetooth Low Energy. Imported '
+            'data still works; a live link does not.',
+      );
+    case null:
+      break;
+  }
+  if (autoReconnectPaused) {
+    return BandStatus(
+      BandCondition.reconnectPaused,
+      'Reconnecting has been paused',
+      'The band refused the pairing key $bondRefusals times in a row, so the '
+          'app stopped retrying rather than pin the radio and drain both '
+          'batteries on a link that will not open. Nothing is reconnecting '
+          'until you act.',
+      fix: repairFix,
+      bondRefusals: bondRefusals,
+    );
+  }
+  if (needsRepairGuide) {
+    return const BandStatus(
+      BandCondition.repairNeeded,
+      'The band needs to be paired again',
+      'The link comes up, but the band rejects the encryption key the phone '
+          'holds, so every command is dropped and no data moves. Your '
+          'recordings are safe on the band.',
+      fix: repairFix,
+    );
+  }
+  if (syncChunkQuarantined) {
+    return const BandStatus(
+      BandCondition.syncStuck,
+      'One batch of recordings will not finish transferring',
+      'The band keeps re-sending the same batch because the app cannot get '
+          'its confirmation through. Everything in it is already saved here — '
+          'nothing is lost — but the band cannot move on until the '
+          'confirmation lands.',
+      fix: 'Reconnect the band; if it repeats tomorrow, pair it again',
+    );
+  }
+  if (strapNeedsReboot) {
+    return const BandStatus(
+      BandCondition.strapUnresponsive,
+      'The band has stopped handing over its recordings',
+      'The band reports newer recordings than it will send. Those recordings '
+          'are still on the band and still safe; it just is not passing them '
+          'across.',
+      fix: 'Put the band on its charger for a minute, then reconnect',
+    );
+  }
+  if (syncClockLost) {
+    return const BandStatus(
+      BandCondition.clockLost,
+      'Syncs are finishing with no data in them',
+      'The band completes each sync without handing over a single sensor '
+          'reading, which almost always means its onboard clock has lost '
+          'sync. The app keeps resetting it on every connect.',
+      fix: 'Leave the band connected for a few minutes; if nothing arrives '
+          'by tomorrow, pair it again',
+    );
+  }
+  switch (connection) {
+    case 'connected':
+      return const BandStatus(
+        BandCondition.connected,
+        'Connected',
+        'The band is linked and handing over its recordings.',
+      );
+    case 'connecting':
+      return const BandStatus(
+        BandCondition.connecting,
+        'Connecting',
+        'Opening the link to the band.',
+      );
+    case 'scanning':
+      return const BandStatus(
+        BandCondition.scanning,
+        'Looking for the band',
+        'Listening for the band to advertise itself.',
+      );
+    default:
+      return const BandStatus(
+        BandCondition.disconnected,
+        'Not connected',
+        'The band is out of range, on its charger, or held by another app. '
+            'It keeps recording either way.',
+        fix: 'Bring the band near the phone, and close any other app '
+            'connected to it',
+      );
   }
 }
 
@@ -201,7 +494,26 @@ class RecordGate {
   /// Records rejected by the plausibility gate this connection.
   int dropped = 0;
 
+  /// Of [dropped], the ones that failed the ABSOLUTE floor
+  /// (`ts < kMinPlausibleUnix`) rather than the future or session-window tests.
+  /// The two have opposite prognoses: an unset or wandering RTC drifts back
+  /// into range (or SET_CLOCK pulls it back), while a source whose time base is
+  /// not a wall-clock epoch at all never will. Counted, never acted on — the
+  /// gate's verdict is identical either way, and must stay so.
+  int droppedBelowFloor = 0;
+
   RecordGate({this.frontierTs = 0});
+
+  /// True when this connection rejected records and EVERY rejection was below
+  /// the absolute floor — the signature of a source that does not stamp
+  /// wall-clock time (uptime-since-boot, a sequence number, milliseconds).
+  ///
+  /// Worth reporting apart from a transient clock problem because the stall is
+  /// PERMANENT: no retry, reconnect or SET_CLOCK resolves it, and the visible
+  /// symptom (records seen, nothing banked, the chunk re-delivered forever) is
+  /// identical to the transient case. See the `kMinPlausibleUnix` assumption
+  /// block in `sync_policy.dart` for the upgrade path.
+  bool get timeBaseNotWallClock => dropped > 0 && dropped == droppedBelowFloor;
 
   /// Should this record be stored? Records with no decodable time ([tsEpoch]
   /// null or <= 0) are always admitted (we can't gate them) and never advance
@@ -221,6 +533,7 @@ class RecordGate {
       sessionNewestUnix: sessionNewestUnix,
     )) {
       dropped++;
+      if (tsEpoch < kMinPlausibleUnix) droppedBelowFloor++;
       return false;
     }
     if (tsEpoch > frontierTs) frontierTs = tsEpoch;
@@ -330,7 +643,16 @@ enum TrimAckVerdict {
   /// reconnect). Refuse the trim so the band re-delivers; the engine should
   /// re-correlate the clock and retry.
   blockedNoDurableProgress,
+
+  /// The band counted more frames in this burst than we counted as valid
+  /// received traffic — some arrived corrupted or never arrived at all. The
+  /// rows we DID get are already committed; refusing the token asks the band
+  /// to re-send the chunk so the missing seconds get another chance instead of
+  /// being trimmed out of flash forever. Strictly bounded by the caller —
+  /// an unbounded refusal wedged sync forever once.
+  blockedBurstShortfall,
 }
+
 
 /// THE gate on the one irreversible act in the whole offload protocol: echoing
 /// a HISTORY_END continuation token, which is what tells the band it may trim
@@ -357,18 +679,31 @@ class TrimAckPolicy {
   /// [commitDurable]   — the atomic commit completed (pass `true` when asking
   ///                     the pre-commit question "should I even commit this
   ///                     token?").
-  /// [hadDurableRows]  — this burst buffered at least one raw/sample or archive
-  ///                     row to bank before ACK. Pass `true` when unknown
-  ///                     (pre-commit stale/discard checks only).
+  /// [hadDurableRows]  — this burst buffered at least one RECORD to bank, or
+  ///                     one archive that is NOT a plausibility drop, before
+  ///                     ACK. Plausibility drops are excluded on purpose: they
+  ///                     are archived too, so counting them would make this
+  ///                     gate unfireable exactly in the drop-only case it
+  ///                     exists for. Records we simply cannot decode DO count —
+  ///                     they are durably set aside, and excluding them wedges
+  ///                     an undecodable-only burst into endless re-delivery.
+  ///                     Pass `true` when unknown (pre-commit stale/discard
+  ///                     checks only).
   /// [droppedThisBurst] — RecordGate rejects during this burst. Combined with
   ///                     `!hadDurableRows`, refuses trim so gate-only bursts
   ///                     cannot delete flash we never stored.
+  /// [shortfallRetry]  — the caller has budget to spend one refusal
+  ///                     on this token's positive shortfall. Pass `false` on
+  ///                     the PRE-commit call: this refusal must happen only
+  ///                     AFTER the rows we did receive are durable, or the
+  ///                     re-delivery costs us the good records too.
   static TrimAckVerdict evaluate({
     required bool sessionCurrent,
     required bool burstDiscarded,
     required bool commitDurable,
     bool hadDurableRows = true,
     int droppedThisBurst = 0,
+    bool shortfallRetry = false,
   }) {
     // Order is deliberate: a stale session must be refused before anything
     // else touches the (new) link, and a poisoned burst must be refused before
@@ -379,6 +714,9 @@ class TrimAckPolicy {
     if (!hadDurableRows && droppedThisBurst > 0) {
       return TrimAckVerdict.blockedNoDurableProgress;
     }
+    // Last: everything above is a reason the chunk must not be trimmed at all.
+    // This one is a reason to ask for it AGAIN, and only once.
+    if (shortfallRetry) return TrimAckVerdict.blockedBurstShortfall;
     return TrimAckVerdict.send;
   }
 }
@@ -392,8 +730,9 @@ class TrimAckPolicy {
 /// committing an empty buffer and echoing the token verbatim, which trims
 /// exactly the records that were just thrown away. The token is unknown at
 /// discard time (it only arrives with the terminal), so the poison is keyed to
-/// the BURST, not the token: a discard poisons the open burst, and only a
-/// fresh HISTORY_START / re-arm clears it.
+/// the BURST, not the token: a discard poisons the open burst, and only a fresh
+/// HISTORY_START clears it. NOT a local re-arm — the abort→retry path re-arms
+/// on a 3 s timer while the abandoned burst's terminal is still on the wire.
 class BurstTrimGuard {
   bool _discarded = false;
 
@@ -404,7 +743,7 @@ class BurstTrimGuard {
   /// True while the open burst may NOT be trimmed.
   bool get discarded => _discarded;
 
-  /// A fresh burst begins (HISTORY_START / re-arm) — nothing lost yet.
+  /// A fresh burst begins (HISTORY_START) — nothing lost yet.
   void beginBurst() => _discarded = false;
 
   /// The open chunk was abandoned without a durable commit.
@@ -487,6 +826,23 @@ enum FrameRoute {
 
   /// Handled inline (command responses, events, live high-rate frames).
   immediate,
+
+  /// Handled inline AND enqueued on the serialized queue at its true arrival
+  /// position, where the burst COUNT for it is applied.
+  ///
+  /// Burst count members that are not type-47 data (events 48, console 50,
+  /// puffin wrappers 53/54/55 — ) arrive on a
+  /// different characteristic than the data frames but over the SAME ACL link,
+  /// so the band's transmit order is the arrival order. Counting them inline
+  /// while the data frames and their HISTORY_END queue up REORDERS the count:
+  /// a member could be tallied into the burst before its HISTORY_START opened
+  /// the window (where the next rearm wipes it) or after its HISTORY_END had
+  /// already validated — which is exactly how a burst goes permanently short
+  /// by its event/console members. Enqueueing the count at the arrival
+  /// position restores the band's ordering; the frame is still PROCESSED
+  /// inline, so wrist/battery/alarm handling is never delayed behind an
+  /// offload commit.
+  immediateAndCount,
 }
 
 /// Pure routing decision for [FrameRoute].
@@ -501,13 +857,21 @@ enum FrameRoute {
 class FrameRoutePolicy {
   const FrameRoutePolicy._();
 
+  /// [isBurstCountMember] is for the non-data
+  /// families (48/50/53/54/55); [offloadActive] is whether a history session is
+  /// running at all, since outside one there is no burst to count into.
   static FrameRoute route({
     required bool isMetadata,
     required bool isHistorical,
     required bool isDataRole,
+    bool isBurstCountMember = false,
+    bool offloadActive = false,
   }) {
     if (isMetadata) return FrameRoute.serializedQueue;
     if (isHistorical && isDataRole) return FrameRoute.serializedQueue;
+    if (isBurstCountMember && offloadActive) {
+      return FrameRoute.immediateAndCount;
+    }
     return FrameRoute.immediate;
   }
 }
@@ -667,7 +1031,39 @@ class DeriveDebouncer {
     // tier. This tier takes priority over fresh/stale whenever foreground.
     this.foregroundQuietPeriod = const Duration(seconds: 5),
     this.foregroundMaxWait = const Duration(seconds: 15),
+    // A FOURTH tier: explicitly backgrounded (Android — the foreground service
+    // keeps capture running with no OS deferral, see DeriveScheduler). Nobody
+    // can see a fresh number while backgrounded, the queued jobs are durable,
+    // and the foreground flip re-evaluates immediately (the engine pokes the
+    // timer in setBackground) — so the only thing a fast background cadence
+    // buys is widget/Health-Connect freshness, which tolerates ~45 min. This
+    // is what caps the all-night light-derive churn (one pass per maxWait
+    // instead of one per 5-min fresh window).
+    this.backgroundQuietPeriod = const Duration(minutes: 20),
+    this.backgroundMaxWait = const Duration(minutes: 45),
   });
+
+  final Duration backgroundQuietPeriod;
+  final Duration backgroundMaxWait;
+
+  /// The (quietPeriod, maxWait) pair for the current tier. One copy of the
+  /// tier priority: foreground > backgrounded > stale/fresh.
+  ({Duration quietPeriod, Duration maxWait}) _tierFor({
+    required Duration dataStaleness,
+    required bool isForeground,
+    required bool isBackgrounded,
+  }) {
+    if (isForeground) {
+      return (quietPeriod: foregroundQuietPeriod, maxWait: foregroundMaxWait);
+    }
+    if (isBackgrounded) {
+      return (quietPeriod: backgroundQuietPeriod, maxWait: backgroundMaxWait);
+    }
+    final staleMode = dataStaleness >= staleThreshold;
+    return staleMode
+        ? (quietPeriod: staleQuietPeriod, maxWait: staleMaxWait)
+        : (quietPeriod: freshQuietPeriod, maxWait: freshMaxWait);
+  }
 
   /// Should we derive now, given the pending-record bookkeeping?
   ///   [hasPending]       — records persisted since the last derive
@@ -676,27 +1072,51 @@ class DeriveDebouncer {
   ///   [isForeground]     — the app is actively in the foreground right now;
   ///                        takes priority over the fresh/stale staleness
   ///                        tiers when true (see foregroundQuietPeriod doc)
+  ///   [isBackgrounded]   — the app is explicitly backgrounded (engine
+  ///                        setBackground); slowest tier, second in priority
   bool shouldDerive({
     required bool hasPending,
     required Duration sinceLastRecord,
     required Duration sinceFirstPending,
     required Duration dataStaleness,
     bool isForeground = false,
+    bool isBackgrounded = false,
   }) {
     if (!hasPending) return false;
-    Duration quietPeriod;
-    Duration maxWait;
-    if (isForeground) {
-      quietPeriod = foregroundQuietPeriod;
-      maxWait = foregroundMaxWait;
-    } else {
-      final staleMode = dataStaleness >= staleThreshold;
-      quietPeriod = staleMode ? staleQuietPeriod : freshQuietPeriod;
-      maxWait = staleMode ? staleMaxWait : freshMaxWait;
-    }
-    if (sinceLastRecord >= quietPeriod) return true; // stream went quiet
-    if (sinceFirstPending >= maxWait) return true; // never-quiet floor
+    final tier = _tierFor(
+      dataStaleness: dataStaleness,
+      isForeground: isForeground,
+      isBackgrounded: isBackgrounded,
+    );
+    if (sinceLastRecord >= tier.quietPeriod) return true; // stream went quiet
+    if (sinceFirstPending >= tier.maxWait) return true; // never-quiet floor
     return false;
+  }
+
+  /// How long until [shouldDerive] could next flip true, given the same
+  /// inputs — lets the engine arm ONE one-shot timer at the exact boundary
+  /// instead of polling every 2 s for the whole pending window (which, with a
+  /// continuous background stream, was a permanent 0.5 Hz CPU wake). Clamped
+  /// to ≥1 s. Tier flips (foreground/background transitions) are handled by
+  /// the engine re-arming, not by this estimate.
+  Duration nextCheckDelay({
+    required Duration sinceLastRecord,
+    required Duration sinceFirstPending,
+    required Duration dataStaleness,
+    bool isForeground = false,
+    bool isBackgrounded = false,
+  }) {
+    final tier = _tierFor(
+      dataStaleness: dataStaleness,
+      isForeground: isForeground,
+      isBackgrounded: isBackgrounded,
+    );
+    final untilQuiet = tier.quietPeriod - sinceLastRecord;
+    final untilMax = tier.maxWait - sinceFirstPending;
+    final next = untilQuiet < untilMax ? untilQuiet : untilMax;
+    return next < const Duration(seconds: 1)
+        ? const Duration(seconds: 1)
+        : next;
   }
 }
 
@@ -705,9 +1125,24 @@ class DeriveDebouncer {
 /// keeping the exact byte layout here makes it unit-testable without a real band.
 ///
 /// Alarm opcodes: SET_ALARM_TIME 0x42, GET_ALARM_TIME 0x43, RUN_ALARM 0x44,
-/// DISABLE_ALARM 0x45. The RICH SET form (a haptic waveform + time) is the one
-/// that actually FIRES on WHOOP 4.0; the SHORT time-only form is ACKed but never
-/// buzzes (no waveform to play).
+/// DISABLE_ALARM 0x45. Prefer [setPayloadForBand] for arming.
+///
+/// WHICH SET FORM FIRES ON WHOOP 4 — firmware-dependent (evidence: PR #265).
+/// On fw 41.17.4 (boot 17.2.2) the REV-1 9-byte form ([rev1]) fired
+/// autonomously at the armed second (events 60 HAPTICS_FIRED + 57
+/// STRAP_DRIVEN_ALARM_EXECUTED, then 59 auto-disable), while the RICH
+/// 20-byte 0x04 form latched (event 56 + GET_ALARM readback) but never
+/// executed — three controlled trials, 2026-08-19/20, plus zero event-57s
+/// across 1.07M lines of this band's history while rich was the shipped
+/// form. On another WHOOP 4 (fw not yet reported; 2026-08-11 export in the
+/// PR review) the RICH form DID execute — the observed discriminator is
+/// firmware version, not the form alone. The SHORT 7-byte form is rev1 minus
+/// the trailing haptic-mode u16; at haptic-mode 0 the two pad4 to
+/// byte-identical BLE frames, so there is no wire distinction between them
+/// and no separate short-form behaviour to claim. [rev1] is the arm form: it
+/// is what the official WHOOP app sends (btsnoop wire capture, noop PR #535)
+/// and no observed firmware fails to execute it. WHOOP 5 keeps the rich
+/// 21-byte slot-1 form (#194, verified by its own users).
 class AlarmPayloads {
   /// The strap's stock 12-byte wake-buzz haptic pattern:
   ///   [0..7]  eight waveform-effect slots (two active: 47, 152; six idle)
@@ -725,7 +1160,20 @@ class AlarmPayloads {
   static int subsecOf(DateTime when) =>
       ((when.millisecondsSinceEpoch % 1000) * 32768) ~/ 1000;
 
-  /// RICH 20-byte SET_ALARM_TIME payload — the form that actually fires:
+  /// REV-1 9-byte SET_ALARM_TIME payload — the gen4 arm form: the official
+  /// app's wire form, fired on fw 41.17.4 (class doc for the evidence):
+  /// `[0x01][u32 epoch-sec LE][u16 subsec LE][u16 haptic-mode LE]`.
+  /// The byte layout has exactly one home, `openstrap_protocol`'s
+  /// [alarmRev1Payload]; this is the app-side name for it. Haptic-mode stays
+  /// at its default 0 (the strap's stock wake buzz) — the only value
+  /// wire-captured from the official app, so we never send anything else.
+  static List<int> rev1(DateTime when) => alarmRev1Payload(when);
+
+  /// RICH 20-byte SET_ALARM_TIME payload. On gen4 this is REFERENCE ONLY —
+  /// execution is firmware-dependent: on fw 41.17.4 it latches (event 56)
+  /// without ever executing, while at least one other firmware executes it
+  /// (class doc). Gen5 arms a 21-byte variant of this shape via
+  /// [setPayloadForBand].
   /// `[0x04][u8 index][u32 epoch-sec LE][u16 subsec LE][12-byte haptic pattern]`.
   static List<int> rich(DateTime when, {int index = 0, List<int>? haptics}) {
     final ms = when.millisecondsSinceEpoch;
@@ -746,8 +1194,10 @@ class AlarmPayloads {
     ];
   }
 
-  /// SHORT 7-byte time-only SET_ALARM_TIME payload (ACKs but does NOT fire):
-  /// `[0x01][u32 epoch-sec LE][u16 subsec LE]`.
+  /// SHORT 7-byte time-only SET_ALARM_TIME payload — [rev1] without the
+  /// trailing haptic-mode u16. At haptic-mode 0 the two serialize to the SAME
+  /// padded frame, so this is not a distinct wire form. REFERENCE ONLY:
+  /// `[0x01][u32 epoch-sec LE][u16 subsec LE]`. Prefer [setPayloadForBand].
   static List<int> simple(DateTime when) {
     final ms = when.millisecondsSinceEpoch;
     final sec = ms ~/ 1000;
@@ -763,11 +1213,79 @@ class AlarmPayloads {
     ];
   }
 
+  /// Generation-correct SET_ALARM_TIME body — 9 bytes on gen4, 21 on gen5.
+  ///
+  /// WHOOP 4: the REV-1 form ([rev1]) — the official app's wire form, which
+  /// fired on fw 41.17.4 where the rich slot-0 body this used to build
+  /// latched without executing (class doc for the firmware split).
+  /// [index]/[haptics]/[crescendo] do not exist in the rev-1 layout and are
+  /// ignored on gen4.
+  ///
+  /// WHOOP 5: rich 21-byte body at slot **index 1** (index 0 is rejected with
+  /// console `arm info is invalid, error 0xb`; the [index] argument is ignored
+  /// so callers cannot accidentally arm slot 0). Kept exactly as #194 shipped
+  /// it — verified by gen5 users; the gen4 findings do not transfer.
+  static List<int> setPayloadForBand(
+    DateTime when, {
+    required bool isGen5,
+    int index = 0,
+    List<int>? haptics,
+    int crescendo = 0,
+  }) =>
+      isGen5
+          ? <int>[
+              ...rich(when, index: gen5Slot, haptics: haptics),
+              // gen5's body carries one byte more than gen4's rich form: a
+              // crescendo flag the strap validates as 0 or 1 and rejects
+              // otherwise, so a 20-byte body is refused there. Keep this in
+              // step with protocol's cmdSetAlarm, the reference layout.
+              crescendo & 0x01,
+            ]
+          : rev1(when);
+
+  /// The alarm slot WHOOP 5 accepts (index 0 is rejected).
+  static const int gen5Slot = 1;
+
+  /// The gen5 "every slot" alarm id, used by [disableForBand].
+  static const int gen5AllSlots = 0xFF;
+
+  /// Gen5 Maverick test-buzz body (RUN_HAPTIC_PATTERN_MAVERICK = 0x13).
+  /// Same `[47, 152]` waveform pair as Find-band. Keep [overallLoop] at 1 for
+  /// a short pulse — the wake-alarm's loop=7 feels like a stuck vibrate.
+  static List<int> gen5MaverickBuzz({int overallLoop = 1}) {
+    // `& 0xff` keeps an int (unlike `clamp`, which widens to num).
+    final loop = overallLoop.clamp(0, 0xff).toInt();
+    return <int>[0x01, 47, 152, 0, 0, 0, 0, 0, 0, 0, 0, loop];
+  }
+
   /// RUN_ALARM (0x44) body — fire the haptics immediately ("test buzz").
   static const List<int> runNow = <int>[0x01];
 
-  /// DISABLE_ALARM (0x45) body — cancel the on-device alarm.
+  /// DISABLE_ALARM (0x45) body — cancel the on-device alarm. GEN4 form; do not
+  /// change (hardware-verified). Use [disableForBand].
   static const List<int> disable = <int>[0x01];
+
+  /// Generation-correct DISABLE_ALARM (0x45) body.
+  ///
+  /// WHOOP 4 takes revision 1 with no operand. WHOOP 5 takes revision 2 plus
+  /// the alarm id to clear, where [gen5AllSlots] clears every slot; sent the
+  /// gen4 body it reads the id from past the end of the body and the alarm
+  /// stays armed.
+  static List<int> disableForBand({
+    required bool isGen5,
+    int id = gen5AllSlots,
+  }) =>
+      isGen5 ? <int>[0x02, id & 0xff] : disable;
+
+  /// Generation-correct GET_ALARM_TIME (0x43) body.
+  ///
+  /// WHOOP 4 takes revision 1 with no operand; WHOOP 5 takes revision 4 plus
+  /// the alarm id to read, defaulting to the slot [setPayloadForBand] arms.
+  static List<int> getPayloadForBand({
+    required bool isGen5,
+    int id = gen5Slot,
+  }) =>
+      isGen5 ? <int>[0x04, id & 0xff] : const <int>[0x01];
 
   /// Convert a WALL-CLOCK alarm target into the strap's own RTC frame.
   ///
@@ -864,5 +1382,573 @@ class AlarmConfirmation {
       default:
         return null;
     }
+  }
+}
+
+// ── command/response correlation ────────────────────────────────────
+
+/// A command response that was matched to a request we actually made.
+///
+/// Wire layout:
+/// `[36][response seq][echoed opcode][originating seq][result][body…]`.
+class CorrelatedResponse {
+  /// The echoed opcode — equal to the opcode of the request by construction.
+  final int opcode;
+
+  /// The sequence WE allocated for the request (not necessarily the byte on
+  /// the wire: see [viaSeqZeroFallback]).
+  final int seq;
+
+  /// `result`: 0 FAILURE, 1 SUCCESS, 2 PENDING, 3 UNSUPPORTED. `-1` when the
+  /// response was too short to carry one.
+  final int status;
+
+  /// The decoded response field map (whatever the protocol decoder produced).
+  final Map<String, dynamic> fields;
+
+  /// True when this reply carried originating sequence 0 and was matched by
+  /// opcode alone — the doc-02 compatibility path.
+  final bool viaSeqZeroFallback;
+
+  const CorrelatedResponse({
+    required this.opcode,
+    required this.seq,
+    required this.status,
+    this.fields = const {},
+    this.viaSeqZeroFallback = false,
+  });
+
+  bool get success => status == CommandAwaiter.statusSuccess;
+  bool get failed => status == CommandAwaiter.statusFailure;
+  bool get unsupported => status == CommandAwaiter.statusUnsupported;
+}
+
+/// What [CommandAwaiter.deliver] did with a response.
+enum CommandDelivery {
+  /// It satisfied a pending request, which is now complete.
+  completed,
+
+  /// It matched a pending request whose PENDING is non-terminal — the await stays open for the terminal result.
+  pendingHeld,
+
+  /// Nothing was waiting for it, or it failed the match rules (wrong opcode
+  /// for that sequence, or an ambiguous sequence-zero fallback).
+  unmatched,
+}
+
+/// One outstanding command transaction. Created by [CommandAwaiter.register]
+/// BEFORE the write goes out.
+class PendingCommand {
+  final int seq;
+  final int opcode;
+  final Duration timeout;
+  final CommandAwaiter _owner;
+  final Completer<CorrelatedResponse?> _completer =
+      Completer<CorrelatedResponse?>();
+
+  PendingCommand._(this._owner, this.seq, this.opcode, this.timeout);
+
+  Timer? _expiry;
+
+  /// Start the one-shot expiry. Idempotent: the timeout is applied EXACTLY
+  /// ONCE and there is no automatic resend — retry, disconnect and abort
+  /// belong to the calling state machine.
+  ///
+  /// Called from [CommandAwaiter.register] rather than lazily from [response],
+  /// so a command that is registered and then never awaited still leaves the
+  /// registry after [timeout]. Arming here starts the clock fractionally
+  /// before the write returns, which costs a few ms of a multi-second window
+  /// and buys the invariant that nothing can outlive its timeout.
+  void _armExpiry() {
+    _expiry ??= Timer(timeout, () {
+      _owner._forget(this);
+      if (!_completer.isCompleted) _completer.complete(null);
+    });
+  }
+
+  /// The correlated reply, or null once [timeout] expires.
+  Future<CorrelatedResponse?> get response {
+    _armExpiry();
+    return _completer.future;
+  }
+
+  bool get isCompleted => _completer.isCompleted;
+
+  /// Give up without waiting out the timeout — the write never went out, or
+  /// the link died under it.
+  void cancel() {
+    _expiry?.cancel();
+    _owner._forget(this);
+    if (!_completer.isCompleted) _completer.complete(null);
+  }
+
+  void _complete(CorrelatedResponse r) {
+    _expiry?.cancel();
+    _owner._forget(this);
+    if (!_completer.isCompleted) _completer.complete(r);
+  }
+}
+
+/// The registry that turns fire-and-forget writes into real request/response
+/// transactions.
+///
+/// Match rule — a response is accepted only when **both** fields agree:
+/// ```text
+/// response.originating_sequence == request.sequence
+/// response.echoed_opcode        == request.opcode
+/// ```
+/// A sequence match with the wrong opcode is NOT a success: it is rejected and
+/// the surrounding await is left to time out. That is the whole point — the
+/// old ad-hoc completers in the engine keyed off "a reply of roughly the right
+/// shape arrived", so an unrelated command's answer could satisfy a read the
+/// app then acted on.
+///
+/// This class is deliberately transport-free: the engine allocates the
+/// sequence, frames and writes; this only says which reply belongs to which
+/// request.
+class CommandAwaiter {
+  /// The generic five-second command await.
+  static const Duration defaultTimeout = Duration(milliseconds: 5000);
+
+  static const int statusFailure = 0;
+  static const int statusSuccess = 1;
+  static const int statusPending = 2;
+  static const int statusUnsupported = 3;
+
+  /// The only commands whose `PENDING` is NON-terminal: GET_HELLO(145) and GET_DATA_RANGE(34) keep waiting for a
+  /// terminal failure/success/unsupported. Every other command completes on
+  /// the first matching response, PENDING included.
+  static const Set<int> pendingIsNonTerminal = <int>{0x91, 0x22};
+
+  /// Whether to honour the optional sequence-zero compatibility path:
+  /// a response whose originating sequence is 0 may match a nonzero request by
+  /// opcode. The doc's own caveat is that two outstanding requests with the
+  /// same opcode then become ambiguous — so a fallback match is only taken
+  /// when EXACTLY ONE pending request carries that opcode, and refused
+  /// otherwise rather than guessing.
+  final bool seqZeroFallback;
+
+  CommandAwaiter({this.seqZeroFallback = true});
+
+  final List<PendingCommand> _pending = <PendingCommand>[];
+
+  int get pendingCount => _pending.length;
+
+  /// The (seq, opcode) pairs currently outstanding — diagnostics/tests.
+  List<String> get pendingKeys =>
+      _pending.map((p) => '${p.seq}/${p.opcode}').toList(growable: false);
+
+  bool hasPendingOpcode(int opcode) => _pending.any((p) => p.opcode == opcode);
+
+  bool hasPendingSeq(int seq) => _pending.any((p) => p.seq == seq);
+
+  /// Install an observer for a command about to be written. Call this BEFORE
+  /// the write so a fast response cannot arrive before its
+  /// observer exists.
+  PendingCommand register(
+    int seq,
+    int opcode, {
+    Duration timeout = defaultTimeout,
+  }) {
+    final p = PendingCommand._(this, seq, opcode, timeout);
+    _pending.add(p);
+    // Arm now, not on first await. An entry that is registered and never
+    // awaited would otherwise sit in `_pending` for the life of the
+    // connection, and `deliver` would refuse every later sequence-zero
+    // fallback for that opcode because the stale entry makes the match
+    // ambiguous.
+    p._armExpiry();
+    return p;
+  }
+
+  /// Offer a decoded command response to the registry.
+  CommandDelivery deliver({
+    required int? opcode,
+    required int? reqSeq,
+    int? status,
+    Map<String, dynamic> fields = const {},
+  }) {
+    // Without an echoed opcode or an originating sequence there is nothing to
+    // correlate on, so nothing may be satisfied.
+    if (opcode == null || reqSeq == null) return CommandDelivery.unmatched;
+    PendingCommand? match;
+    var viaFallback = false;
+    for (final p in _pending) {
+      if (p.seq == reqSeq && p.opcode == opcode) {
+        match = p;
+        break;
+      }
+    }
+    if (match == null && seqZeroFallback && reqSeq == 0) {
+      final sameOpcode = _pending.where((p) => p.opcode == opcode).toList();
+      if (sameOpcode.length != 1) return CommandDelivery.unmatched;
+      match = sameOpcode.single;
+      viaFallback = true;
+    }
+    if (match == null) return CommandDelivery.unmatched;
+    final result = status ?? -1;
+    if (result == statusPending && pendingIsNonTerminal.contains(opcode)) {
+      return CommandDelivery.pendingHeld;
+    }
+    match._complete(CorrelatedResponse(
+      opcode: opcode,
+      seq: match.seq,
+      status: result,
+      fields: fields,
+      viaSeqZeroFallback: viaFallback,
+    ));
+    return CommandDelivery.completed;
+  }
+
+  /// Abandon every outstanding command (the link went down). Each await
+  /// resolves null immediately instead of holding its caller for the full
+  /// timeout on a connection that no longer exists.
+  void failAll() {
+    for (final p in List<PendingCommand>.of(_pending)) {
+      p.cancel();
+    }
+    _pending.clear();
+  }
+
+  void _forget(PendingCommand p) => _pending.remove(p);
+}
+
+/// The identity half of the gen5 bootstrap readiness check — ENFORCED.
+///
+/// After a terminal successful HELLO, readiness requires the serial and CPU
+/// strings to each FULLY match `[a-zA-Z0-9]+`. An empty or partially-matching
+/// value fails, and the bootstrap treats a failed verdict as a connection
+/// failure: no READY, disconnect. The CPU string is lowercase hex by
+/// construction, so in practice it can only fail when it is empty — which is
+/// precisely a body the parser never filled.
+///
+/// An all-zero serial is an EEPROM-failure signal, NOT a rejection — it passes
+/// the alphanumeric gate and is surfaced as a separate diagnostic.
+class HelloIdentity {
+  static final RegExp alphanumeric = RegExp(r'^[a-zA-Z0-9]+$');
+
+  final bool serialOk;
+  final bool cpuOk;
+  final bool eepromFailureSignal;
+
+  const HelloIdentity({
+    required this.serialOk,
+    required this.cpuOk,
+    required this.eepromFailureSignal,
+  });
+
+  bool get ok => serialOk && cpuOk;
+
+  static HelloIdentity evaluate({
+    required String serial,
+    required String cpuHex,
+    bool eepromFailureSignal = false,
+  }) =>
+      HelloIdentity(
+        serialOk: alphanumeric.hasMatch(serial),
+        cpuOk: alphanumeric.hasMatch(cpuHex),
+        eepromFailureSignal: eepromFailureSignal,
+      );
+
+  @override
+  String toString() => 'serial=${serialOk ? 'ok' : 'BAD'} '
+      'cpu=${cpuOk ? 'ok' : 'BAD'}'
+      '${eepromFailureSignal ? ' serial=all-zero(EEPROM)' : ''}';
+}
+
+/// The bootstrap clock gate.
+///
+/// The pinned flow compares the timestamp hello already returned (or, as a
+/// fallback, a `GET_CLOCK` reply) against host time and writes NOTHING below
+/// two whole seconds of absolute drift: "Below 2 whole seconds, succeed with no
+/// BLE write. At 2 or more, send one `SET_CLOCK(10)`". This app used to send
+/// SET_CLOCK unconditionally on every connect, i.e. one guaranteed write per
+/// connection that the band never needed.
+///
+/// Deliberately NOT part of [ClockPolicy] (sync_policy.dart): that class owns
+/// the *repair* rules — a drift over a day, an unset RTC, a phone we do not
+/// trust — which are a different question with a different threshold. This is
+/// only the bootstrap sequence's "is a correction needed at all" step, and it
+/// sits with the rest of the doc-01 bootstrap logic ([HelloIdentity]).
+class BootstrapClockGate {
+  /// Absolute whole-second drift at or above which exactly one SET_CLOCK goes
+  /// out. Below it the bootstrap makes no BLE write at all.
+  static const int toleranceSeconds = 2;
+
+  /// [driftSec] is `wall - strapRtc` ([ClockRef.driftSec]); the sign does not
+  /// matter, only the magnitude.
+  ///
+  /// A null drift means no correlation exists at this point — hello carried no
+  /// timestamp AND the GET_CLOCK fallback went unanswered, or the reading was
+  /// rejected as implausible (an unset band RTC reads decades low and is never
+  /// correlated). That must WRITE: an unset RTC left uncorrected stamps every
+  /// record and every alarm against a clock that was never set, which is the
+  /// one outcome worse than a redundant write.
+  static bool needsCorrection(int? driftSec) =>
+      driftSec == null || driftSec.abs() >= toleranceSeconds;
+
+  /// The same gate at millisecond resolution, for the gen5 path where hello
+  /// carries subseconds (32768 units/s) and the comparison is against a newly
+  /// sampled phone time. "Below two WHOLE seconds of absolute drift, no
+  /// write" — a delta of 1.999 s has whole-second component 1 and passes;
+  /// exactly 2.000 s writes. Null keeps the write-on-no-reading rule above.
+  static bool needsCorrectionMs(int? absDeltaMs) =>
+      absDeltaMs == null || absDeltaMs.abs() >= toleranceSeconds * 1000;
+}
+
+/// Which GENERATION a scan result advertises, by its advertised service UUIDs.
+///
+/// A HINT, NOT THE ACCEPT DECISION — do not turn it back into one. Acceptance
+/// is deliberately broader (`advertisementLooksLikeWhoop` and the scanner's own
+/// match): a band whose 128-bit service UUID spills into the scan-response
+/// overflow area advertises only the 16-bit member UUID or its name, and
+/// refusing those would leave WHOOP MG unpairable (#255).
+///
+/// This is the narrower question the connect ROUTE asks: which generation did
+/// the advertisement actually name? A name-only or 16-bit-only match names
+/// none and returns null, and the connect path then probes the official gen5
+/// order first and lets GATT discovery pin the truth. Returning null here
+/// therefore means "no hint", never "not a WHOOP".
+class ScanAcceptPolicy {
+  /// The advertised-service prefixes that identify a WHOOP band: gen4
+  /// "Harvard" `61080001-…`, gen5 `fd4b0001-…`.
+  static const String gen4AdvertisedPrefix = '61080001';
+  static const String gen5AdvertisedPrefix = 'fd4b0001';
+
+  /// The generation the advertisement claims — 'gen4' / 'gen5' — or null when
+  /// no supported WHOOP service UUID is advertised (no hint; the scanner may
+  /// still have accepted the result). [serviceUuids] are the advertisement's
+  /// service UUID strings, any case.
+  static String? accepts(Iterable<String> serviceUuids) {
+    for (final raw in serviceUuids) {
+      final s = raw.toLowerCase();
+      if (s.startsWith(gen5AdvertisedPrefix)) return 'gen5';
+      if (s.startsWith(gen4AdvertisedPrefix)) return 'gen4';
+    }
+    return null;
+  }
+}
+
+/// Which connect order a link gets, decided BEFORE discovery has run.
+enum ConnectRoute {
+  /// The official gen5 sequence (PHY preference → discovery → MTU → bond …).
+  gen5Official,
+
+  /// The proven legacy gen4 flow (bond → MTU → discovery …), unchanged.
+  gen4Legacy,
+}
+
+/// The routing rule: only an EXPLICIT gen4 hint takes the legacy order.
+/// Unknown/null — a pairing upgraded from an older build, a garbled stored
+/// value — probes gen5-first: the official sequence's pre-discovery steps are
+/// safe on any device (the PHY request is non-fatal by contract), its
+/// discovery identifies the band, and a discovered gen4 falls back to the
+/// unchanged legacy flow. Routing unknown links through the legacy order
+/// instead would run a gen5 band's bond in the wrong position on every
+/// connect until something persisted the generation.
+ConnectRoute connectRouteFor(String? generationHint) =>
+    generationHint == 'gen4' ? ConnectRoute.gen4Legacy : ConnectRoute.gen5Official;
+
+/// Whether a `GET_BATTERY_PACK_INFO(151)` reply actually identifies a pack.
+///
+/// "A response is usable only if its pack address/name field is non-empty and
+/// is not `00:00:00:00:00:00`" — the band answers the command while it is still
+/// working out what it is sitting on, so an early reply carries the all-zero
+/// address, which is why the follow-up retries at all.
+///
+/// `attached` is deliberately not part of the gate: the doc names only the
+/// address/name field, and the flag is recorded alongside the reading rather
+/// than deciding whether the reading counts.
+class BatteryPackInfoGate {
+  /// The "no pack yet" address the band answers with before it knows.
+  static const String unsetAddress = '00:00:00:00:00:00';
+
+  static bool usable({required String identifier, required String name}) {
+    final id = identifier.trim().toLowerCase();
+    final nm = name.trim().toLowerCase();
+    if (id == unsetAddress) return false;
+    if (id.isNotEmpty) return true;
+    // No identifier: a name alone carries the reply only when it is a real
+    // name — the sentinel address leaking through the name field is still
+    // "no pack yet".
+    return nm.isNotEmpty && nm != unsetAddress;
+  }
+}
+
+/// Process-wide BLE scan mutex.
+///
+/// The radio has ONE scanner. Today `BleEngine.scan` is its only caller —
+/// `hr_sensor.dart`'s sensor scan had zero callers and went with the file, and
+/// a pairing screen for a second device is the next thing to take this lock.
+/// Every caller stops whatever is already scanning and then waits for
+/// `FlutterBluePlus.isScanning` to go false — an await that any scan stopping
+/// satisfies, including the OTHER caller's. The loser's scan therefore
+/// "completed" the instant the winner called `stopScan`, having seen nothing,
+/// and the caller reported "no device found" with no error anywhere to say
+/// why. Serialising the two bodies is the whole fix.
+///
+/// Same idiom as `BleEngine._locked` — chain onto the previous op, hand the
+/// caller a completer, swallow nothing — hoisted out of the engine because the
+/// contention is BETWEEN objects, not between two ops on one engine. It has to
+/// stay static once a primary band and a secondary device can both scan.
+///
+/// ponytail: one global lock, so a queued scan waits out the running one's
+/// whole timeout (~12 s) rather than joining it. Give waiters the running
+/// scan's results only if a screen ever needs both scans at once.
+Future<T> withScanLock<T>(Future<T> Function() body) {
+  final completer = Completer<T>();
+  // A body that throws must not break the chain — the error goes to its own
+  // caller and the next scan still runs.
+  _scanLock = _scanLock.then((_) async {
+    try {
+      completer.complete(await body());
+    } catch (e, st) {
+      completer.completeError(e, st);
+    }
+  });
+  return completer.future;
+}
+
+Future<void> _scanLock = Future.value();
+
+/// One GATT write in flight at a time, per LINK.
+///
+/// Same idiom as [withScanLock] — chain onto the previous op, hand the caller a
+/// completer, swallow nothing — but INSTANCE-scoped, because the thing being
+/// serialised is one peripheral's command characteristic and two peripherals
+/// must not queue behind each other (the per-remoteId ownership model exists so
+/// a background drainer and a foreground link can run at once).
+///
+/// Why it has to exist at all: a with-response write issued before the previous
+/// one has been acknowledged is dropped or reordered by the stack, and the
+/// failure is SILENT — the frame simply never reaches the band. `BleEngine`
+/// has had this since the batch-ACK path was written; `GattBandLink` shipped
+/// without it (ASSUMPTIONS G5) and could not bite only because no adapter
+/// wrote anything yet.
+class WriteChain {
+  Future<void> _tail = Future.value();
+
+  /// Run [op] after everything already queued on this chain. The returned
+  /// future carries [op]'s result or its error; the chain itself never carries
+  /// the error, so one failed write cannot wedge every write after it.
+  Future<T> add<T>(Future<T> Function() op) {
+    final completer = Completer<T>();
+    _tail = _tail.then((_) async {
+      try {
+        completer.complete(await op());
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    });
+    return completer.future;
+  }
+}
+
+/// How many SECONDARY links (everything that is not the primary band) may be
+/// connected at once.
+///
+/// A GUESS. Android's real concurrent-GATT ceiling is per-OEM and undocumented;
+/// published behaviour ranges from 4 to 7 client connections and some budget phones
+/// are lower. iOS has no published ceiling and has never been observed to refuse.
+/// So this is a self-imposed floor chosen to be smaller than every number anyone
+/// reports, not a measurement — if a real device refuses a third link, lower it to 1
+/// and the primary still connects.
+///
+/// THE PRIMARY BAND IS NOT COUNTED and never queues. It holds the offload link the
+/// safe-trim invariant depends on (commit-then-ACK, flash trim), and making it wait
+/// behind a chest strap would turn a sensor's 12 s connect timeout into a delayed
+/// band sync — which is exactly the regression this milestone must not ship. With
+/// today's two pairable sensor kinds (kBleHrs, kOura) the cap is never reached, so
+/// this is a guard for the N-device future, not a change in behaviour.
+const int kMaxConcurrentSecondaryLinks = 2;
+
+int _secondaryLinksInUse = 0;
+final List<Completer<void>> _secondaryLinkWaiters = [];
+
+/// Wait for a free secondary-link slot and take it. Pairs with
+/// [releaseSecondaryLinkSlot] — the resource being capped is a LIVE GATT
+/// connection, not the act of opening one, so acquire/release do not have to
+/// nest inside one call the way [withSecondaryLinkSlot] does: a caller whose
+/// link outlives the method that opened it (HrsLink._arm, OuraLink's offload
+/// connect) acquires here before `connect()` and releases from wherever the
+/// link actually tears down (disarm/finally), not from the connect call site.
+/// [timeout] bounds the WAIT, not the link: false means no slot came free in
+/// time and the caller took nothing, so it must NOT release. Only a
+/// user-facing flow that has to answer (pairing) should pass one — a
+/// background sync is late, not refused.
+Future<bool> acquireSecondaryLinkSlot({Duration? timeout}) async {
+  if (_secondaryLinksInUse >= kMaxConcurrentSecondaryLinks) {
+    final waiter = Completer<void>();
+    _secondaryLinkWaiters.add(waiter);
+    if (timeout != null) {
+      try {
+        await waiter.future.timeout(timeout);
+        return true;
+      } on TimeoutException {
+        // Still queued ⇒ leave the queue and own nothing. Gone from the queue
+        // ⇒ a releaser handed us its slot in the same turn the timeout fired,
+        // so give it back rather than leak it past the cap.
+        if (_secondaryLinkWaiters.remove(waiter)) return false;
+        releaseSecondaryLinkSlot();
+        return false;
+      }
+    }
+    // THE RELEASER TRANSFERS ITS SLOT and leaves the count alone, so the count
+    // already includes us by the time this resumes — and a caller arriving in
+    // the window between the release and that resume still sees the cap as
+    // reached and queues BEHIND us. Decrementing there and re-incrementing
+    // here left a window a whole microtask wide in which a late arrival read
+    // the freed count, skipped the queue, and took a slot already promised:
+    // three live GATT links against a cap of two, FIFO order lost.
+    await waiter.future;
+    return true;
+  }
+  _secondaryLinksInUse++;
+  return true;
+}
+
+/// Release a slot taken by [acquireSecondaryLinkSlot]. Must be called exactly
+/// once per successful acquire — callers that can fail before acquiring
+/// (queued and cancelled, body threw before connect) must not call this.
+void releaseSecondaryLinkSlot() {
+  // A stray release frees nothing, so it must not wake a waiter either — that
+  // waiter would resume owning a slot nobody held and push the count past the
+  // cap.
+  if (_secondaryLinksInUse <= 0) return;
+  if (_secondaryLinkWaiters.isNotEmpty) {
+    // Hand the slot straight over: no decrement, no re-increment, no window.
+    _secondaryLinkWaiters.removeAt(0).complete();
+    return;
+  }
+  _secondaryLinksInUse--;
+}
+
+/// Run [body] holding one secondary-link slot for exactly [body]'s duration.
+/// Waits — never fails — when the cap is reached: a third device's connect is
+/// late, not refused, which is what the plan means by "a queue, not a failure".
+///
+/// [timeout]/[onTimeout] are the exception, for a flow a PERSON is waiting on:
+/// pairing cannot sit on a spinner behind an offload it cannot see, so it
+/// bounds the wait and says so instead. Both or neither.
+///
+/// For a link that OUTLIVES this call (a live GATT session, not a one-shot
+/// probe), use [acquireSecondaryLinkSlot]/[releaseSecondaryLinkSlot] directly
+/// instead — see their doc comments.
+///
+/// ponytail: one global semaphore with FIFO ordering, so a queued connect waits out
+/// the running one's whole connect+discovery (~12-20 s). Per-family fairness only if
+/// a real device is ever starved.
+Future<T> withSecondaryLinkSlot<T>(
+  Future<T> Function() body, {
+  Duration? timeout,
+  T Function()? onTimeout,
+}) async {
+  assert((timeout == null) == (onTimeout == null),
+      'a bounded wait needs the answer it gives when the bound is reached');
+  if (!await acquireSecondaryLinkSlot(timeout: timeout)) return onTimeout!();
+  try {
+    return await body();
+  } finally {
+    releaseSecondaryLinkSlot();
   }
 }

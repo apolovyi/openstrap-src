@@ -17,6 +17,7 @@ class DeriveScheduler {
     required this.onChanged,
     this.lightSettle = const Duration(seconds: 8),
     this.heavySettle = const Duration(seconds: 2),
+    this.workoutHoldCap = const Duration(hours: 6),
   });
 
   final Future<void> Function({required DeriveJobKind kind}) run;
@@ -24,6 +25,19 @@ class DeriveScheduler {
   final void Function() onChanged;
   final Duration lightSettle;
   final Duration heavySettle;
+
+  /// Ceiling on the live-workout hold. The hold's whole justification is "a
+  /// workout is minutes long and its own results are derived at the end
+  /// anyway, so deferring costs nothing" — which inverts the moment the user
+  /// forgets to finish the session: capture keeps landing records, every
+  /// queued job stays parked, today's `day_result` is never built, and Home
+  /// spends the day on "Nothing recorded for today — Sync the band" while the
+  /// strap is connected and syncing fine. Past the cap the session is treated
+  /// as forgotten and held work drains even though it is still live. Six
+  /// hours matches `AppState._kMaxLiveWorkoutAgeMs`, the ceiling past which a
+  /// live session row from a previous run is already judged "almost certainly
+  /// not something the user is still in".
+  final Duration workoutHoldCap;
 
   bool _offloadActive = false;
 
@@ -36,17 +50,29 @@ class DeriveScheduler {
   /// foregrounded, so derives ran at their most expensive possible moment,
   /// competing with the GPS stream, the live map and the BLE drain. A workout
   /// is minutes long and its own results are derived at the end anyway, so
-  /// deferring costs nothing.
+  /// deferring costs nothing — as long as the session actually ends; a
+  /// forgotten one is bounded by [workoutHoldCap].
   bool _workoutActive = false;
 
+  /// True once [workoutHoldCap] has elapsed on the CURRENT session's hold.
+  /// Cleared on release, so the next session holds again from scratch.
+  bool _workoutHoldExpired = false;
+  Timer? _workoutCapTimer;
+
+  /// The gate the drain actually checks: live workout, cap not yet blown.
+  bool get _workoutHeld => _workoutActive && !_workoutHoldExpired;
+
   // While the app is backgrounded we must NOT run derivation: a derive pass
-  // decodes the whole retained substrate + runs the metric compute, and doing
+  // decodes the retained substrate + runs the metric compute, and doing
   // that on a short background BLE wake trips iOS's CPU watchdog
   // (cpu_resource_fatal) or memory jetsam → the app gets terminated. Capture
   // (persist + ACK) is lightweight and keeps running; the derive intent is
-  // durable in compute_jobs, so it simply waits and drains on foreground return
-  // (Android WorkManager / iOS BGProcessingTask still handle heavy passes with a
-  // proper OS budget). Held exactly like _offloadActive.
+  // durable in compute_jobs, so it simply waits and drains on foreground
+  // return. (No OS periodic scheduler backs this up — the old WorkManager
+  // registration was deliberately removed, see main.dart — so on Android,
+  // where the foreground service gives derivation a real budget, backgrounded
+  // derives DO run; their cadence is capped by DeriveDebouncer's background
+  // tier, not blocked here.) Held exactly like _offloadActive.
   bool _background = false;
   bool _running = false;
   bool _pendingLight = false;
@@ -68,6 +94,7 @@ class DeriveScheduler {
   Map<String, dynamic> snapshot() => {
         'offload_active': _offloadActive,
         'workout_active': _workoutActive,
+        'workout_hold_expired': _workoutHoldExpired,
         'background': _background,
         'running': _running,
         'pending_light': _pendingLight,
@@ -90,10 +117,21 @@ class DeriveScheduler {
     if (active) {
       _timer?.cancel();
       _timer = null;
+      _workoutCapTimer?.cancel();
+      _workoutCapTimer = Timer(workoutHoldCap, () {
+        _workoutHoldExpired = true;
+        log('[derive-scheduler] workout still live past the hold cap — '
+            'treating it as forgotten; derive may run');
+        onChanged();
+        _arm();
+      });
       log('[derive-scheduler] workout live — holding derive work');
       onChanged();
       return;
     }
+    _workoutCapTimer?.cancel();
+    _workoutCapTimer = null;
+    _workoutHoldExpired = false;
     log('[derive-scheduler] workout ended — derive may run');
     onChanged();
     _arm();
@@ -137,6 +175,8 @@ class DeriveScheduler {
   void dispose() {
     _timer?.cancel();
     _timer = null;
+    _workoutCapTimer?.cancel();
+    _workoutCapTimer = null;
   }
 
   Future<void> _enqueue({
@@ -149,7 +189,7 @@ class DeriveScheduler {
   }
 
   void _arm() {
-    if (_running || _offloadActive || _background || _workoutActive) return;
+    if (_running || _offloadActive || _background || _workoutHeld) return;
     if (!_pendingLight && !_pendingHeavy) {
       unawaited(_refreshSnapshot());
       return;
@@ -162,7 +202,7 @@ class DeriveScheduler {
   }
 
   Future<void> _drain() async {
-    if (_running || _offloadActive || _background || _workoutActive) return;
+    if (_running || _offloadActive || _background || _workoutHeld) return;
     _timer?.cancel();
     _timer = null;
     final job = await LocalDb.takeNextComputeJob();
@@ -176,7 +216,7 @@ class DeriveScheduler {
     // land) inside it — at which point running the pass is exactly what the
     // gate exists to prevent. The job is already marked `running` by
     // takeNextComputeJob, so hand it back rather than leaving it claimed.
-    if (_offloadActive || _background || _workoutActive) {
+    if (_offloadActive || _background || _workoutHeld) {
       if (id != null && id.isNotEmpty) {
         await LocalDb.requeueComputeJob(id);
       }

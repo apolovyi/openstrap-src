@@ -16,7 +16,52 @@ import 'dart:math' as math;
 const int kBackfillIntervalSeconds = 900; // re-offload every 15 min (periodic)
 const int kKeepAliveIntervalSeconds =
     30; // re-arm realtime, poll battery, watchdog
+/// How long an open offload burst may sit silent before its un-committed chunk
+/// is abandoned (`BleEngine._armIdleWatchdog` → `DrainController.discardOpenChunk`).
+///
+/// ASSUMES: a healthy transfer never pauses this long, and abandoning the open
+/// chunk costs nothing because the band re-delivers it on the next offload.
+/// Both halves are WHOOP's flash-and-trim model — a draining band emits records
+/// back-to-back, and un-ACKed flash is kept by contract.
+/// FALSIFIED BY: any source whose NORMAL transfer pauses longer — a
+/// fetch-by-range device answering one page per request, a rate-limited
+/// transport, a band that idles between stored sessions inside one transfer.
+/// WHEN WRONG: every attempt discards its own work and restarts, so the device
+/// makes ZERO forward progress, permanently. The per-session retry cap
+/// (`_maxHistoricalRetriesPerSession`) only hands the same loop to the
+/// reconnect path; nothing counts it across sessions and nothing tells the
+/// user. It is at least LOUD — `[SYNC] idle watchdog` is logged on every
+/// expiry — so it is a stall findable in a log, not a silent one.
+/// HOW TO CHECK: two `[SYNC] idle watchdog` lines with no durable commit
+/// between them, repeating across reconnects.
+// ponytail: one timeout for every source, sized for WHOOP's continuous drain.
+// Upgrade path = the adapter declares its own maximum healthy inter-frame pause
+// AND whether an abandoned chunk is re-delivered at all. The cross-session
+// escalation to hang the "this keeps happening" report on already exists
+// ([NoDurableProgressEscalation]); the discard path just does not feed it.
+// Until both exist, do not point a slower source at this drain.
 const int kBackfillIdleTimeoutSeconds = 60; // strap went silent mid-offload
+
+/// Silence past which an ACTIVE session tears itself down (`_keepAliveFire`).
+///
+/// ASSUMES: a healthy link always produces inbound traffic inside two minutes.
+/// On WHOOP that holds only because WE manufacture the traffic — the 30 s
+/// keep-alive forces a GET_BATTERY_LEVEL once silence passes
+/// [kNoStreamPollSilenceSeconds] (or half this fuse, with a live stream armed).
+/// So the fuse measures "did our own poll come back", not "is this band alive".
+/// FALSIFIED BY: a source with no cheap pollable characteristic, or one that
+/// legitimately says nothing between readings — a fetch-by-range band, a sensor
+/// that notifies only on a detected beat.
+/// WHEN WRONG: the link is bounced every two minutes forever, each bounce
+/// costing a reconnect and re-handshake, so the device may never stay up long
+/// enough to transfer anything.
+/// HOW TO CHECK: `No data for >120s — bouncing the link.` repeating on a ~2 min
+/// cadence with no error between the bounces.
+// ponytail: the fuse and the keep-alive poll that satisfies it are ONE
+// mechanism, and both are WHOOP-shaped. Upgrade path = the adapter declares the
+// interval at which a healthy link of its kind produces inbound traffic (none =
+// no fuse) and what to poll to provoke it. [isLinkStale] already has the right
+// shape — one bar per traffic mode — it just cannot know a second band's modes.
 const int kLivenessFuseSeconds = 120; // no data for >fuse ⇒ bounce the link
 // Every existing RTC recheck is symptom-triggered (drift detected on the ONE
 // GET_CLOCK read at connect, or a defensive SET_CLOCK on StuckStrapDetector
@@ -45,13 +90,47 @@ const int kHistoricalAbortRetryDelaySeconds =
 /// wake, a headless entry point.
 const int kLinkFreshnessSeconds = 30;
 
+/// The freshness bar when NO live stream is armed (Android background, where
+/// live is fully off and the only inbound traffic is the keep-alive's forced
+/// battery poll — see `BleEngine._keepAliveFire`). The poll lands roughly once
+/// per minute (forced past [kNoStreamPollSilenceSeconds] of silence, checked on
+/// 30 s ticks), so a healthy quiet link legitimately shows up to ~65 s of
+/// silence; judging it by the 30 s streaming bar would tear down a live link on
+/// every foreground resume.
+const int kLinkFreshnessNoStreamSeconds = 90;
+
+/// Silence threshold past which the keep-alive FORCES a battery poll when no
+/// live stream is armed, keeping `sinceLastRx` under
+/// [kLinkFreshnessNoStreamSeconds] on a healthy link.
+const int kNoStreamPollSilenceSeconds = 45;
+
 /// True when a connection reporting "connected" should NOT be trusted because
-/// no data has actually arrived within [kLinkFreshnessSeconds]. Pure — callers
-/// own the actual teardown/reconnect. See [kLinkFreshnessSeconds].
-bool isLinkStale(Duration sinceLastRx) =>
-    sinceLastRx.inSeconds >= kLinkFreshnessSeconds;
+/// no data has actually arrived recently. The bar depends on what inbound
+/// traffic a healthy link actually produces: [kLinkFreshnessSeconds] while a
+/// live stream is armed (≥1 Hz expected), [kLinkFreshnessNoStreamSeconds] when
+/// nothing is armed and only poll replies arrive. Pure — callers own the
+/// actual teardown/reconnect.
+bool isLinkStale(Duration sinceLastRx, {bool liveStreamArmed = true}) =>
+    sinceLastRx.inSeconds >=
+    (liveStreamArmed ? kLinkFreshnessSeconds : kLinkFreshnessNoStreamSeconds);
 
 // ── plausibility gates (unix seconds) ────────────────────────────────────────
+/// ASSUMES: every source stamps records with an ABSOLUTE wall-clock epoch, so a
+/// value under the 2023-11 floor is junk — an unset RTC, a previous owner's
+/// garbage, a misread offset. True of WHOOP, which carries a settable RTC.
+/// FALSIFIED BY: a source whose time base is uptime-since-boot, a sequence
+/// number, or milliseconds — each lands permanently under the floor.
+/// WHEN WRONG: every record is refused. Nothing is LOST (`TrimAckPolicy`
+/// correctly refuses the trim on a drop-only burst, so the band keeps its
+/// flash) but nothing is stored either, and the same chunk is re-delivered
+/// forever. [RecordGate.timeBaseNotWallClock] is what makes that case tellable
+/// from a transient wandering clock, which looks identical at the gate.
+/// HOW TO CHECK: `gate_dropped_total` climbing while `records_seen` stays flat,
+/// with `RecordGate.droppedBelowFloor == RecordGate.dropped`.
+// ponytail: an absolute floor, so a relative time base cannot be rescued here
+// at all. Upgrade path = the adapter supplies an epoch ANCHOR (the wall time
+// its zero corresponds to) and converts BEFORE the gate; the gate itself stays
+// absolute, which is the only reason it can still reject a wandering RTC.
 const int kMinPlausibleUnix = 1700000000; // 2023-11 floor
 const int kFutureMargin = 86400; // +1 day
 const int kSessionRangeMargin =
@@ -104,15 +183,13 @@ class ClockRef {
   int get driftSec => wall - device;
 }
 
-/// The dedup grid the record-time correction snaps to. Repeated re-syncs of the
-/// SAME physical record (a band that re-floods after a missed ACK) must land on
-/// the IDENTICAL corrected rec_ts, or the decoded_onehz UNIQUE(rec_ts) dedup
-/// admits duplicates. Snapping the correction to a coarse grid makes the result
-/// stable even if the strap↔wall offset wobbles by a few seconds between syncs.
-const int kRecTsGridSeconds = 300; // 5-minute grid
-
-/// Snap [ts] DOWN to the nearest [grid]-second boundary.
-int snapToGrid(int ts, [int grid = kRecTsGridSeconds]) => (ts ~/ grid) * grid;
+// NO RTC SALVAGE PASS. `ClockPolicy.correctRecordTs` used to live here — it
+// shifted a gate-dropped record by the strap↔wall offset and SNAPPED the result
+// to a 5-minute grid so re-syncs deduped. It never had a caller, and it must
+// not get one: our records are 1 Hz, so snapping 300 consecutive seconds onto
+// one rec_ts would have decoded_onehz REPLACE 299 of every 300 rows — and then
+// the burst ACKs and the band trims the originals. Gate-dropped bytes stay in
+// raw_archive as bytes; the day keeps an honest hole.
 
 class ClockPolicy {
   /// Whether a GET_CLOCK `clock_epoch` read may be trusted enough to become
@@ -137,45 +214,45 @@ class ClockPolicy {
     return drift > 86400 || deviceClock < kMinPlausibleUnix;
   }
 
-  /// Salvage an implausible record time using the strap↔wall clock offset
-  /// (device→wall = [clockWall] - [deviceClock]). A wandering/unset RTC offsets
-  /// EVERY record in a session by the same amount, so shifting by that offset
-  /// recovers the true wall time. Conservative by design:
-  ///   - only corrects when the offset exceeds 1 day (small drift is left alone —
-  ///     the embedded time is trusted for sub-day skew);
-  ///   - SNAPS the result to a 5-minute grid so repeated re-syncs dedupe to the
-  ///     identical rec_ts (protects the decoded_onehz UNIQUE(rec_ts) key);
-  ///   - never returns a time past wall-clock-now;
-  ///   - the result must still pass [isPlausibleUnix] against the session's own
-  ///     GET_DATA_RANGE ±7-day band.
-  /// Returns the corrected+snapped ts, or null when it can't be made plausible
-  /// (the caller then drops the record, exactly as before).
-  static int? correctRecordTs(
-    int recTs, {
-    required int wallNow,
-    int? deviceClock,
-    int? clockWall,
-    int? sessionOldestUnix,
-    int? sessionNewestUnix,
-  }) {
-    if (deviceClock == null || clockWall == null) return null;
-    final offset = clockWall - deviceClock;
-    if (offset.abs() <= 86400) return null; // sub-day drift — don't manufacture a fix
-    var corrected = recTs + offset;
-    // Snap FIRST, then clamp: snapping down can only lower the value, so a value
-    // that was <= now stays <= now, and we still guard the post-snap result.
-    corrected = snapToGrid(corrected);
-    if (corrected > wallNow) return null; // never push a record into the future
-    if (!isPlausibleUnix(
-      corrected,
-      wallNow,
-      sessionOldestUnix: sessionOldestUnix,
-      sessionNewestUnix: sessionNewestUnix,
-    )) {
-      return null;
-    }
-    return corrected;
-  }
+  /// True when the strap RTC reads a PLAUSIBLE absolute time but sits more than
+  /// [kFutureMargin] in the FUTURE relative to the phone — the signature of a
+  /// PHONE clock running slow (dead-battery reboot, bad NTP, a manual set-back).
+  ///
+  /// This is the one clock-disagreement we must NOT act on destructively. We
+  /// cannot prove which clock is right, but both wrong moves are unsafe:
+  ///   - draining now drops the strap's (correctly-stamped, real-now) records as
+  ///     "implausibly future", and a mixed-burst ACK then TRIMS them off the
+  ///     band — permanent, silent loss; and
+  ///   - SET_CLOCK-ing the strap backward to match the slow phone would corrupt
+  ///     a correct RTC.
+  /// So the caller DEFERS history offload until the clocks agree (the phone
+  /// clock almost always self-corrects via NTP within minutes; the strap keeps
+  /// every record until then). The `>= kMinPlausibleUnix` guard excludes an
+  /// unset/garbage-low RTC (that is a strap problem [shouldSetClock] fixes, not
+  /// a phone problem); the strap-BEHIND case is a plausible-past time that is
+  /// not dropped as future and is corrected forward by [shouldSetClock].
+  /// How long a suspect-clock disagreement may defer history before we stop
+  /// believing the phone is the wrong one. A phone that rebooted with a dead
+  /// battery re-syncs over NTP within minutes, so a disagreement that survives
+  /// this long is a strap RTC that is genuinely running fast — not a slow
+  /// phone. Past this the gate stops deferring and the strap clock is corrected
+  /// normally, so a bad strap RTC cannot stall history forever.
+  static const int suspectGraceSeconds = 12 * 3600;
+
+  /// True once a suspect-clock state has persisted past [suspectGraceSeconds].
+  ///
+  /// Both arguments are MONOTONIC seconds (a `Stopwatch`), never wall clock.
+  /// The state being timed is "we do not trust `DateTime.now()`", so timing it
+  /// with `DateTime.now()` is self-defeating: a phone that steps forward a day
+  /// over NTP — while possibly still more than a day behind the strap — would
+  /// instantly age the suspicion past the grace window and re-authorize the
+  /// drain-and-trim this gate exists to hold back.
+  static bool suspectGraceExpired(double? sinceSecs, double nowSecs) =>
+      sinceSecs != null && nowSecs - sinceSecs >= suspectGraceSeconds;
+
+  static bool phoneClockSuspect(int deviceClock, int wallNow) =>
+      deviceClock >= kMinPlausibleUnix &&
+      deviceClock > wallNow + kFutureMargin;
 }
 
 // ── periodic-backfill rate policy ────────────────────────────────────────────

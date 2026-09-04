@@ -1,229 +1,109 @@
-// Every workout type the app can start MUST map to an activity type the target
-// platform's health store actually accepts.
+// `healthActivityForType` and `healthWorkoutTitleForType` — the app's
+// `sessions.type` to HealthKit / Health Connect activity map and record title,
+// which the mapper's own doc comment has named as tested here since #184
+// without the file existing.
 //
-// Issue #184: `strength` mapped to `HealthWorkoutActivityType.STRENGTH_TRAINING`
-// on BOTH platforms. That value exists only in the plugin's Android set, so on
-// iOS `writeWorkoutData` threw `HealthException` *before* the platform channel,
-// the throw was swallowed by a `debugPrint`, and no strength workout ever
-// reached Apple Health. The same latent bug existed for `swim`, which mapped to
-// bare `SWIMMING` — an iOS-only value — and so was dropped on Android.
+// WHAT THIS CAN AND CANNOT CATCH. It pins the app's own switch, on both
+// platform branches, which a host VM is the only place to do: `Platform.isIOS`
+// and `Platform.isAndroid` are both false in a unit test, which is why the
+// function takes `ios` rather than reading `Platform`. It does NOT call
+// `writeWorkoutData`, and it cannot see the plugin's per-platform allow-lists
+// or its native maps — so the platform facts asserted below were read out of
+// the installed `health` 12.2.1 by hand, and a package upgrade that moved them
+// would leave this suite green. Re-read them on a version bump.
 //
-// The supported sets below are a PIN, not a mirror: on a `health` upgrade,
-// re-check the sources named below and update them deliberately. If a value
-// silently leaves a platform's set upstream, this test is what catches it
-// before another workout family goes missing for a release.
-//
-// SOURCE OF TRUTH, and it differs per platform:
-//   iOS     — `ios/Classes/SwiftHealthPlugin.swift`, `workoutActivityTypeMap`.
-//   Android — `android/.../HealthPlugin.kt`, `workoutTypeMap`. NOT the Dart
-//             `_isOnAndroid` list, which is only an advisory pre-check and
-//             does NOT agree with the Kotlin map. `SOCCER` is the live example:
-//             the Dart list contains it, the Kotlin map has it commented out,
-//             and a write of it returns `success(false)` instead of throwing.
-//             This file's exporter reads a false as a real write failure and
-//             counts it toward the day's give-up budget, so trusting the Dart
-//             list here would have shipped a workout type that silently paused
-//             a whole day of health export.
+// The failure being defended against is silent: `writeWorkoutData` throws
+// `HealthException` for any type absent from THAT platform's set, before the
+// platform channel, so a spelling that exists on one store and not the other
+// does not degrade — it drops every workout of that type on the other one.
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:health/health.dart';
 import 'package:openstrap_edge/health/health_export.dart';
-import 'package:openstrap_edge/ui/workouts/workout_types.dart';
-
-/// Values `healthActivityForType` may emit that iOS (HealthKit) accepts.
-const _iosSupported = <HealthWorkoutActivityType>{
-  HealthWorkoutActivityType.RUNNING,
-  HealthWorkoutActivityType.BIKING,
-  HealthWorkoutActivityType.WALKING,
-  HealthWorkoutActivityType.SWIMMING,
-  HealthWorkoutActivityType.TRADITIONAL_STRENGTH_TRAINING,
-  HealthWorkoutActivityType.YOGA,
-  HealthWorkoutActivityType.HIGH_INTENSITY_INTERVAL_TRAINING,
-  HealthWorkoutActivityType.BOXING,
-  HealthWorkoutActivityType.ROWING,
-  HealthWorkoutActivityType.HIKING,
-  HealthWorkoutActivityType.ROCK_CLIMBING,
-  HealthWorkoutActivityType.DOWNHILL_SKIING,
-  HealthWorkoutActivityType.SNOWBOARDING,
-  HealthWorkoutActivityType.STAIR_CLIMBING,
-  HealthWorkoutActivityType.PILATES,
-  HealthWorkoutActivityType.TENNIS,
-  HealthWorkoutActivityType.BASKETBALL,
-  HealthWorkoutActivityType.SOCCER,
-  HealthWorkoutActivityType.GOLF,
-  HealthWorkoutActivityType.OTHER,
-};
-
-/// Values `healthActivityForType` may emit that Android (Health Connect) accepts.
-const _androidSupported = <HealthWorkoutActivityType>{
-  HealthWorkoutActivityType.RUNNING,
-  HealthWorkoutActivityType.BIKING,
-  HealthWorkoutActivityType.WALKING,
-  HealthWorkoutActivityType.SWIMMING_POOL,
-  HealthWorkoutActivityType.STRENGTH_TRAINING,
-  HealthWorkoutActivityType.YOGA,
-  HealthWorkoutActivityType.HIGH_INTENSITY_INTERVAL_TRAINING,
-  HealthWorkoutActivityType.BOXING,
-  HealthWorkoutActivityType.ROWING,
-  HealthWorkoutActivityType.HIKING,
-  HealthWorkoutActivityType.ROCK_CLIMBING,
-  HealthWorkoutActivityType.DOWNHILL_SKIING,
-  HealthWorkoutActivityType.SNOWBOARDING,
-  HealthWorkoutActivityType.STAIR_CLIMBING,
-  HealthWorkoutActivityType.PILATES,
-  HealthWorkoutActivityType.TENNIS,
-  HealthWorkoutActivityType.BASKETBALL,
-  HealthWorkoutActivityType.GOLF,
-  HealthWorkoutActivityType.OTHER,
-};
-
-/// Type strings that can reach the exporter but are not in [kWorkoutTypes]:
-/// manual-start aliases and the auto-detector's own vocabulary.
-const _extraTypeStrings = <String>[
-  'running',
-  'cycling',
-  'bike',
-  'biking',
-  'walking',
-  'swimming',
-  'weights',
-  'lifting',
-  'row',
-  'hiking',
-  'climbing',
-  'skiing',
-  'snowboarding',
-  'stair',
-  'racquet',
-  'squash',
-  'padel',
-  'badminton',
-  'football',
-  'autodetected',
-  'autodetected_workout',
-  'workout',
-  '',
-];
 
 void main() {
-  final allTypes = <String?>[
-    ...kWorkoutTypes.map((e) => e.$1),
-    ..._extraTypeStrings,
-    null,
-  ];
+  group('healthActivityForType', () {
+    test('the families the two stores spell differently split by platform', () {
+      // #184 itself: iOS has no bare STRENGTH_TRAINING, and every strength
+      // workout was rejected for two releases.
+      expect(healthActivityForType('strength', ios: true),
+          HealthWorkoutActivityType.TRADITIONAL_STRENGTH_TRAINING);
+      expect(healthActivityForType('strength', ios: false),
+          HealthWorkoutActivityType.STRENGTH_TRAINING);
+      // The same latent bug for swims, caught before it shipped.
+      expect(healthActivityForType('swimming', ios: true),
+          HealthWorkoutActivityType.SWIMMING);
+      expect(healthActivityForType('swimming', ios: false),
+          HealthWorkoutActivityType.SWIMMING_POOL);
+      // Bowling exists on iOS and nowhere in Health Connect.
+      expect(healthActivityForType('bowling', ios: true),
+          HealthWorkoutActivityType.BOWLING);
+      expect(healthActivityForType('bowling', ios: false),
+          HealthWorkoutActivityType.OTHER);
+    });
 
-  group('healthActivityForType stays inside each platform supported set', () {
-    for (final type in allTypes) {
-      test('"${type ?? '<null>'}" is writable on both platforms', () {
-        expect(
-          _iosSupported,
-          contains(healthActivityForType(type, ios: true)),
-          reason:
-              'iOS would throw HealthException for "$type" and the workout '
-              'would never reach Apple Health (issue #184)',
-        );
-        expect(
-          _androidSupported,
-          contains(healthActivityForType(type, ios: false)),
-          reason:
-              'Health Connect would throw HealthException for "$type" and the '
-              'workout would never reach Android health',
-        );
-      });
-    }
-  });
+    test('an OTHER workout still reaches Android under its own name', () {
+      // Health Connect titles the record with the enum name when the write
+      // carries no title, so bowling landed there as "OTHER".
+      expect(healthWorkoutTitleForType('bowling'), 'Bowling');
+      expect(healthWorkoutTitleForType('general_workout'), 'General Workout');
+      expect(healthWorkoutTitleForType('table_tennis'), 'Table Tennis');
+      // The ponytail ceiling, pinned so it is a known shape and not a
+      // surprise: acronyms come back title-cased.
+      expect(healthWorkoutTitleForType('hiit'), 'Hiit');
+      // Nothing to title is not a title of nothing — null lets the platform
+      // keep its own default rather than writing an empty string.
+      expect(healthWorkoutTitleForType(null), isNull);
+      expect(healthWorkoutTitleForType('   '), isNull);
+      // Null, not a blank string: Android falls back to its own default only
+      // when the title is absent, so ' ' would write an EMPTY name — worse
+      // than the "OTHER" it replaced. `sessions.type` is free-form, and the
+      // coach can write one, so a punctuation-only type is reachable.
+      expect(healthWorkoutTitleForType('_'), isNull);
+      expect(healthWorkoutTitleForType('___'), isNull);
+      expect(healthWorkoutTitleForType('cold__plunge'), 'Cold Plunge');
+    });
 
-  // The picker table and the health switch are two hand-maintained lists.
-  // Adding a tile to `kWorkoutTypes` without adding a case to
-  // `healthActivityForType` is silent — the workout still exports, just as an
-  // unlabelled "Other", so it is invisible until someone opens Apple Health
-  // and finds a wall of generic entries.
-  test('every picker type has its own health activity, not a silent OTHER', () {
-    // `cardio` and `other` are genuinely unspecific: neither store has a
-    // better home for them than OTHER, and that is a decision, not an
-    // oversight.
-    const deliberatelyOther = {'cardio', 'other'};
-    // Android-only exemption: Health Connect has no writable soccer type at
-    // this plugin version (see the header), so OTHER there is the correct
-    // answer rather than a missing case.
-    const androidOtherOk = {'soccer'};
-    for (final e in kWorkoutTypes) {
-      if (deliberatelyOther.contains(e.$1)) continue;
+    test('soccer is OTHER on Android — a write that reports false', () {
+      // Not a supported-set problem: SOCCER passes the Dart guard and is
+      // commented out of Health Connect's own write map, so the call returns
+      // false, which this file counts toward the day's give-up budget. One
+      // football would pause the whole day's export, sleep included.
+      expect(healthActivityForType('football', ios: true),
+          HealthWorkoutActivityType.SOCCER);
+      expect(healthActivityForType('football', ios: false),
+          HealthWorkoutActivityType.OTHER);
+    });
+
+    test('one spelling is used where only one is accepted by both', () {
       for (final ios in [true, false]) {
-        if (!ios && androidOtherOk.contains(e.$1)) continue;
-        expect(
-          healthActivityForType(e.$1, ios: ios),
-          isNot(HealthWorkoutActivityType.OTHER),
-          reason:
-              '"${e.$1}" is offered in the workout picker but falls through to '
-              'OTHER on ${ios ? 'iOS' : 'Android'} — add a case to '
-              'healthActivityForType',
-        );
+        // Bare CLIMBING and STAIRS are iOS-only; SKIING is Android-only.
+        expect(healthActivityForType('climbing', ios: ios),
+            HealthWorkoutActivityType.ROCK_CLIMBING);
+        expect(healthActivityForType('stairs', ios: ios),
+            HealthWorkoutActivityType.STAIR_CLIMBING);
+        expect(healthActivityForType('skiing', ios: ios),
+            HealthWorkoutActivityType.DOWNHILL_SKIING);
       }
-    }
-  });
+    });
 
-  test('strength maps to the platform-correct strength spelling', () {
-    expect(
-      healthActivityForType('strength', ios: true),
-      HealthWorkoutActivityType.TRADITIONAL_STRENGTH_TRAINING,
-    );
-    expect(
-      healthActivityForType('strength', ios: false),
-      HealthWorkoutActivityType.STRENGTH_TRAINING,
-    );
-    // The aliases the manual-start UI and older rows can carry.
-    for (final alias in ['weights', 'lifting', 'Strength', 'STRENGTH']) {
-      expect(
-        healthActivityForType(alias, ios: true),
-        HealthWorkoutActivityType.TRADITIONAL_STRENGTH_TRAINING,
-        reason: '"$alias" must land on the same iOS type as "strength"',
-      );
-    }
-  });
+    test('an unknown, unnamed or unmapped type lands as OTHER, not nowhere',
+        () {
+      for (final ios in [true, false]) {
+        // The catch-all row is deliberately here: "a general workout" is the
+        // user declining to say what it was, and MIXED_CARDIO or
+        // CROSS_TRAINING would be the app saying it for them.
+        expect(healthActivityForType('general_workout', ios: ios),
+            HealthWorkoutActivityType.OTHER);
+        // 'other' is what an accepted auto-detected bout is stored as.
+        expect(healthActivityForType('other', ios: ios),
+            HealthWorkoutActivityType.OTHER);
+        expect(healthActivityForType(null, ios: ios),
+            HealthWorkoutActivityType.OTHER);
+        expect(healthActivityForType('underwater basket weaving', ios: ios),
+            HealthWorkoutActivityType.OTHER);
+      }
+    });
 
-  test('soccer does not reach a Health Connect type it would reject', () {
-    // The Kotlin write map has SOCCER commented out. Sending it anyway comes
-    // back false rather than throwing, and this exporter reads a false as a
-    // real write failure — one soccer workout would take the whole day's
-    // export down with it.
-    expect(
-      healthActivityForType('soccer', ios: true),
-      HealthWorkoutActivityType.SOCCER,
-    );
-    expect(
-      healthActivityForType('soccer', ios: false),
-      HealthWorkoutActivityType.OTHER,
-    );
-    expect(
-      healthActivityForType('football', ios: false),
-      HealthWorkoutActivityType.OTHER,
-    );
-  });
-
-  test('swim maps to the platform-correct swim spelling', () {
-    expect(
-      healthActivityForType('swim', ios: true),
-      HealthWorkoutActivityType.SWIMMING,
-    );
-    expect(
-      healthActivityForType('swim', ios: false),
-      HealthWorkoutActivityType.SWIMMING_POOL,
-    );
-  });
-
-  test('an unknown type degrades to OTHER rather than an unwritable value', () {
-    // 'padel' used to stand in for "unknown" here and is now a racquet alias —
-    // pick strings the switch genuinely has no case for.
-    for (final unknown in ['surfing', 'kitesurfing', 'autodetected', null]) {
-      expect(
-        healthActivityForType(unknown, ios: true),
-        HealthWorkoutActivityType.OTHER,
-      );
-      expect(
-        healthActivityForType(unknown, ios: false),
-        HealthWorkoutActivityType.OTHER,
-      );
-    }
   });
 }

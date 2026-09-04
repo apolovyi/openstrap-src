@@ -3,23 +3,31 @@
 // Invoked by the iOS CoreBluetooth-restoration RECOVERY path (ios_ble_restore.dart)
 // when the band reappears after the live connection dropped.
 //
-// There is NO OS periodic scheduler (no WorkManager task, no BGTask): continuous
-// capture is the kept-alive live connection in AppState. This is purely the
-// relaunch-recovery fallback that pulls the band's offline flash backlog into the
-// local SQLite store (lib/data/db.dart), the system of record. A missed run is
-// harmless; the next reconnect catches up from the non-destructive cursor.
+// There is NO OS periodic scheduler on Android (the old WorkManager tasks were
+// removed — background_derivation.dart is a tombstone; main.dart still cancels
+// their persisted registrations by name). iOS registers opportunistic BGTasks
+// (ios_bg_task.dart) that are never guaranteed. Continuous capture is the
+// kept-alive live connection in AppState. This is purely the relaunch-recovery
+// fallback that pulls the band's offline flash backlog into the local SQLite
+// store (lib/data/db.dart), the system of record. A missed run is harmless;
+// the next reconnect catches up from the non-destructive cursor.
 
 import 'dart:convert';
 
 import 'package:flutter/widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../ble/adapters/_registry.dart' show kWhoopGen4;
+import '../ble/adapters/host.dart' show BandHost;
+import '../ble/adapters/whoop_gen4.dart' show WhoopFramedAdapter;
 import '../ble/ble_engine.dart';
+import '../ble/oura_link.dart';
 import '../compute/derivation_engine.dart';
 import '../compute/profile.dart';
 import '../data/db.dart';
 import '../notify/notification_center.dart';
 import '../notify/notification_event.dart';
+import '../state/alarm_schedule.dart';
 import 'band_ownership.dart';
 import 'high_freq_wake_window.dart';
 import 'paired_device.dart';
@@ -63,29 +71,46 @@ Future<bool> runHeadlessSync({BandLease? lease}) async {
     }
 
     // Connect → drain → store. No live streams (battery): in and out.
+    // `bandHost` is `late final`: the closure below captures the variable,
+    // not a value, so it is fine that it is only assigned after `engine`
+    // (whose facade adapter needs `engine` itself) is constructed.
+    late final BandHost bandHost;
     final engine = BleEngine(
       onRecord: (sample, raw) => LocalDb.insertRecord(raw, sample),
       onState: (_) {},
-      onEvent: (id, ts, hex) => LocalDb.insertEvent(id, ts, hex),
+      // This path drains exactly the one paired band (PairedDevice.load()),
+      // so kPrimaryDeviceId is the correct value here, not a placeholder.
+      onEvent: (id, ts, hex) =>
+          LocalDb.insertEvent(id, ts, hex, deviceId: LocalDb.kPrimaryDeviceId),
       log: (l) => debugPrint('[bgsync] $l'),
       onRecordsBatch: LocalDb.insertRecordsBatch,
-      onCommitBatch: (raws, samples, trimTokenHex, {archives}) =>
-          LocalDb.commitSyncBatch(raws, samples,
-              trimToken: trimTokenHex,
-              archives: archives,
-              onCheckpoint: (msg) => debugPrint('[bgsync][COMMIT] $msg')),
+      // Routed through BandHost (M1a) rather than calling
+      // LocalDb.commitSyncBatch directly — same durable commit, same
+      // arguments, one extra await frame, and the SAME failure contract:
+      // `commitNativeBatch` rethrows so `DrainController.commit` still reads
+      // durability from a throw and `TrimAckPolicy` still blocks the ACK.
+      onCommitBatch: (raws, samples, trimTokenHex, {archives, deviceFamily}) =>
+          bandHost.commitNativeBatch(raws, samples, trimTokenHex,
+              archives: archives, deviceFamily: deviceFamily),
       onArchiveRecord: LocalDb.archiveRawRecord,
-      cursorReader: LocalDb.getCursorInt,
+      cursorReader: (base) =>
+          LocalDb.getCursorInt(LocalDb.cursorKeyFor(base, LocalDb.kPrimaryDeviceId)),
       // Mark this as the background drainer: if the foreground app engine already
       // owns the band (same process — iOS restore-wake OR Android headless boot /
       // foreground service), this engine YIELDS instead of opening a second drain
       // that would double-ACK the same offload and stall the trim cursor.
       isBackgroundDrainer: true,
     );
+    bandHost = BandHost(
+      adapter: WhoopFramedAdapter(engine, kWhoopGen4),
+      deviceId: LocalDb.kPrimaryDeviceId,
+      onLog: (msg) => debugPrint('[bgsync][COMMIT] $msg'),
+    );
 
     // connect() subscribes → SET_CLOCK → INIT, so the historical offload is already
     // streaming when this returns. We then await it reaching HISTORY_COMPLETE.
-    final connected = await engine.connectToRemoteId(paired.remoteId);
+    final connected = await engine.connectToRemoteId(paired.remoteId,
+        generationHint: paired.generation);
     if (!connected) {
       debugPrint(
         '[bgsync] strap not reachable this cycle — will catch up next time.',
@@ -93,13 +118,21 @@ Future<bool> runHeadlessSync({BandLease? lease}) async {
       await checkSyncStaleness();
       return true;
     }
+    // Pin the discovered generation onto the pairing record, exactly like the
+    // foreground engine-state heal does — a headless-only phone would
+    // otherwise re-probe the connect route on every wake forever.
+    final gen = engine.state.generation;
+    if ((gen == 'gen4' || gen == 'gen5') && gen != paired.generation) {
+      await PairedDevice.save(paired.remoteId, paired.serial, generation: gen);
+    }
     try {
       final plan = await HighFreqWakeWindow.planNow();
       await engine.applyHighFreqWakeWindow(
         enabled: plan.shouldEnable,
         targetWake: plan.targetWake,
         duration: HighFreqWakeWindow.lease,
-        intervalSeconds: 60,
+        intervalSeconds: 61, // gen5 rejects <= 60
+
         reason: plan.source,
       );
       debugPrint(
@@ -113,6 +146,46 @@ Future<bool> runHeadlessSync({BandLease? lease}) async {
       // and the next wake resumes from the (now-advanced) cursor. No live streams
       // (battery): connect → listen → store → ACK → derive → disconnect.
       await engine.runSync();
+      // Feature 1's arming engine, headless half: "on every successful
+      // connect AND after each headless sync". No AppState here, so the
+      // schedule read and the `alarm_epoch` persistence go straight through
+      // LocalDb/SharedPreferences — the same store the foreground path uses,
+      // so whichever side runs next sees a consistent value.
+      try {
+        final schedule = fillDefaultAlarmSchedule([
+          for (final r in await LocalDb.alarmScheduleRows())
+            AlarmScheduleEntry.fromRow(r),
+        ]);
+        final prefs = await SharedPreferences.getInstance();
+        final result = await armNextScheduledOccurrence(
+          engine: engine,
+          schedule: schedule,
+          currentArmedEpoch: prefs.getInt('alarm_epoch'),
+        );
+        if (result.disabled) {
+          await prefs.remove('alarm_epoch');
+          await prefs.remove('alarm_epoch_confirmed');
+        } else if (result.epoch != null) {
+          final epoch = result.epoch!;
+          // No live AppState here to catch a late ALARM_SET (event 56) the way
+          // the foreground grace timer does, so wait for it inline — same
+          // grace window as AlarmConfirmation's default (6s) — before this
+          // headless connection closes. Not confirmed within that window still
+          // persists the epoch (optimistic, matching the foreground write) but
+          // as unconfirmed, so the 7pm safety check (AppState._alarmArmedTonight)
+          // won't wrongly treat an un-latched headless arm as covering tonight.
+          final armedAtMs = DateTime.now().millisecondsSinceEpoch;
+          var confirmed = false;
+          for (var i = 0; i < 6 && !confirmed; i++) {
+            await Future.delayed(const Duration(milliseconds: 1000));
+            confirmed = await LocalDb.alarmSetConfirmedSince(armedAtMs);
+          }
+          await prefs.setInt('alarm_epoch', epoch);
+          await prefs.setBool('alarm_epoch_confirmed', confirmed);
+        }
+      } catch (e) {
+        debugPrint('[bgsync] alarm re-arm skipped: $e');
+      }
     } finally {
       await engine.disconnect();
     }
@@ -140,6 +213,17 @@ Future<bool> runHeadlessSync({BandLease? lease}) async {
       '(${BandOwnership.debugState})',
     );
     BandOwnership.release(ownedLease);
+    // Piggyback the ring on the same OS wake window, after the band work is
+    // fully done so it can never delay or interfere with WHOOP's own timing.
+    // OuraLink.sync() already no-ops when nothing is paired and never throws,
+    // but this is the one shared headless entry point (every wake source
+    // funnels through runHeadlessSync via HeadlessSyncGate) so a failure here
+    // must not be allowed to escape and mark the WHOOP cycle as errored.
+    try {
+      await OuraLink.instance.sync();
+    } catch (e) {
+      debugPrint('[bgsync] oura sync skipped: $e');
+    }
   }
 }
 
@@ -174,15 +258,17 @@ Future<void> checkSyncStaleness({bool allowPermissionPrompt = false}) async {
     final now = DateTime.now();
     if (!shouldRenotifyStaleness(lastAt, now)) return;
 
-    await prefs.setInt(_kLastStalenessNotifiedMs, now.millisecondsSinceEpoch);
     final hoursStale = (nowSec - recTsHw) ~/ 3600;
-    await NotificationCenter.instance.emit(
+    final shown = await NotificationCenter.instance.emit(
       NotificationEvent(
         // Date-bucketed so a legitimate re-fire after the cooldown isn't
         // blocked by putNotification's INSERT-OR-IGNORE dedupe.
         dedupeKey: '${now.toIso8601String().substring(0, 10)}:sync_stale',
         category: NotifCategory.device,
-        priority: NotifPriority.normal, // respects quiet hours — not urgent
+        // Quiet hours DROP a normal-priority event; nothing queues it for the
+        // morning. The 48-hour cooldown below is therefore only spent when the
+        // event was actually presented.
+        priority: NotifPriority.normal,
         title: "Your band hasn't synced in a while",
         body: 'No new data for about $hoursStale hours. Open OpenStrap to '
             'reconnect — background sync may have stalled.',
@@ -191,6 +277,14 @@ Future<void> checkSyncStaleness({bool allowPermissionPrompt = false}) async {
       ),
       allowPermissionPrompt: allowPermissionPrompt,
     );
+    if (!shown) {
+      // The gate refused it (quiet hours on an overnight wake is the common
+      // case). Burning the cooldown here silenced the backstop for another 48
+      // hours over a notification nobody ever saw.
+      debugPrint('[bgsync] staleness notification dropped by the gate.');
+      return;
+    }
+    await prefs.setInt(_kLastStalenessNotifiedMs, now.millisecondsSinceEpoch);
     debugPrint(
       '[bgsync] staleness notification fired (hours_stale=$hoursStale).',
     );

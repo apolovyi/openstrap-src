@@ -11,15 +11,19 @@
 // SEEDS the rolling baselines the recovery/illness stack reads — that's the
 // "snapshots + baselines" the onboarding promised.
 //
-// Overlap with future 1 Hz days is safe: once the measured day is complete and
-// settled, it replaces the imported snapshot for that date (real data wins).
+// Overlap with 1 Hz days is safe in BOTH directions. Forwards: putDayResult is
+// INSERT-OR-REPLACE on (day_id, algo_version), so once the band syncs and a real
+// 1 Hz day is derived it overwrites any imported snapshot for the same date.
+// Backwards: `_writeDay` skips any date `LocalDb.isMeasuredDay` already claims —
+// without that, importing over history the band had measured destroyed it, and
+// the `finalized: true` below meant no re-derive could ever bring it back.
 
 import 'dart:convert';
-import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../compute/derivation_engine.dart' show kAlgoVersion;
+import '../data/day_label.dart' show dayLabelOf;
 import '../data/db.dart';
 import 'backend_client.dart';
 
@@ -46,7 +50,9 @@ class CloudImporter {
     // today so the current local day is never excluded.
     final now = DateTime.now();
     final fromD = now.subtract(Duration(days: days));
-    final from = _ymd(fromD), to = _ymd(now);
+    // day_label.dart is THE one day-label helper (byte-identical output here —
+    // both inputs are local DateTimes).
+    final from = dayLabelOf(fromD), to = dayLabelOf(now);
 
     final profileRaw = await api.getProfile();
     final dailies = await api.getDailies(from, to);
@@ -101,19 +107,16 @@ class CloudImporter {
     };
   }
 
-  @visibleForTesting
-  static Future<void> debugWriteDay(
-          String date, Map<String, dynamic> daily, Map<String, dynamic>? sleep) =>
-      _writeDay(date, daily, sleep);
-
   static Future<void> _writeDay(
       String date, Map<String, dynamic> d, Map<String, dynamic>? sl) async {
+    // Real data wins BOTH ways. The header's claim only ever held in one
+    // direction (a later band sync overwriting a snapshot); importing over a
+    // day the band had already measured replaced it and, because the write is
+    // `finalized: true`, locked the replacement in for good.
+    if (await LocalDb.isMeasuredDay(date)) return;
     num? n(Object? v) => v is num ? v : null;
     final rhr = n(d['resting_hr']);
     final rmssd = n(d['hrv_rmssd']);
-    final lnRmssd = rmssd != null && rmssd > 0
-        ? math.log(rmssd.toDouble())
-        : null;
     final sdnn = n(d['hrv_sdnn']);
     final readiness = n(d['readiness']) ?? n(d['recovery']);
     final strain = n(d['strain']);
@@ -209,7 +212,6 @@ class CloudImporter {
       'scalars': {
         'rhr': rhr,
         'rmssd': rmssd,
-        'ln_rmssd': lnRmssd,
         'sdnn': sdnn,
         'readiness': readiness,
         'strain': strain,
@@ -237,13 +239,15 @@ class CloudImporter {
       payloadJson: jsonEncode(bundle),
       windowJson: jsonEncode(win ?? const {}),
       finalized: true, // imported snapshot — never recomputed (no raw exists)
+      // export-provenance — see WhoopImporter. A vendor snapshot's scalars are
+      // that vendor's maths; the tag matches the one in the payload.
+      source: 'cloud_v2',
       rhr: f(rhr),
       rmssd: f(rmssd),
       readiness: f(readiness),
       series: {
         'rhr': f(rhr),
         'rmssd': f(rmssd),
-        'ln_rmssd': lnRmssd,
         'readiness': f(readiness),
         'strain': f(strain),
         'resp_rate': f(resp),
@@ -295,9 +299,6 @@ class CloudImporter {
     });
     return true;
   }
-
-  static String _ymd(DateTime d) => '${d.year.toString().padLeft(4, '0')}-'
-      '${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
   static Map<String, dynamic>? _parseObj(Object? v) {
     if (v is Map) return v.cast<String, dynamic>();

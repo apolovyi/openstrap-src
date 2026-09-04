@@ -1,6 +1,9 @@
 package wtf.openstrap.openstrap_edge
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.ActivityManager
+import android.bluetooth.BluetoothManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -33,9 +36,20 @@ object NativeChannels {
     private const val EDGE_TRACKING_CHANNEL = "openstrap/edge_tracking"
     private const val DEVICE_ACTIONS_CHANNEL = "openstrap/device_actions"
     private const val ANDROID_BG_CHANNEL = "openstrap/android_background"
+    private const val BLE_NATIVE_CHANNEL = "openstrap/ble_native"
     const val TASKER_CHANNEL = "openstrap/tasker"
     const val ACTION_DOUBLE_TAP = "wtf.openstrap.openstrap_edge.DOUBLE_TAP"
     private const val TASKER_TOKEN_KEY = "tasker_auth_token"
+
+        /**
+         * Outbound automation events broadcast as
+         * `wtf.openstrap.openstrap_edge.<EVENT>` so an automation app can
+         * filter on the action directly. Runtime-registered receivers (which is
+         * what Tasker's "Intent Received" profile installs) still receive
+         * implicit broadcasts on Android 8+; the O background restriction
+         * applies to manifest-declared receivers.
+         */
+        const val EVENT_ACTION_PREFIX = "wtf.openstrap.openstrap_edge."
 
     private var torchOn = false
 
@@ -52,21 +66,23 @@ object NativeChannels {
 
         HealthConnectSleepWriter.register(engine, app)
         HealthConnectHeartRateWriter.register(engine, app)
+        // The phone's own step counter. Registered here (from EdgeApplication.ensureEngine,
+        // which runs on the process's FIRST engine need — cold launch or headless wake)
+        // so the channel exists headless; the sensor listener itself arms on the first
+        // Dart call, which only happens when the user has phone steps switched on.
+        PhoneStepCounter.register(engine, app)
 
         MethodChannel(engine.dartExecutor.binaryMessenger, EDGE_TRACKING_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "start" -> {
-                        val intent = Intent(app, EdgeTrackingService::class.java)
                         // Route workout live → the FGS also claims the location type
-                        // (see EdgeTrackingService.EXTRA_LOCATION).
-                        val location = call.argument<Boolean>("location") == true
-                        intent.putExtra(EdgeTrackingService.EXTRA_LOCATION, location)
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            app.startForegroundService(intent)
-                        } else {
-                            app.startService(intent)
-                        }
+                        // (see EdgeTrackingService.EXTRA_LOCATION). Dart always sends
+                        // the flag, so the extra is always set (authoritative).
+                        EdgeTrackingService.start(
+                            app,
+                            call.argument<Boolean>("location") == true,
+                        )
                         result.success(null)
                     }
                     "stop" -> {
@@ -110,6 +126,26 @@ object NativeChannels {
                             prefs.edit().putBoolean("pending_headless_boot", false).apply()
                         }
                         result.success(eligible)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // Native Bluetooth reads flutter_blue_plus cannot answer. The one
+        // method here backs the gen5 readiness gate: it must read the
+        // platform `BluetoothDevice.getName()` (bond/stack-backed), not the
+        // plugin's in-memory platformName cache, which is empty for a device
+        // rebuilt from its id on a cold start. See lib/ble/android_native_name.dart.
+        MethodChannel(engine.dartExecutor.binaryMessenger, BLE_NATIVE_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "remoteDeviceName" -> {
+                        val mac = call.arguments as? String
+                        if (mac.isNullOrEmpty()) {
+                            result.error("bad_args", "expected the remote MAC", null)
+                        } else {
+                            remoteDeviceName(app, mac, result)
+                        }
                     }
                     else -> result.notImplemented()
                 }
@@ -190,6 +226,47 @@ object NativeChannels {
                         result.success(null)
                     }
                     "get_auth_token" -> result.success(getOrCreateTaskerToken(app))
+                    // OUTBOUND automation event. ANDROID ONLY, and deliberately
+                    // so: iOS has no public mechanism for a Shortcuts personal
+                    // automation to trigger on an app-donated intent — that
+                    // trigger list is a fixed system set, and `donate`/
+                    // INInteraction buys Siri suggestions, not an event
+                    // trigger. Claiming parity in the docs would be a promise
+                    // the platform cannot keep.
+                    //
+                    // NO TOKEN RIDES OUT. This is an implicit broadcast, so
+                    // every app on the device can read its extras; putting the
+                    // INBOUND buzz secret in here would hand any installed app
+                    // the ability to buzz the strap, which is the one thing
+                    // that token exists to prevent. The outbound direction has
+                    // nothing to protect — the worst a spoofed event can do is
+                    // run the user's own Tasker profile early.
+                    //
+                    // Extras carry only FACTS ABOUT THE SYNC (how many records
+                    // landed, when), never a derived metric: a Shortcut that
+                    // receives `readiness=0` has recreated the fabricated-number
+                    // problem outside the app, where there is no tier and no
+                    // note to read. Absence must leave as absence, and the
+                    // simplest way to guarantee that is to send no metrics.
+                    "emit_event" -> {
+                        val name = call.argument<String>("event")
+                        if (name.isNullOrBlank()) {
+                            result.success(false)
+                        } else {
+                            val intent = Intent("$EVENT_ACTION_PREFIX$name")
+                            call.argument<Map<String, Any>>("extras")
+                                ?.forEach { (k, v) ->
+                                    when (v) {
+                                        is Int -> intent.putExtra(k, v)
+                                        is Long -> intent.putExtra(k, v)
+                                        is Boolean -> intent.putExtra(k, v)
+                                        is String -> intent.putExtra(k, v)
+                                    }
+                                }
+                            app.sendBroadcast(intent)
+                            result.success(true)
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -213,6 +290,33 @@ object NativeChannels {
         val token = java.util.UUID.randomUUID().toString().replace("-", "")
         prefs.edit().putString(TASKER_TOKEN_KEY, token).apply()
         return token
+    }
+
+    /**
+     * The platform `BluetoothDevice.getName()` read behind the gen5 readiness
+     * gate. `getName()` needs BLUETOOTH_CONNECT on API 31+ — the same runtime
+     * permission every GATT operation already holds by the time a link is
+     * connected, checked explicitly here so a revoked grant answers as a clean
+     * error instead of a SecurityException. Lint cannot see that check through
+     * the early return, hence the targeted suppression; the belt-and-braces
+     * catch still turns any surprise (invalid MAC, no adapter) into the same
+     * error, which Dart reads as "no name" — the gate's failing value.
+     */
+    @SuppressLint("MissingPermission")
+    private fun remoteDeviceName(app: Context, mac: String, result: MethodChannel.Result) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            app.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            result.error("name_unavailable", "BLUETOOTH_CONNECT not granted", null)
+            return
+        }
+        try {
+            val mgr = app.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            result.success(mgr?.adapter?.getRemoteDevice(mac)?.name)
+        } catch (e: Exception) {
+            result.error("name_unavailable", e.toString(), null)
+        }
     }
 
     private fun perform(ctx: Context, action: String): Boolean {

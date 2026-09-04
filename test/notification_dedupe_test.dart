@@ -22,6 +22,7 @@ import 'package:openstrap_edge/data/day_label.dart';
 import 'package:openstrap_edge/notify/fired_keys.dart';
 import 'package:openstrap_edge/notify/notification_center.dart';
 import 'package:openstrap_edge/notify/notification_event.dart';
+import 'package:openstrap_edge/notify/tap_router.dart';
 
 /// Records every event handed to the OS layer so tests can assert call counts.
 class _FakeSink {
@@ -174,6 +175,27 @@ void main() {
       await center.emit(_ev('$_today:temp'));
       expect(granted.shown.length, 1);
     });
+
+    // DerivationEngine._runNotifications keys the day's health exception on its
+    // highest severity class, so an ESCALATION (plain → medical) gets through
+    // once. The reverse used to buzz too: the morning fires ':exception:medical'
+    // for a red illness flag, the evening re-derive de-escalates to "low
+    // readiness" and the plain ':exception' key was still unclaimed. It now
+    // burns the plain slot after a real medical present — this is that sequence.
+    test('a de-escalated re-derive does not buzz a second time', () async {
+      final sink = _FakeSink();
+      center.presentSink = sink.call;
+
+      expect(await center.emit(_ev('$_today:exception:medical')), isTrue);
+      await const FiredKeyStore().recordFired('$_today:exception');
+
+      await center.emit(_ev('$_today:exception'));
+      expect(sink.shown.length, 1);
+
+      // The other direction still works: tomorrow is a fresh day.
+      await center.emit(_ev('$_tomorrow:exception', date: _tomorrow));
+      expect(sink.shown.length, 2);
+    });
   });
 
   group('emit still respects gating', () {
@@ -300,6 +322,66 @@ void main() {
       center.presentSink = sink.call;
       await center.emit(highStress());
       expect(sink.shown, isEmpty);
+    });
+  });
+
+  group('the auto-detected workout actually reaches the shade', () {
+    // The exact event derivation_engine builds for a detected bout. It was
+    // emitted on NotifCategory.recovery, which `classOf` maps to null, so
+    // `shouldFireOs` dropped it: the suggestion row was written on every derive
+    // and the user was never told, in any build. A test that only asserts the
+    // row exists passes on that broken code — this one asserts the OS saw it.
+    const sugId = '2026-08-19:1755625800';
+    NotificationEvent detected() => NotificationEvent(
+          dedupeKey: '$_today:$sugId:auto_workout',
+          category: NotifCategory.reminders,
+          title: 'Did you work out?',
+          body: 'We spotted ~42 min of elevated activity. Tap to log it.',
+          date: _today,
+          route: workoutSuggestionRoute(sugId),
+        );
+
+    test('it fires, and it carries the bout it is about', () async {
+      final sink = _FakeSink();
+      center.presentSink = sink.call;
+      expect(await center.emit(detected()), isTrue);
+      // The payload is what the OS hands back on the tap; the id has to survive
+      // it (the colon in the row id is percent-encoded in the query).
+      expect(routeId(sink.shown.single.route!), sugId);
+    });
+
+    test('one detected workout, one notification — never per derive pass',
+        () async {
+      final sink = _FakeSink();
+      center.presentSink = sink.call;
+      // Derivation re-detects the same bout on every drain and every 15-min
+      // background pass. The key is the suggestion id, so they all collapse.
+      for (var i = 0; i < 5; i++) {
+        await center.emit(detected());
+      }
+      expect(sink.shown.length, 1);
+    });
+
+    test('the auto-detect switch silences it', () async {
+      SharedPreferences.setMockInitialValues({
+        'notif_quiet_enabled': false,
+        'notif_auto_detect': false,
+      });
+      final sink = _FakeSink();
+      center.presentSink = sink.call;
+      expect(await center.emit(detected()), isFalse);
+      expect(sink.shown, isEmpty);
+    });
+
+    test('quiet hours silence it — it is a prompt, not the alarm', () async {
+      SharedPreferences.setMockInitialValues({
+        'notif_quiet_enabled': true,
+        'notif_quiet_start': 0,
+        'notif_quiet_end': 1440,
+      });
+      final sink = _FakeSink();
+      center.presentSink = sink.call;
+      expect(await center.emit(detected()), isFalse);
     });
   });
 

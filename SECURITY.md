@@ -9,7 +9,7 @@ Use GitHub's private reporting instead:
 
 That goes straight to the maintainer and stays private until there's a fix.
 
-Rough expectations, set honestly — this is a one-maintainer project, not a
+Rough expectations, set honestly, this is a one-maintainer project, not a
 company with an on-call rota:
 
 - Acknowledgement within about a week.
@@ -37,7 +37,7 @@ company with an on-call rota:
 - The fact that sideloaded builds are unsigned, or that a rooted/jailbroken
   device can read app storage. Both are known properties of the distribution
   model, documented in the README.
-- Metric accuracy. Wrong numbers are bugs — open a normal issue.
+- Metric accuracy. Wrong numbers are bugs, open a normal issue.
 
 ## Where your data actually is
 
@@ -46,14 +46,14 @@ data on-device, and there's no account or server holding it. Two qualifications,
 so the boundary is exact:
 
 - **Anonymous diagnostics** (Firebase crash/performance, never health data) are
-  **on by default in GitHub release builds** and absent from App Store / Play
-  Store builds. Switchable off in-app.
+  **off by default in every build** — nothing is collected until you turn it on
+  in-app, and switching it back off stops collection immediately.
 - **Health-data contribution** uploads the local database, but is opt-in, off by
   default, and compiled out of store builds entirely.
 
-Everything else the companion worker does — legacy import, an update pointer —
+Everything else the companion worker does, legacy import, an update pointer —
 is optional and carries no health data. See [PRIVACY.md](PRIVACY.md).
 
 That means the realistic attack surface is the phone, the Bluetooth link, and
-the local database — not a cloud backend. Reports focused there are the most
+the local database, not a cloud backend. Reports focused there are the most
 useful.

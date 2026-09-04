@@ -16,8 +16,9 @@ import 'package:openstrap_edge/data/models.dart';
 import 'package:openstrap_edge/sync/sync_policy.dart';
 
 /// A well-formed inner-frame hex: [0]=0x2f historical, [1]=0x18 (revision 24),
-/// then the u32 record counter. BurstStats re-parses this, so it must be real
-/// hex, not a label.
+/// then the u32 record counter. Nothing re-parses it any more — BurstStats is
+/// handed the revision the ingest path already read — but the commit path
+/// stores it, so it stays real hex rather than a label.
 String _hex(int counter) =>
     '2f18${counter.toRadixString(16).padLeft(8, '0')}';
 
@@ -58,10 +59,10 @@ void main() {
   group('P0 — a durable commit that fails must not let the caller ACK', () {
     test('commit() REPORTS failure instead of swallowing the exception', () async {
       final d = _drainWith(
-        (raws, samples, token, {archives}) async =>
+        (raws, samples, token, {archives, deviceFamily}) async =>
             throw StateError('OOM in SqlCommand.getSqlArguments'),
       );
-      d.onHistoricalRecord(_raw(1), _sample(1));
+      d.onHistoricalRecord(_raw(1), _sample(1), 24);
 
       final durable = await d.commit(_tokenA);
 
@@ -74,10 +75,10 @@ void main() {
 
     test('a failed commit RE-BUFFERS the records instead of losing them', () async {
       final d = _drainWith(
-        (raws, samples, token, {archives}) async => throw StateError('rollback'),
+        (raws, samples, token, {archives, deviceFamily}) async => throw StateError('rollback'),
       );
-      d.onHistoricalRecord(_raw(1), _sample(1));
-      d.onHistoricalRecord(_raw(2), _sample(2));
+      d.onHistoricalRecord(_raw(1), _sample(1), 24);
+      d.onHistoricalRecord(_raw(2), _sample(2), 24);
       d.onUndecodableRecord(_archive(3));
 
       expect(d.bufferedRecords, 2);
@@ -93,13 +94,13 @@ void main() {
       // every record AND the archived one.
       final seenRaws = <String>[];
       final seenArchives = <String>[];
-      final d2 = _drainWith((raws, samples, token, {archives}) async {
+      final d2 = _drainWith((raws, samples, token, {archives, deviceFamily}) async {
         seenRaws.addAll(raws.map((r) => r.hex));
         seenArchives.addAll((archives ?? const []).map((a) => a.hex));
       });
       // (rebuild the same state on a controller whose commit succeeds)
-      d2.onHistoricalRecord(_raw(1), _sample(1));
-      d2.onHistoricalRecord(_raw(2), _sample(2));
+      d2.onHistoricalRecord(_raw(1), _sample(1), 24);
+      d2.onHistoricalRecord(_raw(2), _sample(2), 24);
       d2.onUndecodableRecord(_archive(3));
       expect(await d2.commit(_tokenA), isTrue);
       expect(seenRaws, [_hex(1), _hex(2)]);
@@ -116,7 +117,7 @@ void main() {
         final d = DrainController(
           onRecord: (sample, raw) async {},
           onRecordsBatch: null,
-          onCommit: (raws, samples, token, {archives}) async {
+          onCommit: (raws, samples, token, {archives, deviceFamily}) async {
             if (fail) {
               await gate.future;
               throw StateError('rollback');
@@ -127,10 +128,10 @@ void main() {
           log: (_) {},
         );
 
-        d.onHistoricalRecord(_raw(1), _sample(1));
+        d.onHistoricalRecord(_raw(1), _sample(1), 24);
         final inFlight = d.commit(_tokenA);
         // A record arrives while the commit is parked mid-await.
-        d.onHistoricalRecord(_raw(2), _sample(2));
+        d.onHistoricalRecord(_raw(2), _sample(2), 24);
         gate.complete();
         expect(await inFlight, isFalse);
 
@@ -146,7 +147,7 @@ void main() {
       final d = DrainController(
         onRecord: (sample, raw) async {},
         onRecordsBatch: null,
-        onCommit: (raws, samples, token, {archives}) async {
+        onCommit: (raws, samples, token, {archives, deviceFamily}) async {
           if (fail) throw StateError('rollback');
         },
         onArchive: null,
@@ -155,12 +156,12 @@ void main() {
 
       // Empty token-only commits do not count as trim advance (would feed
       // auto-continue while the durable frontier stayed frozen).
-      d.onHistoricalRecord(_raw(0), _sample(0));
+      d.onHistoricalRecord(_raw(0), _sample(0), 24);
       expect(await d.commit(_tokenA), isTrue);
       expect(d.lastTrimAdvanced, isTrue);
 
       fail = true;
-      d.onHistoricalRecord(_raw(1), _sample(1));
+      d.onHistoricalRecord(_raw(1), _sample(1), 24);
       expect(await d.commit(_tokenB), isFalse);
       // The cursor did NOT move to tokenB, so nothing may claim it did.
       expect(d.lastTrimAdvanced, isTrue, reason: 'rolled back to the tokenA state');
@@ -175,21 +176,21 @@ void main() {
     });
 
     test('an empty buffer commit does not claim trim advanced', () async {
-      final d = _drainWith((raws, samples, token, {archives}) async {});
+      final d = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
       expect(await d.commit(_tokenA), isTrue);
       expect(d.lastTrimAdvanced, isFalse);
     });
 
     test('archive-only commit still counts as trim advanced', () async {
-      final d = _drainWith((raws, samples, token, {archives}) async {});
+      final d = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
       d.onUndecodableRecord(_archive(1));
       expect(await d.commit(_tokenA), isTrue);
       expect(d.lastTrimAdvanced, isTrue);
     });
 
     test('a successful commit clears the buffer and reports durable', () async {
-      final d = _drainWith((raws, samples, token, {archives}) async {});
-      d.onHistoricalRecord(_raw(1), _sample(1));
+      final d = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
+      d.onHistoricalRecord(_raw(1), _sample(1), 24);
 
       expect(await d.commit(_tokenA), isTrue);
       expect(d.bufferedRecords, 0);
@@ -332,7 +333,7 @@ void main() {
     });
 
     test('supportsSafeTrim is true only when onCommit is wired', () {
-      final withCommit = _drainWith((raws, samples, token, {archives}) async {});
+      final withCommit = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
       expect(withCommit.supportsSafeTrim, isTrue);
 
       final unbuffered = DrainController(
@@ -359,7 +360,7 @@ void main() {
 
     test('archive-only + onCommit still persists before success', () async {
       final seen = <String>[];
-      final ok = _drainWith((raws, samples, token, {archives}) async {
+      final ok = _drainWith((raws, samples, token, {archives, deviceFamily}) async {
         seen.addAll((archives ?? const []).map((a) => a.hex));
       });
       ok.onUndecodableRecord(_archive(9));
@@ -380,7 +381,7 @@ void main() {
         onArchive: null,
         log: (_) {},
       );
-      d.onHistoricalRecord(_raw(1), _sample(1));
+      d.onHistoricalRecord(_raw(1), _sample(1), 24);
       expect(d.bufferedRecords, 0);
       expect(d.supportsSafeTrim, isFalse);
       expect(wrote, 1);
@@ -389,8 +390,8 @@ void main() {
 
   group('P0 — a discarded burst poisons its HISTORY_END token', () {
     test('discardOpenChunk marks the open burst un-ACKable', () async {
-      final d = _drainWith((raws, samples, token, {archives}) async {});
-      d.onHistoricalRecord(_raw(1), _sample(1));
+      final d = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
+      d.onHistoricalRecord(_raw(1), _sample(1), 24);
       expect(d.burstDiscarded, isFalse);
 
       d.discardOpenChunk();
@@ -412,17 +413,41 @@ void main() {
     });
 
     test('poisons even when the open buffer is already empty', () {
-      final d = _drainWith((raws, samples, token, {archives}) async {});
+      final d = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
       d.discardOpenChunk();
       expect(d.burstDiscarded, isTrue);
     });
 
-    test('a fresh burst (rearm / HISTORY_START) clears the poison', () {
-      final d = _drainWith((raws, samples, token, {archives}) async {});
+    test('a local rearm (abort→retry) does NOT clear the poison', () {
+      // THE BUG: the idle watchdog discards the open chunk, _abortAndRetry arms
+      // a 3 s timer, and _startHistoricalRefresh's first act was d.rearm() —
+      // which cleared the latch. The abandoned burst's HISTORY_END was still in
+      // flight, landed on a clean guard, and got ACKed verbatim: the band
+      // trimmed exactly the records the watchdog threw away.
+      final d = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
+      d.onHistoricalRecord(_raw(1), _sample(1), 24);
+      d.discardOpenChunk();
+
+      d.rearm();
+
+      expect(d.burstDiscarded, isTrue);
+      expect(
+        TrimAckPolicy.evaluate(
+          sessionCurrent: true,
+          burstDiscarded: d.burstDiscarded,
+          commitDurable: true,
+        ),
+        TrimAckVerdict.blockedDiscardedBurst,
+      );
+    });
+
+    test('only a HISTORY_START (beginBurst) clears the poison', () {
+      final d = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
       d.discardOpenChunk();
       expect(d.burstDiscarded, isTrue);
 
       d.rearm();
+      d.beginBurst();
 
       expect(d.burstDiscarded, isFalse);
       expect(
@@ -436,11 +461,11 @@ void main() {
     });
 
     test('poisonedBursts counts once per burst, not once per discard call', () {
-      final d = _drainWith((raws, samples, token, {archives}) async {});
+      final d = _drainWith((raws, samples, token, {archives, deviceFamily}) async {});
       d.discardOpenChunk();
       d.discardOpenChunk();
       expect(d.poisonedBursts, 1);
-      d.rearm();
+      d.beginBurst();
       d.discardOpenChunk();
       expect(d.poisonedBursts, 2);
     });

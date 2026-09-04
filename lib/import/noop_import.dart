@@ -76,8 +76,18 @@ class NoopImportResult {
   /// unordered source is visible rather than quietly short.
   final Set<String> strandedDates;
 
+  /// Source tables a `.noopbak` gave up on partway through — SQLite reported
+  /// `database disk image is malformed` reading them, which is what a backup
+  /// taken by copying NOOP's live database file (rather than a proper backup
+  /// API) leaves on its newest rows. Everything up to that point is still
+  /// imported; only the empty set here means the backup read cleanly.
+  final Set<String> corruptTables;
+
   NoopImportResult(this.days, this.rows,
-      [this.lateRows = 0, this.steps = 0, this.strandedDates = const {}]);
+      [this.lateRows = 0,
+      this.steps = 0,
+      this.strandedDates = const {},
+      this.corruptTables = const {}]);
 }
 
 class NoopImporter {
@@ -182,7 +192,7 @@ class NoopImporter {
     await for (final line in lines) {
       if (line.isEmpty || line.startsWith('#')) continue;
       firstLine ??= line;
-      if (line.startsWith('unix_s,')) {
+      if (line.startsWith(kNoopCsvHeader)) {
         sawHeader = true;
         // Header → (re)build the name→index map and skip.
         final h = line.split(',');

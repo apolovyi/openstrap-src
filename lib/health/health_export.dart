@@ -23,8 +23,10 @@ import 'dart:io' show Platform;
 import 'package:android_intent_plus/android_intent.dart';
 import 'package:flutter/foundation.dart';
 import 'package:health/health.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/db.dart';
+import '../data/series_codec.dart';
 import 'health_heart_rate_batch.dart';
 import 'health_sleep_session.dart';
 
@@ -38,15 +40,42 @@ enum HealthLinkState {
   unsupported, // no health store on this device (iPad / simulator)
 }
 
+/// The user's "sync to Apple Health / Health Connect" switch. `AppState` owns
+/// the toggle; the key lives here so an export seam reached without an
+/// AppState can honour the same answer instead of keeping a second copy of the
+/// string.
+const String kHealthSyncPref = 'health_sync';
+
 const _sleepHealthTypes = <HealthDataType>{
   HealthDataType.SLEEP_DEEP,
   HealthDataType.SLEEP_REM,
   HealthDataType.SLEEP_LIGHT,
   HealthDataType.SLEEP_AWAKE,
+  // The night's envelope. Health Connect models it as a SleepSessionRecord
+  // parent; HealthKit has no session record, so the enclosing bar is an
+  // `inBed` sleepAnalysis sample. Only one of the two is ever asked for —
+  // see `_types`. Native writers own delete+write on both stores; this set is
+  // the authorization scope, not the plugin rewrite loop.
   HealthDataType.SLEEP_SESSION,
+  HealthDataType.SLEEP_IN_BED,
 };
 
+/// The envelope type the OTHER store uses, which this one must never be sent.
+///
+/// SLEEP_SESSION is Health-Connect-only. Handing it to HealthKit is not a
+/// harmless no-op: the plugin resolves an unknown key to bodyMass and runs a
+/// sample query for a type we never asked permission for, which errors — and
+/// the error path never calls back, so `delete()` never completes. That hangs
+/// the day's export, which is the stall (#239/#225) this whole seam exists to
+/// stop, re-entered through the delete side.
+HealthDataType _foreignSleepEnvelope(bool isApplePlatform) => isApplePlatform
+    ? HealthDataType.SLEEP_SESSION
+    : HealthDataType.SLEEP_IN_BED;
+
 List<HealthDataType> healthDeleteTypes({required bool isApplePlatform}) {
+  // Sleep and (on Android) minute HR are owned by native replace writers.
+  // Keeping sleep on the plugin delete list re-opens the HealthKit hang:
+  // unknown keys map to bodyMass and `delete()` never callbacks.
   final types = <HealthDataType>[
     HealthDataType.RESTING_HEART_RATE,
     isApplePlatform
@@ -57,18 +86,70 @@ List<HealthDataType> healthDeleteTypes({required bool isApplePlatform}) {
     HealthDataType.ACTIVE_ENERGY_BURNED,
     HealthDataType.BASAL_ENERGY_BURNED,
     HealthDataType.STEPS,
-    ..._sleepHealthTypes,
     HealthDataType.WORKOUT,
   ];
   return isApplePlatform
       ? types
-      : types
-            .where(
-              (type) =>
-                  !_sleepHealthTypes.contains(type) &&
-                  type != HealthDataType.HEART_RATE,
-            )
-            .toList();
+      : types.where((type) => type != HealthDataType.HEART_RATE).toList();
+}
+
+/// Does a `delete()` answer mean the window is now clear of OUR samples — i.e.
+/// is it safe to write the replacement?
+///
+/// The two stores answer the EMPTY range differently, so the raw bool cannot be
+/// read the same way on both, and reading it wrong breaks the delete-then-write
+/// idempotency in opposite directions:
+///
+///   * Health Connect (`HealthPlugin.deleteData`) calls `deleteRecords` over a
+///     time range and reports success unless it THREW. A zero-match range is a
+///     normal success. So `false` there is always a genuine failure — a denied
+///     permission, an unmapped type, a store error — and the samples we meant
+///     to replace may well still be sitting there.
+///
+///   * HealthKit (`SwiftHealthPlugin.delete`) queries our own samples
+///     (`HKSource.default()`) and hands whatever came back to
+///     `HKHealthStore.delete`, which Apple documents as: "Deleting an empty
+///     array fails with an `errorInvalidArgument` error." So on Apple `false`
+///     is the NORMAL answer for a window we have never written — every FIRST
+///     export of every day and every workout sees it — and it says nothing
+///     about whether a real sample survived.
+///
+/// Hence: gate the write on Android, never on Apple. Trusting Apple's `false`
+/// is not optimism, it is the only reading the platform supports; and the
+/// HealthKit failures that CAN leave one of our samples behind (share
+/// permission never requested, or denied) suppress the following write for the
+/// same reason, so they cannot produce the duplicate this gate exists to stop.
+///
+/// Parameterised on [ios] rather than reading `Platform` for the same reason
+/// [healthActivityForType] is — so a host-VM test can exercise both branches.
+@visibleForTesting
+bool healthDeleteClearedRange({required bool deleted, required bool ios}) =>
+    deleted || ios;
+
+/// Cursor for the one-shot Apple Health sleep rewrite. Bump when the writer
+/// changes enough that nights already sitting in HealthKit should be replaced
+/// (plugin Core/in-bed misses, leftover 11pm fragments). Does not bump
+/// `kAlgoVersion` — derived metrics are unchanged.
+const kHealthSleepExportEpoch = 'apple-native-1';
+const kHealthSleepExportEpochCursor = 'health_sleep_export_epoch';
+
+Future<void> ensureHealthSleepExportEpoch({
+  required Future<String?> Function(String name) getCursor,
+  required Future<void> Function(String name, String value) setCursor,
+  String epoch = kHealthSleepExportEpoch,
+  required bool isApplePlatform,
+}) async {
+  // APPLE ONLY. The cursor clear forces a full replay (up to 400 day
+  // bundles: type deletes, hourly energy, the minute-HR batch) so nights
+  // already in HealthKit get rewritten by the native writer. Nothing about
+  // the HEALTH CONNECT writer changed with this epoch — clearing on Android
+  // would replay every bundle for zero benefit. The caller passes the same
+  // platform flag it already computes for the delete types.
+  if (!isApplePlatform) return;
+  if (await getCursor(kHealthSleepExportEpochCursor) == epoch) return;
+  await setCursor('health_export_through', '');
+  await setCursor('health_export_retry_state', '');
+  await setCursor(kHealthSleepExportEpochCursor, epoch);
 }
 
 bool shouldAttemptHealthExport({
@@ -77,9 +158,20 @@ bool shouldAttemptHealthExport({
   required DateTime now,
   required DateTime? lastAttempt,
   required Duration backoff,
+  DateTime? lastSuccess,
+  Duration minRewriteInterval = Duration.zero,
   bool force = false,
 }) {
   if (force) return true;
+  // Success-side throttle for the re-written recent tail: a NON-finalized day
+  // that just exported cleanly is byte-identical minutes later, but exportAll
+  // runs on every drain/derive pass, so without this the full delete+rewrite
+  // (hourly buckets + minute HR) hit the health store every ~10 min around the
+  // clock. Finalized days pass Duration.zero and are unaffected; forceRetry
+  // and finalization (which resets the retry entry) still bypass.
+  if (lastSuccess != null && now.difference(lastSuccess) < minRewriteInterval) {
+    return false;
+  }
   if (attempts >= maxAttempts) return false;
   return lastAttempt == null || now.difference(lastAttempt) >= backoff;
 }
@@ -91,6 +183,8 @@ bool shouldAttemptHealthBulkExport({
   required DateTime? lastAttempt,
   required Duration backoff,
   required bool prioritySleepAlreadyWritten,
+  DateTime? lastSuccess,
+  Duration minRewriteInterval = Duration.zero,
   bool force = false,
 }) => shouldAttemptHealthExport(
   attempts: attempts,
@@ -98,6 +192,8 @@ bool shouldAttemptHealthBulkExport({
   now: now,
   lastAttempt: lastAttempt,
   backoff: backoff,
+  lastSuccess: lastSuccess,
+  minRewriteInterval: minRewriteInterval,
   force: force || prioritySleepAlreadyWritten,
 );
 
@@ -160,12 +256,70 @@ class HealthExporter {
   final _androidSleep = HealthConnectSleepSessionExporter(
     writer: MethodChannelHealthConnectSleepSessionWriter(),
   );
+  final _appleSleep = HealthKitSleepSessionExporter(
+    writer: MethodChannelHealthKitSleepSessionWriter(),
+  );
   final HealthConnectHeartRateWriter _androidHeartRate;
   bool _configured = false;
 
   HealthExporter({HealthConnectHeartRateWriter? androidHeartRate})
     : _androidHeartRate =
           androidHeartRate ?? MethodChannelHealthConnectHeartRateWriter();
+
+  /// The process-wide exporter. `AppState` holds this one, and so does every
+  /// seam that lands a session without a widget tree to read AppState from —
+  /// the coach's `add_completed_workout` tool has only a [LocalRepository].
+  /// Lazily built, so importing this file starts no platform channels.
+  static final HealthExporter shared = HealthExporter();
+
+  /// [exportWorkout] for a caller that holds the ID it just wrote rather than
+  /// the row: `logManualWorkout` returns `workout_id`, not the session. This
+  /// is the seam issue #130 is actually about — a workout logged from the
+  /// coach (or any non-UI path) otherwise reaches the health store only if a
+  /// full-day export happens to run afterwards, which needs a `day_result`
+  /// row AND a derive pass, so a hand-logged session can sit unexported for
+  /// hours.
+  ///
+  /// GATED ON [kHealthSyncPref], because unlike `AppState.stopWorkout` these
+  /// callers have no `healthSyncEnabled` to check first — and writing to the
+  /// platform store with the switch off is exactly the thing the switch is
+  /// for. Best-effort: never throws, false when nothing was written.
+  static Future<bool> exportWorkoutId(String? id) async {
+    if (id == null || id.isEmpty) return false;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool(kHealthSyncPref) != true) return false;
+      final row = await LocalDb.session(id);
+      if (row == null) return false;
+      return await shared.exportWorkout(row);
+    } catch (e) {
+      debugPrint('[health] exportWorkoutId $id: $e');
+      return false;
+    }
+  }
+
+  /// Clear a stale workout's OLD window before the caller writes its retimed
+  /// replacement. [exportWorkout] only ever deletes inside the row's CURRENT
+  /// `[start,end]` — fine for a same-window re-export, but `setWorkoutWindow`
+  /// narrowing or moving a session leaves its previous Health sample outside
+  /// that window, so it survives untouched. Call this with the row's window
+  /// as it stood BEFORE the retime, then let the normal exportWorkoutId path
+  /// write the new one. Best-effort; never throws.
+  static Future<void> deleteWorkoutWindow(int startTs, int endTs) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool(kHealthSyncPref) != true) return;
+      await shared._ensureConfigured();
+      if (await shared._androidUnavailable() != null) return;
+      await shared._deleteOwnSamples(
+        HealthDataType.WORKOUT,
+        DateTime.fromMillisecondsSinceEpoch(startTs * 1000),
+        DateTime.fromMillisecondsSinceEpoch(endTs * 1000),
+      );
+    } catch (e) {
+      debugPrint('[health] deleteWorkoutWindow: $e');
+    }
+  }
 
   /// True on iOS/macOS (Apple Health); false on Android (Health Connect).
   static bool get isApple => Platform.isIOS || Platform.isMacOS;
@@ -183,27 +337,24 @@ class HealthExporter {
   String get _hrvScalarKey => isApple ? 'sdnn' : 'rmssd';
 
   List<HealthDataType> get _types => [
-        HealthDataType.RESTING_HEART_RATE,
-        _hrvType,
-        HealthDataType.RESPIRATORY_RATE,
-        HealthDataType.HEART_RATE,
-        HealthDataType.ACTIVE_ENERGY_BURNED,
-        HealthDataType.BASAL_ENERGY_BURNED,
-        // STEPS is requested for DELETE SCOPE ONLY — nothing writes steps any
-        // more (see the block further down for why). We still need the write
-        // permission to purge the fabricated step samples earlier versions put
-        // into Apple Health / Health Connect, which is why WRITE_STEPS stays in
-        // the Android manifest. That purge is a ONE-SHOT migration and does not
-        // belong in the per-day rewrite loop — see [_purgeLegacyStepsIfNeeded]
-        // and [_rewriteTypes].
-        HealthDataType.STEPS,
-        HealthDataType.SLEEP_DEEP,
-        HealthDataType.SLEEP_REM,
-        HealthDataType.SLEEP_LIGHT,
-        HealthDataType.SLEEP_AWAKE,
-        HealthDataType.SLEEP_SESSION,
-        HealthDataType.WORKOUT,
-      ];
+    HealthDataType.RESTING_HEART_RATE,
+    _hrvType,
+    HealthDataType.RESPIRATORY_RATE,
+    HealthDataType.HEART_RATE,
+    HealthDataType.ACTIVE_ENERGY_BURNED,
+    HealthDataType.BASAL_ENERGY_BURNED,
+    // STEPS is requested for DELETE SCOPE ONLY — nothing writes steps any
+    // more (see the block further down for why). We still need the write
+    // permission to purge the fabricated step samples earlier versions put
+    // into Apple Health / Health Connect, which is why WRITE_STEPS stays in
+    // the Android manifest. That purge is a ONE-SHOT migration and does not
+    // belong in the per-day rewrite loop — see [_purgeLegacyStepsIfNeeded]
+    // and [_rewriteTypes].
+    HealthDataType.STEPS,
+    for (final t in _sleepHealthTypes)
+      if (t != _foreignSleepEnvelope(isApple)) t,
+    HealthDataType.WORKOUT,
+  ];
 
   /// The types the per-day delete-then-write pass touches.
   ///
@@ -213,9 +364,9 @@ class HealthExporter {
   /// finalized) tail, forever, and would let that delete's failure flip a day's
   /// export to unsuccessful.
   /// Composes both intents on this seam:
-  ///   * `healthDeleteTypes` (platform-aware) drops the sleep types and
-  ///     HEART_RATE on Android, because the native SleepSessionRecord writer
-  ///     and the minute-HR batch own their own cleanup there.
+  ///   * `healthDeleteTypes` (platform-aware) drops sleep on both stores and
+  ///     HEART_RATE on Android, because the native sleep replace writers and
+  ///     the minute-HR batch own their own cleanup there.
   ///   * STEPS is then removed on top, because NOTHING writes steps any more.
   ///     Deleting a type we never write would run on every re-export of the
   ///     not-yet-finalized tail forever, and — since a false `delete()` flips
@@ -223,9 +374,9 @@ class HealthExporter {
   ///     historical fabricated samples are handled once by
   ///     [_purgeLegacyStepsIfNeeded] instead, outside the success accounting.
   List<HealthDataType> get _rewriteTypes => [
-        for (final t in healthDeleteTypes(isApplePlatform: isApple))
-          if (t != HealthDataType.STEPS) t,
-      ];
+    for (final t in healthDeleteTypes(isApplePlatform: isApple))
+      if (t != HealthDataType.STEPS) t,
+  ];
 
   /// Cursor for the one-shot legacy-STEPS purge: the newest day already purged.
   static const _kStepsPurgeCursor = 'health_steps_purged_through';
@@ -257,6 +408,32 @@ class HealthExporter {
     } catch (e) {
       // Leave the cursor where it is so the next pass retries this day.
       debugPrint('[health] purge legacy steps $date: $e');
+    }
+  }
+
+  /// Delete OUR [type] samples in [start,end) and report whether the window is
+  /// now safe to write into — see [healthDeleteClearedRange] for why the two
+  /// stores' `false` cannot be read the same way.
+  ///
+  /// A THROW is a genuine failure on both stores (and on Apple the only signal
+  /// there is), so it is the one case that reports "not cleared" everywhere.
+  Future<bool> _deleteOwnSamples(
+    HealthDataType type,
+    DateTime start,
+    DateTime end,
+  ) async {
+    try {
+      return healthDeleteClearedRange(
+        deleted: await _health.delete(
+          type: type,
+          startTime: start,
+          endTime: end,
+        ),
+        ios: isApple,
+      );
+    } catch (e) {
+      debugPrint('[health] delete ${type.name}: $e');
+      return false;
     }
   }
 
@@ -383,6 +560,16 @@ class HealthExporter {
   // false is not success and must keep the day out of the exported prefix.
   static const _kRetryCursor = 'health_export_retry_state';
   static const _kMaxExportAttempts = 6;
+
+  /// Success-side floor for re-writing a NON-finalized day (the mutable recent
+  /// tail). exportAll runs on every drain/derive pass — every ~10 min while
+  /// connected — and each pass re-deletes and re-writes the whole current day
+  /// (hourly buckets + minute HR) into the health store; almost all of it
+  /// identical. New minutes reach Health Connect/HealthKit within this window;
+  /// finalization and forceRetry bypass it entirely, so the finalized prefix
+  /// and user-initiated exports are unaffected. Tracked per day as `ok_ms` in
+  /// the same retry-state JSON.
+  static const _kNonFinalizedRewriteInterval = Duration(minutes: 30);
   static const _kRetryBackoff = [
     Duration(minutes: 5),
     Duration(minutes: 30),
@@ -413,6 +600,13 @@ class HealthExporter {
     await _ensureConfigured();
     if (await _androidUnavailable() != null) return 0; // HC missing/outdated
     try {
+      await ensureHealthSleepExportEpoch(
+        getCursor: LocalDb.getCursor,
+        setCursor: (name, value) => LocalDb.setCursor(name, value),
+        // Same platform flag the delete types use — the epoch rewrite is an
+        // Apple-HealthKit concern only.
+        isApplePlatform: isApple,
+      );
       if (reset) {
         await LocalDb.setCursor('health_export_through', '');
         await LocalDb.setCursor(_kRetryCursor, '');
@@ -420,9 +614,12 @@ class HealthExporter {
       final cursor = await LocalDb.getCursor('health_export_through') ?? '';
       final retryState = await _loadRetryState();
       var retryStateDirty = false;
-      final rows = await LocalDb.recentDayResults(400); // newest-first
-      final pendingDays =
-          <({String date, bool finalized, Map<String, dynamic>? bundle})>[];
+      // METADATA ONLY — 400 days of payload is ~300 MB resident, measured, and
+      // this runs on a first export or a settings reset, which are precisely
+      // the moments the user is watching. The bundles are fetched one at a time
+      // inside the loops below, so only one is ever live.
+      final rows = await LocalDb.recentDayResultsMeta(400); // newest-first
+      final pendingDays = <({String date, bool finalized, bool skipped})>[];
       for (final row in rows) {
         final date = (row['day_id'] ?? row['date'])?.toString();
         if (date == null || date.isEmpty) continue;
@@ -430,24 +627,28 @@ class HealthExporter {
         pendingDays.add((
           date: date,
           finalized: (row['finalized'] as num?)?.toInt() == 1,
-          bundle: _decode(row['payload_json']),
+          // The stored column, not a probe into the decoded payload.
+          skipped: (row['skipped'] as num?)?.toInt() == 1,
         ));
       }
+
+      /// One day's bundle, or null if it is missing or undecodable. Never hold
+      /// two of these at once.
+      Future<Map<String, dynamic>?> bundleFor(String date) async =>
+          _decode((await LocalDb.dayResult(date))?['payload_json']);
 
       late final Future<int> Function(String? androidSleepAlreadyWritten)
       exportBulk;
       Future<int> exportPriorityOrBulk() async {
         if (Platform.isAndroid) {
-          final priorityDays = pendingDays
-              .where(
-                (day) => day.bundle != null && day.bundle!['skipped'] != true,
-              )
-              .map((day) => MapEntry(day.date, day.bundle!))
-              .toList();
+          // Walk candidates one bundle at a time and stop at the first with a
+          // sleep session, rather than decoding every pending day up front.
           MapEntry<String, Map<String, dynamic>>? priorityDay;
-          for (final day in priorityDays) {
-            if (normalizeHealthSleepSession(day.value) != null) {
-              priorityDay = day;
+          for (final day in pendingDays.where((d) => !d.skipped)) {
+            final bundle = await bundleFor(day.date);
+            if (bundle == null || bundle['skipped'] == true) continue;
+            if (normalizeHealthSleepSession(bundle) != null) {
+              priorityDay = MapEntry(day.date, bundle);
               break;
             }
           }
@@ -459,6 +660,7 @@ class HealthExporter {
                 ?.cast<String, dynamic>();
             var attempts = (entry?['attempts'] as num?)?.toInt() ?? 0;
             var lastAttemptMs = (entry?['last_ms'] as num?)?.toInt();
+            final okMs = (entry?['ok_ms'] as num?)?.toInt();
             final wasFinalized = entry?['finalized'] as bool? ?? false;
             if (pendingPriorityDay.finalized && !wasFinalized && attempts > 0) {
               attempts = 0;
@@ -473,10 +675,29 @@ class HealthExporter {
                   ? null
                   : DateTime.fromMillisecondsSinceEpoch(lastAttemptMs),
               backoff: _backoffFor(attempts),
+              lastSuccess: okMs == null
+                  ? null
+                  : DateTime.fromMillisecondsSinceEpoch(okMs),
+              minRewriteInterval: pendingPriorityDay.finalized
+                  ? Duration.zero
+                  : _kNonFinalizedRewriteInterval,
               force: forceRetry,
             );
             if (!shouldAttempt) {
-              if (attempts >= _kMaxExportAttempts) return exportBulk(null);
+              // The priority day is held back by the CAP or by the success-side
+              // rewrite throttle (it exported cleanly &lt;30 min ago) — in either
+              // case its sleep session is already in the store and is not what's
+              // blocking, so still export every OTHER pending day. Only a
+              // genuine retry backoff (recent FAILURE, still under the cap) holds
+              // bulk, matching the pre-throttle behaviour. A day with `ok_ms` set
+              // carries no pending failure (the success branch clears
+              // attempts/last_ms), so the two conditions are mutually exclusive.
+              final throttledBySuccess = okMs != null &&
+                  !pendingPriorityDay.finalized &&
+                  nowMs - okMs < _kNonFinalizedRewriteInterval.inMilliseconds;
+              if (attempts >= _kMaxExportAttempts || throttledBySuccess) {
+                return exportBulk(null);
+              }
               return 0;
             }
             Future<void> recordPriorityFailure() async {
@@ -491,7 +712,11 @@ class HealthExporter {
             var bulkDone = 0;
             try {
               final priorityResult = await exportPrioritySleepBeforeBulk(
-                newestFirstDays: priorityDays,
+                // `exportNewestPrioritySleep` returns the first day carrying a
+                // sleep session, and the scan above already found exactly that
+                // day — so one entry is equivalent to the whole list, without
+                // holding 400 decoded bundles to re-derive the same answer.
+                newestFirstDays: [priorityDay],
                 write: _androidSleep.replace,
                 exportBulk: (androidSleepAlreadyWritten) async {
                   bulkDone = await exportBulk(androidSleepAlreadyWritten);
@@ -519,7 +744,11 @@ class HealthExporter {
         for (final day in pendingDays.reversed) {
           final date = day.date;
           final finalized = day.finalized;
-          final bundle = day.bundle;
+          if (day.skipped) {
+            if (!finalized) prefixContiguous = false;
+            continue;
+          }
+          final bundle = await bundleFor(date);
           if (bundle == null || bundle['skipped'] == true) {
             if (!finalized) prefixContiguous = false;
             continue;
@@ -528,6 +757,7 @@ class HealthExporter {
           final entry = (retryState[date] as Map?)?.cast<String, dynamic>();
           var attempts = (entry?['attempts'] as num?)?.toInt() ?? 0;
           var lastAttemptMs = (entry?['last_ms'] as num?)?.toInt();
+          final okMs = (entry?['ok_ms'] as num?)?.toInt();
           final wasFinalized = entry?['finalized'] as bool? ?? false;
           if (finalized && !wasFinalized && attempts > 0) {
             // The day just transitioned non-finalized -> finalized: a
@@ -552,6 +782,11 @@ class HealthExporter {
                 : DateTime.fromMillisecondsSinceEpoch(lastAttemptMs),
             backoff: _backoffFor(attempts),
             prioritySleepAlreadyWritten: date == androidSleepAlreadyWritten,
+            lastSuccess: okMs == null
+                ? null
+                : DateTime.fromMillisecondsSinceEpoch(okMs),
+            minRewriteInterval:
+                finalized ? Duration.zero : _kNonFinalizedRewriteInterval,
             force: forceRetry,
           );
           if (!shouldAttempt && attempts >= _kMaxExportAttempts) {
@@ -566,8 +801,19 @@ class HealthExporter {
               androidSleepAlreadyWritten: date == androidSleepAlreadyWritten,
             ); // delete-then-write (idempotent)
             if (ok) {
-              if (entry != null) {
-                retryState.remove(date);
+              if (finalized) {
+                // Finalized + exported → the cursor advances past it; no
+                // per-day state left behind.
+                if (entry != null) {
+                  retryState.remove(date);
+                  retryStateDirty = true;
+                }
+              } else {
+                // Non-finalized success: stamp ok_ms so the next passes skip
+                // the identical rewrite until _kNonFinalizedRewriteInterval
+                // elapses. Replacing the entry also resets any failure budget,
+                // exactly as the old remove-on-success did.
+                retryState[date] = {'ok_ms': nowMs};
                 retryStateDirty = true;
               }
             } else {
@@ -644,9 +890,8 @@ class HealthExporter {
     // write on failure (best-effort, idempotent re-export corrects it later).
     var success = true;
 
-    // Sleep is the smallest, highest-value Android write. Do it before the
-    // high-volume minute-HR export can consume Health Connect's API quota.
-    // The native replace owns SleepSessionRecord cleanup on Android.
+    // Sleep is the smallest, highest-value write. Native replace owns cleanup
+    // on both stores (Health Connect SleepSessionRecord; HealthKit inBed+Core).
     if (Platform.isAndroid && !androidSleepAlreadyWritten) {
       try {
         if (!await _androidSleep.replace(b)) {
@@ -658,6 +903,21 @@ class HealthExporter {
         success = false;
       }
     }
+    if (isApple) {
+      try {
+        if (!await _appleSleep.replace(
+          bundle: b,
+          dayStart: dayStart,
+          dayEnd: dayEnd,
+        )) {
+          debugPrint('[health] write Apple sleep session returned false');
+          success = false;
+        }
+      } catch (e) {
+        debugPrint('[health] write Apple sleep session: $e');
+        success = false;
+      }
+    }
 
     // One-shot cleanup of the fabricated step samples earlier versions wrote.
     // Outside the success accounting on purpose — see the method doc.
@@ -665,21 +925,31 @@ class HealthExporter {
 
     // Idempotency: remove OUR previously-written samples for this day (HealthKit /
     // Health Connect only let an app delete its own data), then re-write fresh.
+    // Sleep is not in this list — native replace already deleted it.
+    //
+    // A type whose delete did NOT clear the window must not be re-written on
+    // top of the survivor — that is how a retry turns one stale sample into
+    // two, then three. Only WORKOUT is tracked, because a duplicated workout
+    // is the one that shows up as a second entry in the user's activity list
+    // (and is the type `exportWorkout` re-writes out-of-band too); the scalar
+    // types below still write unconditionally, so an uncleared RHR/HRV window
+    // can still double until the next successful delete replaces both.
+    //
+    // This day-wide WORKOUT delete runs before the per-session loop below
+    // skips any end_ts_fabricated row (see _writeOneWorkout) — that is safe
+    // ONLY because a fabricated row can never have a prior Health entry to
+    // lose: the flag is set exclusively by _reconcileOrphanedLiveWorkout on a
+    // row that was status=='live' up to that point, and every export path
+    // (this one and exportWorkout) already skips 'live' rows outright. If a
+    // second end_ts_fabricated writer is ever added on an already-exported
+    // row, that invariant breaks and this delete would need to become
+    // per-session instead of day-wide.
+    var workoutCleared = true;
     for (final t in _rewriteTypes) {
-      try {
-        final deleted = await _health.delete(
-          type: t,
-          startTime: dayStart,
-          endTime: dayEnd,
-        );
-        if (!deleted) {
-          debugPrint('[health] delete ${t.name} returned false');
-          success = false;
-        }
-      } catch (e) {
-        debugPrint('[health] delete ${t.name}: $e');
-        success = false;
-      }
+      if (await _deleteOwnSamples(t, dayStart, dayEnd)) continue;
+      debugPrint('[health] delete ${t.name} did not clear the day');
+      success = false;
+      if (t == HealthDataType.WORKOUT) workoutCleared = false;
     }
 
     final scalars = (b['scalars'] as Map?)?.cast<String, dynamic>() ?? const {};
@@ -761,6 +1031,11 @@ class HealthExporter {
       var workoutCal = 0.0;
       for (final r in rows) {
         if ((r['status']?.toString() ?? '') == 'live') continue;
+        // A fabricated session's calories never get their own WORKOUT
+        // sample (_writeOneWorkout skips it) — subtracting them here too
+        // would make them vanish from the day entirely instead of just
+        // staying in the active-energy total where they still belong.
+        if ((r['end_ts_fabricated'] as num?)?.toInt() == 1) continue;
         workoutCal += (r['calories'] as num?)?.toDouble() ?? 0.0;
       }
       cal = (cal > workoutCal) ? cal - workoutCal : 0.0;
@@ -830,7 +1105,30 @@ class HealthExporter {
       hrRows = await db.rawQuery(
         'SELECT (rec_ts / 60) * 60 AS minute_ts, AVG(hr) as avg_hr '
         'FROM decoded_onehz '
-        'WHERE rec_ts >= ? AND rec_ts < ? AND hr > 0 '
+        // THE BAND'S OWN SECONDS, AND DELIBERATELY NOT `derivableSourceSql()`.
+        //
+        // This is the one read in the app where a wider predicate would be
+        // wrong even for a VERIFIED sensor, and it is the same argument the
+        // steps block below makes: a sample that lands in Apple Health or
+        // Health Connect carries no qualifier, no source seam and no way for
+        // the user to unpick it later. Every other app on the device then
+        // treats it as one continuous series measured one way.
+        //
+        // A chest strap's HR under the same identity as the wrist's is exactly
+        // the systematic-difference blending this project refuses everywhere
+        // else (ASSUMPTIONS D2) — except that here the blend happens inside a
+        // system store we do not own and cannot correct. Deleting our prior
+        // samples for the window (which this exporter already does on every
+        // re-derive) is the only reversal available, and it is ours to run, not
+        // the user's.
+        //
+        // So: no external sensor's HR is written to the OS health store, ever,
+        // whatever its verification tier. If a sensor's readings should reach
+        // HealthKit, that sensor's own app is the honest writer of them. A
+        // separate per-source export identity is the only thing that would
+        // change this call, and it needs a decision (F5-shaped) rather than a
+        // predicate.
+        'WHERE rec_ts >= ? AND rec_ts < ? AND hr > 0 AND $kPrimaryBandSourceSql '
         'GROUP BY minute_ts',
         [startTs, endTs],
       );
@@ -875,34 +1173,12 @@ class HealthExporter {
     // The "estimate" qualifier every in-app surface carries is also lost the
     // moment a sample lands in Apple Health as a bare STEPS count, so a wrong
     // number here contaminates every other app on the device.
-
-    // Health Connect models stages as children of ONE SleepSessionRecord. The
-    // health 11.1.1 generic SLEEP_* writer instead creates one parent record
-    // per call, fragmenting a night. Android therefore uses our typed native
-    // replace API; Apple Health keeps its existing per-stage samples.
-    if (isApple) {
-      final segs = (_sub(b, 'series')?['hypnogram'] as List?) ?? const [];
-      for (final s in segs) {
-        if (s is! Map) continue;
-        final st = (s['start'] as num?)?.toInt();
-        final en = (s['end'] as num?)?.toInt();
-        final stage = healthSleepStageOf(s['stage']?.toString());
-        if (st == null || en == null || en <= st || stage == null) continue;
-        final type = _sleepType(stage);
-        try {
-          final wrote = await _health.writeHealthData(
-            value: 0,
-            type: type,
-            startTime: DateTime.fromMillisecondsSinceEpoch(st * 1000),
-            endTime: DateTime.fromMillisecondsSinceEpoch(en * 1000),
-          );
-          if (!wrote) success = false;
-        } catch (e) {
-          debugPrint('[health] write sleep ${type.name}: $e');
-          success = false;
-        }
-      }
-    }
+    //
+    // Sleep is written natively at the top of this method (Health Connect
+    // SleepSessionRecord on Android; HealthKit inBed + asleepCore/Deep/REM
+    // on Apple). The plugin per-stage writer is not used: on HealthKit it
+    // dropped Core, skipped in-bed, and left 11pm fragments outside the
+    // detected window (#225/#239/#249).
 
     // Workouts (manual/live/detected) finalized in this calendar day. Upper
     // bound is exclusive (dayEnd - 1s) for the same midnight-boundary reason
@@ -919,7 +1195,12 @@ class HealthExporter {
         debugPrint('[health] query workouts: $e');
         success = false;
       }
-      if (rows != null) {
+      // `workoutCleared` is false only when the day's WORKOUT delete genuinely
+      // failed (see the rewrite loop above), in which case every row here would
+      // land beside a survivor. `success` is already false, so the day retries
+      // and re-attempts the delete first; skipping only this block keeps that
+      // failure from touching the day's unrelated exports.
+      if (rows != null && workoutCleared) {
         for (final r in rows) {
           if (await _writeOneWorkout(r) == false) {
             debugPrint('[health] write workout returned false');
@@ -945,6 +1226,12 @@ class HealthExporter {
     if ((r['status']?.toString() ?? '') == 'live') {
       return null; // skip, not a failure
     }
+    // Set by `_reconcileOrphanedLiveWorkout` on a crash-orphaned session it
+    // finalized without ever seeing the real finish — `end_ts` there is
+    // reconcile-time, not a measurement, so this must never reach Health.
+    if ((r['end_ts_fabricated'] as num?)?.toInt() == 1) {
+      return null; // skip, not a failure
+    }
     final st = (r['start_ts'] as num?)?.toInt();
     final en = (r['end_ts'] as num?)?.toInt();
     if (st == null || en == null || en <= st) {
@@ -956,6 +1243,7 @@ class HealthExporter {
         start: DateTime.fromMillisecondsSinceEpoch(st * 1000),
         end: DateTime.fromMillisecondsSinceEpoch(en * 1000),
         totalEnergyBurned: (r['calories'] as num?)?.round(),
+        title: healthWorkoutTitleForType(r['type']?.toString()),
       );
     } catch (e) {
       debugPrint('[health] write workout @$st: $e');
@@ -981,8 +1269,18 @@ class HealthExporter {
   /// [_exportDay], which owns the whole-day delete). Best-effort — never
   /// throws; no-op if the health store isn't configured/available/permitted
   /// (mirrors [_exportDay]'s silent-no-op-on-missing-permission contract).
+  ///
+  /// The idempotency is only as good as the delete, so the write is GATED on
+  /// it: a delete that did not clear the window returns false without writing,
+  /// because writing beside a survivor is what turns a retry into a duplicate.
+  /// See [healthDeleteClearedRange] for what "did not clear" means per store.
   Future<bool> exportWorkout(Map<String, Object?> session) async {
     if ((session['status']?.toString() ?? '') == 'live') return false;
+    // Same fabricated-end_ts skip as _writeOneWorkout, but checked BEFORE any
+    // delete: this session's window may still hold a real, previously
+    // exported workout, and deleting it here — only to have _writeOneWorkout
+    // refuse to write the replacement — would erase it for nothing.
+    if ((session['end_ts_fabricated'] as num?)?.toInt() == 1) return false;
     final st = (session['start_ts'] as num?)?.toInt();
     final en = (session['end_ts'] as num?)?.toInt();
     if (st == null || en == null || en <= st) return false;
@@ -991,36 +1289,19 @@ class HealthExporter {
       if (await _androidUnavailable() != null) return false;
       final start = DateTime.fromMillisecondsSinceEpoch(st * 1000);
       final end = DateTime.fromMillisecondsSinceEpoch(en * 1000);
-      var success = true;
-      try {
-        final deleted = await _health.delete(
-          type: HealthDataType.WORKOUT,
-          startTime: start,
-          endTime: end,
-        );
-        if (!deleted) success = false;
-      } catch (e) {
-        debugPrint('[health] delete workout @$st: $e');
-        success = false;
+      if (!await _deleteOwnSamples(HealthDataType.WORKOUT, start, end)) {
+        // The window still holds a copy we could not remove, so writing now
+        // would leave TWO of this workout in the store — and returning false
+        // hands the caller a retry, which would write a third. Bail instead:
+        // the same false still asks for a retry, but the retry re-attempts the
+        // delete FIRST and only writes once it actually clears.
+        debugPrint('[health] delete workout @$st did not clear the window');
+        return false;
       }
-      final wrote = (await _writeOneWorkout(session)) ?? false;
-      return success && wrote;
+      return (await _writeOneWorkout(session)) ?? false;
     } catch (e) {
       debugPrint('[health] exportWorkout: $e');
       return false;
-    }
-  }
-
-  HealthDataType _sleepType(HealthSleepStage stage) {
-    switch (stage) {
-      case HealthSleepStage.deep:
-        return HealthDataType.SLEEP_DEEP;
-      case HealthSleepStage.rem:
-        return HealthDataType.SLEEP_REM;
-      case HealthSleepStage.light:
-        return HealthDataType.SLEEP_LIGHT;
-      case HealthSleepStage.awake:
-        return HealthDataType.SLEEP_AWAKE;
     }
   }
 
@@ -1030,15 +1311,12 @@ class HealthExporter {
   HealthWorkoutActivityType _activity(String? type) =>
       healthActivityForType(type, ios: isApple);
 
-  static Map<String, dynamic>? _decode(Object? json) {
-    if (json is! String) return null;
-    try {
-      final d = jsonDecode(json);
-      return d is Map ? d.cast<String, dynamic>() : null;
-    } catch (_) {
-      return null;
-    }
-  }
+  /// Decode a stored day bundle, normalizing the compact curve format back to
+  /// plain [{t,v}] lists. Hypnogram segments are never encoded (no `t` key), so
+  /// today only the sleep export reads through here — but every day_result
+  /// reader goes through the codec so a future one cannot silently miss it.
+  static Map<String, dynamic>? _decode(Object? json) =>
+      SeriesCodec.decodePayloadJson(json);
 
   static Map<String, dynamic>? _sub(Map<String, dynamic>? b, String path) {
     var cur = b;
@@ -1061,8 +1339,48 @@ class HealthExporter {
   }
 }
 
-/// The app's workout-type key -> platform health activity type.
+/// The Health Connect record title for a stored `sessions.type`.
 ///
+/// Health Connect titles the record with the ACTIVITY TYPE NAME when the write
+/// carries no title of its own — `HealthPlugin.kt` does
+/// `call.argument("title") ?: type` — so every session landing on `OTHER`
+/// appeared in the user's health app named "OTHER". That is most of the
+/// catalogue, and NOT because the store lacks the types: Health Connect
+/// accepts `TABLE_TENNIS`, `CRICKET`, `VOLLEYBALL` and more that
+/// [healthActivityForType] below simply does not map yet. `OTHER` is this
+/// app's fallback, not a platform limit, and widening the map is its own
+/// audit — the title is what stops the gap from being user-visible meanwhile.
+///
+/// iOS ignores the field: `HKWorkout` has no title, and the activity type IS
+/// the label there. One unconditional argument rather than a platform branch,
+/// because a value the other store discards is not a platform difference.
+///
+/// FUTURE WRITES ONLY. `exportAll` skips dates at or before
+/// `health_export_through`, so sessions already finalized on Android keep the
+/// label they were written with. Relabelling them would need a bounded replay
+/// of the finalized prefix; a wrong name on old rows is not worth that.
+///
+/// ponytail: this de-slugs the type key instead of reading the catalogue's
+/// display name, so the three acronym-cased entries come back title-cased —
+/// "Crossfit", "Hiit", "Diy". The upgrade is one import, and it is not worth
+/// taking: `lib/health` reaching into `lib/ui2` to spell three words is the
+/// wrong dependency, and every one of them already beats "OTHER".
+@visibleForTesting
+String? healthWorkoutTitleForType(String? type) {
+  // Underscores BEFORE the trim, or a type of `_` survives as a one-space
+  // title — non-null, so it suppresses the platform default and writes a
+  // blank name where "OTHER" at least said something.
+  final t = (type ?? '')
+      .replaceAll('_', ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+  if (t.isEmpty) return null;
+  return t
+      .split(' ')
+      .map((w) => w[0].toUpperCase() + w.substring(1))
+      .join(' ');
+}
+
 /// Parameterised by [ios] rather than reading `Platform` directly so a unit
 /// test can exercise BOTH platform branches on a host VM (where `Platform.isIOS`
 /// and `Platform.isAndroid` are both false) — see
@@ -1168,6 +1486,16 @@ HealthWorkoutActivityType healthActivityForType(
           : HealthWorkoutActivityType.OTHER;
     case 'golf':
       return HealthWorkoutActivityType.GOLF;
+    case 'bowling':
+      // Android has no bowling: Health Connect's exercise types stop at the
+      // sports it knows, and `BOWLING` is absent from the plugin's Android
+      // set, so the call throws `HealthException` before the channel and the
+      // session never lands. iOS maps it to a real `HKWorkoutActivityType
+      // .bowling`. Same #184 shape as strength and swim, caught before the
+      // bug rather than after it.
+      return ios
+          ? HealthWorkoutActivityType.BOWLING
+          : HealthWorkoutActivityType.OTHER;
     default:
       return HealthWorkoutActivityType.OTHER;
   }

@@ -51,9 +51,27 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- GENERATED from lib/ble/adapters/_registry.dart — do not hand-edit.
+	     `dart run tool/gen_ios_ask_plist.dart` rewrites this array and the
+	     OSBandLabels dict below; test/ios_ask_plist_test.dart fails CI if
+	     they drift. On iOS 18+ the ASK picker is the pairing path, so a band
+	     missing here cannot be paired on iPhone at all. -->
 	<key>NSAccessorySetupBluetoothServices</key>
 	<array>
 		<string>61080001-8D6D-82B8-614A-1C8CB0F8DCC6</string>
+		<string>FD4B0001-CCE1-4033-93CE-002D5875F58A</string>
+		<!-- 16-bit SIG member UUID. Distinct from the 128-bit vendor service
+		     above, and NOT the Bluetooth-base expansion
+		     0000FD4B-0000-1000-8000-00805F9B34FB (no band advertises that).
+		     A 128-bit UUID often does not fit the 31-byte advertisement. -->
+		<string>FD4B</string>
+	</array>
+	<!-- Last net for ASK: MG advertises as WHOOP MGB…, 5.0 as WHOOP 5A…,
+	     4.0 as WHOOP 4…. Criteria inside one descriptor AND-combine, so the
+	     name lives on its own ASPickerDisplayItem, not on the UUID items. -->
+	<key>NSAccessorySetupBluetoothNames</key>
+	<array>
+		<string>WHOOP</string>
 	</array>
 	<key>NSAccessorySetupKitSupports</key>
 	<array>
@@ -61,6 +79,15 @@
 	</array>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>OpenStrap connects to your WHOOP band over Bluetooth to sync your health data.</string>
+	<!-- GENERATED (see above): service UUID -> ASK picker row label. Cosmetic
+	     only; AccessorySetup.swift falls back to a generic name. -->
+	<key>OSBandLabels</key>
+	<dict>
+		<key>61080001-8D6D-82B8-614A-1C8CB0F8DCC6</key>
+		<string>WHOOP 4</string>
+		<key>FD4B0001-CCE1-4033-93CE-002D5875F58A</key>
+		<string>WHOOP 5</string>
+	</dict>
 	<!-- The automatic-backup folder lives in the app's Documents directory.
 	     Without BOTH of these it exists but is invisible in Files, so nothing
 	     the user might sync it with (iCloud Drive, Nextcloud, a cable) can
@@ -70,8 +97,21 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<!-- Steps are NOT read from Apple Health any more: that number is the sum of
+	     every app that writes steps, and OpenStrap will not put a figure it
+	     cannot attribute into one of its own. Steps come from this iPhone's
+	     motion chip instead (NSMotionUsageDescription below). Do not put the
+	     step clause back into this string — it is review-visible, and it would
+	     be describing something the app no longer does. -->
 	<key>NSHealthShareUsageDescription</key>
-	<string>OpenStrap reads your step count from Apple Health to show your daily steps, and reads back its own recent samples so it never writes duplicates.</string>
+	<string>OpenStrap reads your height, weight, date of birth and sex to set up your profile; your resting heart rate so it has a starting baseline; any blood pressure, blood glucose or body temperature readings, so a device that is cleared to measure those can sit beside your own data with that device's name on it — never blended into an OpenStrap number; and your workouts and their routes, so a run recorded by another app can be listed and drawn on a map here, named with the app that recorded it and never counted as one OpenStrap measured. It also reads back its own recent samples so it never writes duplicates.</string>
+	<!-- REQUIRED, not optional: Apple documents that calling CoreMotion without
+	     this key CRASHES the app. See ios/Runner/AppDelegate.swift
+	     (PedometerBridge). -->
+	<key>NSMotionUsageDescription</key>
+	<string>OpenStrap counts your daily steps from this iPhone's own motion chip, because a band on your wrist cannot tell walking from stirring a pot, and the phone in your pocket can. It reads step counts only — never your location or anything else the motion chip records — and only the last few days of them. Your steps stay on this device and are never uploaded.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>OpenStrap uses the camera to read the barcode on a food packet, so logging a meal does not mean typing its nutrition panel out by hand. It reads the barcode digits and nothing else — no photo is taken, kept, or sent anywhere.</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>OpenStrap writes your sleep, resting heart rate, HRV, respiratory rate, energy and workouts into Apple Health.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
