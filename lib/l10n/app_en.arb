@@ -108,7 +108,7 @@
   "@pairingFailedTitle": {
     "description": "Pairing state title: failed."
   },
-  "pairingFailedBody": "The band was reachable but the session did not finish.",
+  "pairingFailedBody": "Setup did not finish. The error below identifies the step that failed.",
   "@pairingFailedBody": {
     "description": "Pairing state body: failed."
   },
@@ -160,11 +160,11 @@
   "@pairingBondRefusedAdviceFix": {
     "description": "Advice card fix: bond refused."
   },
-  "pairingFailedAdviceTitle": "The band was found but the session did not finish",
+  "pairingFailedAdviceTitle": "Band setup did not complete",
   "@pairingFailedAdviceTitle": {
     "description": "Advice card title: failed."
   },
-  "pairingFailedAdviceBody": "Scanning again from a metre away normally works.",
+  "pairingFailedAdviceBody": "Review the error below before retrying. This does not mean the band was found or rejected pairing.",
   "@pairingFailedAdviceBody": {
     "description": "Advice card body: failed."
   },
@@ -11564,15 +11564,15 @@
   "@bandStatusBluetoothDeniedFix": {
     "description": "BandStatus fix action: app-level Bluetooth permission denied"
   },
-  "bandStatusBluetoothOffTitle": "Bluetooth is turned off",
+  "bandStatusBluetoothOffTitle": "Bluetooth is unavailable to OpenStrap",
   "@bandStatusBluetoothOffTitle": {
     "description": "BandStatus card title: phone Bluetooth radio is off"
   },
-  "bandStatusBluetoothOffReason": "The phone’s radio is off, so the band cannot be reached by any app. The band keeps recording meanwhile; nothing is lost.",
+  "bandStatusBluetoothOffReason": "The system reports Bluetooth as unavailable to this app. This can mean Bluetooth is off or, on iOS, no accessory is authorized for OpenStrap.",
   "@bandStatusBluetoothOffReason": {
     "description": "BandStatus card body: phone Bluetooth radio is off"
   },
-  "bandStatusBluetoothOffFix": "Turn Bluetooth on",
+  "bandStatusBluetoothOffFix": "Check Bluetooth in Settings; if it is on, pair your band here",
   "@bandStatusBluetoothOffFix": {
     "description": "BandStatus fix action: phone Bluetooth radio is off"
   },

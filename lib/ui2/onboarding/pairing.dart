@@ -279,7 +279,7 @@ class PairingView extends StatelessWidget {
       PairPhase.cancelled => l?.pairingCancelledBody ??
           'The system picker was dismissed before a band was chosen.',
       PairPhase.failed => l?.pairingFailedBody ??
-          'The band was reachable but the session did not finish.',
+          'Setup did not finish. The error below identifies the step that failed.',
       PairPhase.paired => l?.pairingPairedBody ?? 'Setting up the first sync.',
     };
   }
@@ -332,10 +332,9 @@ class PairingView extends StatelessWidget {
       PairPhase.failed => [
           const SizedBox(height: S.x6),
           StatusCard(
-            l?.pairingFailedAdviceTitle ??
-                'The band was found but the session did not finish',
+            l?.pairingFailedAdviceTitle ?? 'Band setup did not complete',
             l?.pairingFailedAdviceBody ??
-                'Scanning again from a metre away normally works.',
+                'Review the error below before retrying. This does not mean the band was found or rejected pairing.',
             icon: LucideIcons.triangleAlert,
           ),
           if (detail.isNotEmpty) ...[

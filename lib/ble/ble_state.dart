@@ -83,7 +83,6 @@ enum BleBlocker {
   /// BLUETOOTH_SCAN/CONNECT denied). Only Settings clears it.
   permissionDenied,
 
-  /// The radio itself is off. Every app is equally stuck.
   adapterOff,
 
   /// No BLE radio on this device at all. Nothing to fix.
@@ -253,10 +252,10 @@ BandStatus bandStatusFor({
     case BleBlocker.adapterOff:
       return const BandStatus(
         BandCondition.bluetoothOff,
-        'Bluetooth is turned off',
-        'The phone’s radio is off, so the band cannot be reached by any app. '
-            'The band keeps recording meanwhile; nothing is lost.',
-        fix: 'Turn Bluetooth on',
+        'Bluetooth is unavailable to OpenStrap',
+        'The system reports Bluetooth as unavailable to this app. This can mean '
+            'Bluetooth is off or, on iOS, no accessory is authorized for OpenStrap.',
+        fix: 'Check Bluetooth in Settings; if it is on, pair your band here',
       );
     case BleBlocker.unsupported:
       return const BandStatus(

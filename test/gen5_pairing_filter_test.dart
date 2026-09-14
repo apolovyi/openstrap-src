@@ -24,35 +24,6 @@ String _readRepoFile(String posixPath) {
   return file.readAsStringSync();
 }
 
-/// The argument text of every `name(...)` call in [source], with nested
-/// parentheses balanced — so an argument that itself contains a call
-/// (`known: ids.map((i) => i.x)`) does not truncate the result.
-Iterable<String> _callArguments(String source, String name) sync* {
-  final open = '$name(';
-  for (var i = source.indexOf(open);
-      i >= 0;
-      i = source.indexOf(open, i + open.length)) {
-    var depth = 0;
-    for (var j = i + open.length - 1; j < source.length; j++) {
-      final c = source[j];
-      if (c == '(') {
-        depth++;
-      } else if (c == ')' && --depth == 0) {
-        yield source.substring(i + open.length, j);
-        break;
-      }
-    }
-  }
-}
-
-/// The value of named argument [name] in an argument list, or null when it is
-/// absent or is not a bare token. `allowGen4Retry: true && false` deliberately
-/// does NOT match — the whole point is to pin the value, not a prefix of it.
-String? _namedArgument(String arguments, String name) =>
-    RegExp('\\b$name:\\s*(\\w+)\\s*(?:,|\$)')
-        .firstMatch(arguments)
-        ?.group(1);
-
 void main() {
   group('16-bit member UUID is not the Bluetooth-base expansion', () {
     test('kWhoopMemberUuid16 is the short SIG assignment', () {
@@ -185,21 +156,7 @@ void main() {
         'no bare name-substring descriptor exists — it crashed every '
         '"search for devices" tap once (TestFlight v0.9.29, '
         'A3457926-FD0D-48A7-9C6B-DCC6958276BF)', () {
-      // ASDiscoveryDescriptor requires bluetoothServiceUUID whenever
-      // bluetoothNameSubstring is set; a name-only descriptor fails ASK's
-      // validation with a FATAL, uncatchable trap in
-      // -[ASAccessorySession _validateDiscoveryDescriptor:], not a
-      // completion-handler error — the gen4-retry-on-rejection logic never
-      // even runs. The fallback fix is the member-UUID item covered by the
-      // adjacent 'ASK folds gen5's 16-bit member UUID...' test above; this
-      // test only guards against the name-only descriptor's crash mode
-      // being silently reintroduced. Re-add bluetoothNameSubstring only
-      // paired with a bluetoothServiceUUID on the SAME descriptor.
-      expect(swift, contains('dropped the name-substring-only fallback'),
-          reason:
-              'the ponytail comment recording why must survive alongside '
-              'the code it explains');
-      expect(swift, isNot(contains('bluetoothNameSubstring:')),
+      expect(swift, isNot(contains('bluetoothNameSubstring')),
           reason: 'a live bluetoothNameSubstring assignment is the exact '
               'crash this test exists to catch');
     });
@@ -213,64 +170,19 @@ void main() {
       expect(engine, contains("s == kWhoopMemberUuid16"));
     });
 
-    test(
-        'the widened descriptor list retries once with the Gen 4 item alone '
-        'so a rejected experiment can never take down 4.0 pairing', () {
-      // The initial picker call must offer the retry, and the retry target
-      // must be items[0] — the WHOOP 4.0 (gen4) descriptor built first in
-      // `items`, so a rejection of the widened list falls back to exactly
-      // what already ships.
-      // Matched by shape, not by full line. This assertion has already drifted
-      // once — `present` gained a `known:` parameter and the pinned literal
-      // stopped guarding anything until the test failed. What matters is the
-      // argument the retry hinges on, whatever else rides along. So read the
-      // call's balanced argument list and check that one value as a COMPLETE
-      // token: a prefix match would accept `true && false`, and a
-      // parenthesis-blind scan would break the moment an intervening argument
-      // contained a call of its own.
-      final presentArgs = _callArguments(swift, 'present').toList();
-      final widened =
-          presentArgs.where((a) => a.trimLeft().startsWith('items,')).toList();
-      final gen4Retry = presentArgs
-          .where((a) => a.trimLeft().startsWith('[items[0]],'))
-          .toList();
-      expect(widened, hasLength(1),
-          reason: 'exactly one call presents the widened list');
-      expect(gen4Retry, hasLength(1),
-          reason: 'the retry must target items[0] — the gen4 descriptor');
-      expect(
-        _namedArgument(widened.single, 'allowGen4Retry'),
-        'true',
-        reason: 'the widened list must be presented WITH the Gen 4 retry armed',
-      );
-      expect(
-        _namedArgument(gen4Retry.single, 'allowGen4Retry'),
-        'false',
-        reason: 'the single-item retry must NOT retry again, or a rejected '
-            'list loops',
-      );
-      // items[0] must be the FIRST registry-driven item (gen4 — kBandRegistry
-      // lists it before gen5, see _registry.dart), not the appended gen5-only
-      // fallback items (member UUID / name substring).
-      final itemsStart = swift.indexOf('var items = services.map');
-      expect(itemsStart, greaterThanOrEqualTo(0));
-      final fallbackAppendStart = swift.indexOf(
-        'items.append(makeItem("WHOOP 5.0 / MG")',
-        itemsStart,
-      );
-      expect(fallbackAppendStart, greaterThan(itemsStart),
-          reason: 'the two gen5-only fallback items must be appended AFTER '
-              'the registry-driven items, so items[0] stays gen4');
+    test('one picker offers every declared service and the member UUID', () {
+      expect(swift, contains('var items = services.map'));
+      expect(swift, contains('items.append(makeItem("WHOOP 5.0 / MG")'));
+      expect('session.showPicker(for: items)'.allMatches(swift), hasLength(1));
     });
 
-    test(
-        'a dismissal of the rejected sheet during the Gen 4 retry is '
-        'suppressed, so a provisioned accessory cannot be reported cancelled',
-        () {
-      expect(swift, contains('retryInFlight'));
-      expect(swift, contains('guard !retryInFlight else { return }'));
-      expect(swift, contains('self.retryInFlight = true'));
-      expect(swift, contains('self.retryInFlight = false'));
+    test('the native bridge delegates presentation and dismissal separately', () {
+      expect(swift, contains('private let picker = AccessoryPickerLifecycle()'));
+      expect(swift, contains('self.picker.presentationCompleted(token: token, error: failure)'));
+      expect(swift, contains('case .pickerDidDismiss:'));
+      expect(swift, contains('picker.dismissed(authorizedIds: authorizedIds)'));
+      expect(swift, contains('case .accessoryAdded, .accessoryChanged:'));
+      expect(swift, contains('guard accessory.state == .authorized'));
     });
   });
 }

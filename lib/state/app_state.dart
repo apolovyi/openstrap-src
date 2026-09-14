@@ -4049,16 +4049,10 @@ class AppState extends ChangeNotifier {
   /// and iOS < 18 — those use the service-filtered scan flow ([scanForBand]/[pairWith]).
   Future<bool> accessorySetupSupported() => AccessorySetup.isSupported();
 
-  /// iOS 18+ pairing: show the ASK picker, persist the provisioned band by its
-  /// CoreBluetooth UUID (== flutter_blue_plus remoteId), then open the session. Throws
-  /// if the user cancels or no accessory is provisioned. The picker is skipped (returns
-  /// the known id) if a WHOOP is already provisioned via ASK.
   Future<void> pairViaAccessorySetup({String? serial}) async {
-    final remoteId = await AccessorySetup.showPicker();
-    // CRITICAL ORDERING: the ASK picker has now provisioned the accessory. Only NOW is it
-    // safe for the native restore central (BleRestoreManager) to exist — it was deferred
-    // at launch on a fresh install so showPicker could run with no CBCentralManager alive.
-    // Create it here, BEFORE _persistPaired → openSession touches flutter_blue_plus.
+    final remoteId = await AccessorySetup.showPicker(
+      existingRemoteId: paired?.remoteId,
+    );
     await IosBleRestore.provisioned(remoteId);
     await _persistPaired(remoteId, serial);
   }
